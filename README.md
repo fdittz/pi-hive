@@ -14,6 +14,7 @@ For complete local extension documentation, see [`EXTENSION.md`](./EXTENSION.md)
 - **Abort support**: Ctrl+C propagates to kill subagent processes
 - **Live transcript view**: Open a fullscreen overlay with `/subagents`, `Ctrl+Shift+O`, or fallback `Alt+O`
 - **Model selection**: Use `/subagent-model` to configure each subagent to inherit the parent model or use a specific available model
+- **Automatic handoff**: Subagents can request follow-up work by another subagent; handoffs run automatically by default
 - **Persistent transcripts**: Completed subagent JSON streams are saved as compressed `.jsonl.gz` sidecars and reload with the main session
 
 ## Structure
@@ -22,14 +23,21 @@ For complete local extension documentation, see [`EXTENSION.md`](./EXTENSION.md)
 subagent/
 ├── README.md            # This file
 ├── index.ts             # The extension (entry point)
-├── agents.ts            # Agent discovery logic
-├── live-registry.ts     # In-memory and hydrated run registry
-├── transcript-storage.ts # Gzipped JSONL transcript sidecar storage
+├── agents.ts             # Agent discovery logic
+├── agent-colors.ts       # Frontmatter color parsing/rendering helpers
+├── child-session-storage.ts # Child pi sessions for continuable runs
+├── compatibility.ts      # Version guard and fallback rendering
+├── handoff.ts            # Handoff parsing, policy, confirmation, and config UI
+├── live-registry.ts      # In-memory and hydrated run registry
+├── model-overrides.ts    # Per-agent model override resolution
+├── model-selector.ts     # /subagent-model interactive selector
+├── subagent-config.ts    # Unified ~/.pi/agent/subagent.json config
+├── subagent-overlay.ts   # Fullscreen live view overlay
 ├── transcript-adapter.ts # JSON event stream -> native pi components
-├── transcript-view.ts   # Native/fallback transcript renderer
-├── subagent-overlay.ts  # Fullscreen live view overlay
-├── compatibility.ts     # Version guard and fallback rendering
-├── agents/              # Sample agent definitions
+├── transcript-storage.ts # Gzipped JSONL transcript sidecar storage
+├── transcript-types.ts   # Shared run/transcript types
+├── transcript-view.ts    # Native/fallback transcript renderer
+├── agents/               # Sample agent definitions
 │   ├── scout.md         # Fast recon, returns compressed context
 │   ├── planner.md       # Creates implementation plans
 │   ├── reviewer.md      # Code review
@@ -123,6 +131,55 @@ To enable project-local agents, pass `agentScope: "both"` (or `"project"`). Only
 
 When running interactively, the tool prompts for confirmation before running project-local agents. Set `confirmProjectAgents: false` to disable.
 
+## Unified configuration
+
+The extension uses one user-level config file:
+
+```text
+~/.pi/agent/subagent.json
+```
+
+In this environment:
+
+```text
+~/.pi/agent/subagent.json
+```
+
+Example:
+
+```json
+{
+  "version": 1,
+  "models": {
+    "overrides": {
+      "planner": "copproxy/gpt-5.5"
+    }
+  },
+  "handoff": {
+    "enabled": true,
+    "mode": "auto",
+    "maxDepth": 2,
+    "maxHandoffsPerRun": 3,
+    "requireApprovalForProjectAgents": false,
+    "blockSelfHandoff": false
+  }
+}
+```
+
+### Config sections
+
+| Section | Purpose |
+|---------|---------|
+| `models.overrides` | Optional per-agent model overrides used by `/subagent-model` |
+| `handoff.enabled` | Master switch for handoff execution |
+| `handoff.mode` | `auto`, `manual`, or `off` |
+| `handoff.maxDepth` | Maximum nested handoff depth |
+| `handoff.maxHandoffsPerRun` | Maximum handoffs accepted from a single run output |
+| `handoff.requireApprovalForProjectAgents` | Require confirmation when target agent comes from `.pi/agents` |
+| `handoff.blockSelfHandoff` | Prevent an agent from handing off to itself |
+
+The old `~/.pi/agent/subagent-models.json` file is read as a migration fallback for model overrides, but new writes go to `subagent.json`.
+
 ## Usage
 
 ### Single agent
@@ -178,6 +235,15 @@ Handoff is enabled by default and runs automatically without confirmation. Confi
 ~/.pi/agent/subagent.json
 ```
 
+The interactive command can change:
+
+- `enabled` on/off;
+- `mode`: `auto`, `manual`, or `off`;
+- `maxDepth`;
+- `maxHandoffsPerRun`;
+- `requireApprovalForProjectAgents`;
+- `blockSelfHandoff`.
+
 Default handoff config:
 
 ```json
@@ -193,7 +259,15 @@ Default handoff config:
 }
 ```
 
-A subagent can request handoff by returning a JSON block:
+Handoff modes:
+
+| Mode | Behavior |
+|------|----------|
+| `auto` | Execute accepted handoffs automatically, without confirmation |
+| `manual` | Ask for confirmation before executing accepted handoffs when UI is available |
+| `off` | Do not execute handoffs |
+
+A subagent can request handoff by returning a JSON block in its final output:
 
 ````markdown
 ```json
@@ -201,13 +275,40 @@ A subagent can request handoff by returning a JSON block:
   "handoff": {
     "agent": "reviewer",
     "task": "Review src/auth.ts for security issues.",
-    "reason": "Scout found token handling code."
+    "reason": "Scout found token handling code.",
+    "cwd": "/optional/working/directory"
   }
 }
 ```
 ````
 
-Multiple handoffs are supported with `handoffs: [...]`.
+Multiple handoffs are supported with `handoffs: [...]`:
+
+````markdown
+```json
+{
+  "handoffs": [
+    {
+      "agent": "reviewer",
+      "task": "Review authentication code.",
+      "reason": "Security-sensitive code was identified."
+    },
+    {
+      "agent": "planner",
+      "task": "Create a refactor plan for the auth module.",
+      "reason": "The module has multiple responsibilities."
+    }
+  ]
+}
+```
+````
+
+Aliases are also accepted for parser compatibility:
+
+```json
+{ "delegate": { "agent": "reviewer", "task": "..." } }
+{ "delegations": [{ "agent": "reviewer", "task": "..." }] }
+```
 
 By default, every subagent can hand off to every other subagent. To restrict a specific source agent, add an explicit frontmatter allow list to that agent's `.md` file:
 
@@ -215,7 +316,16 @@ By default, every subagent can hand off to every other subagent. To restrict a s
 handoffAllowList: reviewer, planner
 ```
 
-Supported aliases are `handoffAllowList`, `handoffAllowlist`, `handoff-allow-list`, and `allowList`.
+Supported aliases are:
+
+```text
+handoffAllowList
+handoffAllowlist
+handoff-allow-list
+allowList
+```
+
+If an allow list is present, that source agent can only hand off to listed target agents. If no allow list is present, all target agents are allowed subject to the global `subagent.json` limits.
 
 ### Continue a subagent run
 
@@ -430,6 +540,30 @@ docs/continuable-runs.md
 - **stopReason "error"**: LLM error propagated with error message
 - **stopReason "aborted"**: User abort (Ctrl+C) kills subprocess, throws error
 - **Chain mode**: Stops at first failing step, reports which step failed
+- **Handoff target not found**: skipped with a warning when UI is available
+- **Handoff blocked by allow list**: skipped with a warning when UI is available
+- **Handoff limits reached**: skipped when `maxDepth` or `maxHandoffsPerRun` is reached
+
+## Handoff safety notes
+
+Handoff gives subagents a way to ask the parent orchestrator to run other subagents. It is intentionally mediated by the parent process rather than exposing the `subagent` tool directly to child agents.
+
+Safety controls:
+
+- `maxDepth` prevents infinite handoff chains.
+- `maxHandoffsPerRun` prevents a single output from spawning too many runs.
+- `handoffAllowList` in agent frontmatter restricts which agents a source agent may call.
+- `blockSelfHandoff` can disable self-handoff loops.
+- `mode: manual` can require confirmation.
+- `requireApprovalForProjectAgents` can require approval for repository-controlled target agents.
+
+Default policy is intentionally permissive, as requested:
+
+```text
+enabled: true
+mode: auto
+all agents may hand off to all other agents unless the source agent defines handoffAllowList
+```
 
 ## Limitations
 
