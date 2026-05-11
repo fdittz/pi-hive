@@ -342,6 +342,7 @@ async function runSingleAgent(
 	if (childSessionPath) args.push("--session", childSessionPath);
 	else args.push("--no-session");
 	if (resolvedModel.modelArg) args.push("--model", resolvedModel.modelArg);
+	if (resolvedModel.thinkingArg) args.push("--thinking", resolvedModel.thinkingArg);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;

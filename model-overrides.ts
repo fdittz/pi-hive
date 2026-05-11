@@ -3,6 +3,9 @@ import type { AgentConfig } from "./agents.js";
 import { getSubagentConfigPath, loadSubagentConfig, saveSubagentConfig } from "./subagent-config.js";
 
 export const INHERIT_MODEL = "inherit";
+export const INHERIT_THINKING = "inherit";
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type SubagentThinkingLevel = (typeof THINKING_LEVELS)[number] | typeof INHERIT_THINKING;
 
 export interface SubagentModelConfig {
 	version: number;
@@ -12,6 +15,7 @@ export interface SubagentModelConfig {
 export interface ResolvedAgentModel {
 	setting: string;
 	modelArg?: string;
+	thinkingArg?: string;
 	display: string;
 	inherited: boolean;
 }
@@ -39,6 +43,19 @@ export async function saveSubagentModelConfig(config: SubagentModelConfig): Prom
 	await saveSubagentConfig(fullConfig);
 }
 
+function splitModelThinking(value: string): { model: string; thinking?: string } {
+	const trimmed = value.trim();
+	const match = trimmed.match(/^(.*):(off|minimal|low|medium|high|xhigh)$/);
+	if (!match) return { model: trimmed };
+	return { model: match[1], thinking: match[2] };
+}
+
+function normalizeThinking(value: string | undefined): SubagentThinkingLevel {
+	const trimmed = value?.trim();
+	if (!trimmed || trimmed === INHERIT_THINKING) return INHERIT_THINKING;
+	return (THINKING_LEVELS as readonly string[]).includes(trimmed) ? (trimmed as SubagentThinkingLevel) : INHERIT_THINKING;
+}
+
 export function getAgentModelSetting(agent: AgentConfig, config = loadSubagentModelConfig()): string {
 	return config.overrides[agent.name] || agent.model || INHERIT_MODEL;
 }
@@ -56,17 +73,23 @@ export function resolveAgentModel(
 	parentModel: Pick<Model<any>, "provider" | "id"> | undefined,
 	config = loadSubagentModelConfig(),
 ): ResolvedAgentModel {
-	const setting = getAgentModelSetting(agent, config).trim() || INHERIT_MODEL;
+	const rawSetting = getAgentModelSetting(agent, config).trim() || INHERIT_MODEL;
+	const split = splitModelThinking(rawSetting);
+	const setting = split.model || INHERIT_MODEL;
+	const thinking = normalizeThinking(agent.thinking);
+	const thinkingArg = split.thinking ?? (thinking === INHERIT_THINKING ? undefined : thinking);
 	if (setting === INHERIT_MODEL) {
 		const inherited = parentModel ? formatModelRef(parentModel) : undefined;
+		const displayThinking = thinkingArg ? `:${thinkingArg}` : "";
 		return {
 			setting,
 			modelArg: inherited,
-			display: inherited ? `${INHERIT_MODEL} (${inherited})` : INHERIT_MODEL,
+			thinkingArg,
+			display: inherited ? `${INHERIT_MODEL} (${inherited}${displayThinking})` : `${INHERIT_MODEL}${displayThinking}`,
 			inherited: true,
 		};
 	}
-	return { setting, modelArg: setting, display: setting, inherited: false };
+	return { setting, modelArg: setting, thinkingArg, display: `${setting}${thinkingArg ? `:${thinkingArg}` : ""}`, inherited: false };
 }
 
 export async function setAgentModelOverride(agentName: string, modelRef: string): Promise<void> {

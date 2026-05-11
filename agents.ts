@@ -15,6 +15,7 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	thinking?: string;
 	color?: string;
 	handoffAllowList?: string[];
 	systemPrompt: string;
@@ -79,6 +80,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			description: frontmatter.description,
 			tools: tools && tools.length > 0 ? tools : undefined,
 			model: frontmatter.model,
+			thinking: frontmatter.thinking,
 			color: frontmatter.color,
 			handoffAllowList: handoffAllowList && handoffAllowList.length > 0 ? handoffAllowList : undefined,
 			systemPrompt: body,

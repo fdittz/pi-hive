@@ -3,6 +3,7 @@ name: planner
 description: Creates implementation plans from context and requirements
 tools: read, grep, find, ls
 model: inherit
+thinking: inherit
 color: yellow
 ---
 
@@ -52,4 +53,3 @@ If another specialized subagent should continue the work, include a JSON handoff
 ```
 
 Use handoff only when it materially improves the result. Do not hand off to yourself unless explicitly necessary.
-

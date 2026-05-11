@@ -3,6 +3,7 @@ name: scout
 description: Fast codebase recon that returns compressed context for handoff to other agents
 tools: read, grep, find, ls, bash
 model: inherit
+thinking: inherit
 color: cyan
 ---
 
@@ -65,4 +66,3 @@ If another specialized subagent should continue the work, include a JSON handoff
 ```
 
 Use handoff only when it materially improves the result. Do not hand off to yourself unless explicitly necessary.
-

@@ -3,6 +3,7 @@ name: reviewer
 description: Code review specialist for quality and security analysis
 tools: read, grep, find, ls, bash
 model: inherit
+thinking: inherit
 color: red
 ---
 
@@ -50,4 +51,3 @@ If another specialized subagent should continue the work, include a JSON handoff
 ```
 
 Use handoff only when it materially improves the result. Do not hand off to yourself unless explicitly necessary.
-

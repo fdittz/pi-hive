@@ -328,6 +328,7 @@ name: scout
 description: Fast codebase recon that returns compressed context for handoff to other agents
 tools: read, grep, find, ls, bash
 model: inherit
+thinking: inherit
 color: cyan
 handoffAllowList: reviewer, planner
 ---
@@ -508,6 +509,26 @@ Resolution order:
 3. `inherit` if no model is set.
 
 When the resolved setting is `inherit`, the extension passes the current parent model (`provider/id`) to the child `pi` process. This gives real parent-model inheritance rather than falling back to the global default model.
+
+Agents can also define thinking/effort in frontmatter:
+
+```yaml
+thinking: inherit
+```
+
+Supported values:
+
+```text
+inherit, off, minimal, low, medium, high, xhigh
+```
+
+Explicit values are passed to child `pi` with `--thinking <level>`. Pi's model shorthand is also accepted:
+
+```yaml
+model: copproxy/gpt-5.5:high
+```
+
+A thinking suffix in `model:` takes precedence over `thinking:`.
 
 ### Handoff
 

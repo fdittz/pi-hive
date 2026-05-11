@@ -500,6 +500,7 @@ name: my-agent
 description: What this agent does
 tools: read, grep, find, ls
 model: inherit
+thinking: inherit
 color: cyan
 handoffAllowList: reviewer, planner
 ---
@@ -549,14 +550,38 @@ Hex truecolor is also supported:
 
 Invalid or missing colors fall back to the active pi theme's `accent`/`toolTitle` colors.
 
+### Thinking level
+
+Agents can define a thinking/effort level in frontmatter:
+
+```yaml
+thinking: inherit
+```
+
+Supported values:
+
+```text
+inherit, off, minimal, low, medium, high, xhigh
+```
+
+`inherit` is the default and means the child process uses pi's inherited/default thinking behavior. Explicit values are passed to child `pi` with `--thinking <level>`.
+
+You may also use pi's model shorthand in `model:`:
+
+```yaml
+model: copproxy/gpt-5.5:high
+```
+
+An explicit suffix in `model:` takes precedence over `thinking:`.
+
 ## Sample Agents
 
-| Agent | Purpose | Model | Color | Tools |
-|-------|---------|-------|-------|-------|
-| `scout` | Fast codebase recon | inherit | cyan | read, grep, find, ls, bash |
-| `planner` | Implementation plans | inherit | yellow | read, grep, find, ls |
-| `reviewer` | Code review | inherit | red | read, grep, find, ls, bash |
-| `worker` | General-purpose | inherit | green | (all default) |
+| Agent | Purpose | Model | Thinking | Color | Tools |
+|-------|---------|-------|----------|-------|-------|
+| `scout` | Fast codebase recon | inherit | inherit | cyan | read, grep, find, ls, bash |
+| `planner` | Implementation plans | inherit | inherit | yellow | read, grep, find, ls |
+| `reviewer` | Code review | inherit | inherit | red | read, grep, find, ls, bash |
+| `worker` | General-purpose | inherit | inherit | green | (all default) |
 
 ## Continuable runs
 
