@@ -1,5 +1,5 @@
 {
-  "name": "pi-hive",
+  "name": "@fdittz/pi-hive",
   "version": "0.1.0",
   "description": "Coordinated subagent orchestration for pi with live transcripts, handoffs, continuable runs, model selection, and custom headers.",
   "type": "module",
@@ -37,5 +37,9 @@
   "scripts": {
     "check:load": "pi --no-extensions -e ./index.ts --list-models",
     "check:no-private-imports": "! grep -R 'pi-coding-agent/dist' . --include='*.ts'"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/fdittz/pi-hive.git"
   }
 }

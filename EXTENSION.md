@@ -7,20 +7,20 @@ This extension adds a `subagent` tool to pi. The tool delegates work to speciali
 This repository is installable as a pi package from GitHub.
 
 ```bash
-pi install git:github.com/<owner>/<repo>
+pi install git:git@github.com:fdittz/pi-hive.git
 ```
 
 With an explicit ref:
 
 ```bash
-pi install git:github.com/<owner>/<repo>@main
-pi install git:github.com/<owner>/<repo>@v0.1.0
+pi install git:git@github.com:fdittz/pi-hive.git@main
+pi install git:git@github.com:fdittz/pi-hive.git@v0.1.0
 ```
 
 For temporary testing without adding the package to settings:
 
 ```bash
-pi -e git:github.com/<owner>/<repo>
+pi -e git:git@github.com:fdittz/pi-hive.git
 ```
 
 For local development from this checkout:

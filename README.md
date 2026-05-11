@@ -50,23 +50,23 @@ pi-hive/
 
 ## Installation from GitHub
 
-This directory is a self-contained pi package. After pushing it to a GitHub repository, install it with:
+This repository is a self-contained pi package. Install it from GitHub over SSH with:
 
 ```bash
-pi install git:github.com/<owner>/<repo>
+pi install git:git@github.com:fdittz/pi-hive.git
 ```
 
 Or with an explicit ref:
 
 ```bash
-pi install git:github.com/<owner>/<repo>@main
-pi install git:github.com/<owner>/<repo>@v0.1.0
+pi install git:git@github.com:fdittz/pi-hive.git@main
+pi install git:git@github.com:fdittz/pi-hive.git@v0.1.0
 ```
 
 For a one-off test without adding it to settings:
 
 ```bash
-pi -e git:github.com/<owner>/<repo>
+pi -e git:git@github.com:fdittz/pi-hive.git
 ```
 
 The package manifest is in `package.json`:

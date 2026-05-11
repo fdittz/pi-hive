@@ -8,3 +8,4 @@ pnpm-debug.log*
 *.log
 .pi/
 subagent-transcripts/
+*.tgz
