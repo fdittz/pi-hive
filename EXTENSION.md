@@ -64,6 +64,7 @@ The project/repository copy is:
 - Stream child process JSON events from each subagent.
 - Preserve the existing compact/expanded `subagent` tool result display.
 - Open a fullscreen live transcript overlay with `/subagents`, `Ctrl+Shift+O`, or fallback `Alt+O`.
+- Configure per-subagent model selection with `/subagent-model`.
 - Navigate historical subagent runs from the current main session.
 - Persist completed subagent transcripts as compressed `.jsonl.gz` sidecar files.
 - Rehydrate persisted subagent transcripts when the main pi session is resumed.
@@ -90,6 +91,27 @@ Some terminals do not distinguish `Ctrl+Shift+O` from `Ctrl+O`. Use `Alt+O` if t
 ### `Alt+O`
 
 Fallback shortcut to open or close the fullscreen subagent transcript viewer.
+
+### `/subagent-model`
+
+Configure which model each subagent uses.
+
+Flow:
+
+1. Select a subagent from the available agents list.
+2. Select `inherit` or a specific available model.
+3. After selecting, the command returns to the subagent list so another agent can be configured.
+4. Press `Esc` from the subagent list to exit.
+
+`inherit` is the default. It means the subagent process inherits the current parent pi model (`ctx.model`) explicitly. If no parent model is available, the child process falls back to pi's default model behavior.
+
+Overrides are stored in:
+
+```text
+~/.pi/agent/subagent-models.json
+```
+
+Selecting `inherit` removes that agent's override from the config file.
 
 ## Live viewer keybindings
 
@@ -203,7 +225,8 @@ Agents are Markdown files with YAML frontmatter:
 name: scout
 description: Fast codebase recon that returns compressed context for handoff to other agents
 tools: read, grep, find, ls, bash
-model: copproxy/gpt-5.5
+model: inherit
+color: cyan
 ---
 
 System prompt goes here.
@@ -230,6 +253,51 @@ The extension supports project-local agents from:
 ```
 
 Project-local agents are only used when `agentScope` is set to `"project"` or `"both"`. Project-local agents override both bundled package agents and user-level agents. The extension asks for confirmation before running project-local agents in interactive mode because those prompts are repository-controlled.
+
+### Agent colors
+
+Agents can define a presentation-only color in frontmatter:
+
+```yaml
+color: cyan
+```
+
+The color is used in the `/subagents` live viewer and the normal `subagent` tool result. The run stores `agentColor` in its details so historical runs keep the color used at execution time.
+
+Supported simple color names:
+
+```text
+red, green, yellow, blue, magenta, purple, cyan, orange, gray, grey, white
+```
+
+Supported pi theme color names:
+
+```text
+accent, border, borderAccent, borderMuted, success, error, warning, muted, dim, text,
+thinkingText, userMessageText, customMessageText, customMessageLabel, toolTitle, toolOutput,
+mdHeading, mdLink, mdLinkUrl, mdCode, mdCodeBlock, mdCodeBlockBorder, mdQuote,
+mdQuoteBorder, mdHr, mdListBullet, toolDiffAdded, toolDiffRemoved, toolDiffContext,
+syntaxComment, syntaxKeyword, syntaxFunction, syntaxVariable, syntaxString, syntaxNumber,
+syntaxType, syntaxOperator, syntaxPunctuation, thinkingOff, thinkingMinimal, thinkingLow,
+thinkingMedium, thinkingHigh, thinkingXhigh, bashMode
+```
+
+Hex truecolor is also supported:
+
+```text
+#38bdf8, #f97316, #a78bfa
+```
+
+Invalid or missing colors fall back to the active pi theme's `accent`/`toolTitle` colors.
+
+Bundled defaults:
+
+| Agent | Color |
+|-------|-------|
+| `scout` | cyan |
+| `planner` | yellow |
+| `reviewer` | red |
+| `worker` | green |
 
 ## Execution model
 
@@ -289,6 +357,7 @@ Registers:
 
 - `subagent` tool
 - `/subagents` command
+- `/subagent-model` command
 - `Ctrl+Shift+O` shortcut
 - `Alt+O` shortcut
 - session hydration/shutdown hooks
@@ -301,7 +370,34 @@ Captures JSON events from child pi processes and stores run metadata.
 agents.ts
 ```
 
-Loads user-level and optionally project-level agent definitions.
+Loads bundled, user-level, and optionally project-level agent definitions, including presentation metadata such as `color:`.
+
+### Agent colors
+
+```text
+agent-colors.ts
+```
+
+Resolves `color:` frontmatter values to ANSI/theme styling for the live viewer and tool result rendering.
+
+### Model overrides
+
+```text
+model-overrides.ts
+model-selector.ts
+```
+
+`model-overrides.ts` reads and writes `~/.pi/agent/subagent-models.json`, resolves `inherit`, and formats model references.
+
+`model-selector.ts` implements the `/subagent-model` interactive loop.
+
+Resolution order:
+
+1. saved override in `~/.pi/agent/subagent-models.json`;
+2. `model:` in the agent frontmatter;
+3. `inherit` if no model is set.
+
+When the resolved setting is `inherit`, the extension passes the current parent model (`provider/id`) to the child `pi` process. This gives real parent-model inheritance rather than falling back to the global default model.
 
 ### Live run registry
 

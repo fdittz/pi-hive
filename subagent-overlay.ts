@@ -1,5 +1,6 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
+import { colorAgentText } from "./agent-colors.js";
 import type { LiveSubagentRegistry } from "./live-registry.js";
 import { TranscriptView } from "./transcript-view.js";
 import type { SubagentRunRecord } from "./transcript-types.js";
@@ -142,8 +143,10 @@ export class SubagentOverlay implements Component {
 	}
 
 	private renderHeader(run: SubagentRunRecord, total: number, width: number): string[] {
-		const top = this.theme.fg("borderAccent", "─".repeat(Math.max(0, width)));
-		const title = `${this.theme.bold(this.theme.fg("accent", "Subagents"))} ${this.theme.fg("muted", `${this.selectedIndex + 1}/${total}`)} ${statusIcon(run.status)} ${this.theme.fg("toolTitle", run.agent)} ${this.theme.fg("muted", `[${run.mode}]`)} ${run.model ? this.theme.fg("dim", run.model) : ""}`;
+		const borderColor = run.agentColor || "borderAccent";
+		const top = colorAgentText(this.theme, borderColor, "─".repeat(Math.max(0, width)), "borderAccent");
+		const agentName = this.theme.bold(colorAgentText(this.theme, run.agentColor, run.agent, "toolTitle"));
+		const title = `${this.theme.bold(this.theme.fg("accent", "Subagents"))} ${this.theme.fg("muted", `${this.selectedIndex + 1}/${total}`)} ${statusIcon(run.status)} ${agentName} ${this.theme.fg("muted", `[${run.mode}]`)} ${run.model ? this.theme.fg("dim", run.model) : ""}`;
 		const ctx = `${this.theme.fg("muted", "cwd:")} ${this.theme.fg("dim", shortCwd(run.cwd || process.cwd()))}`;
 		const help = this.theme.fg(
 			"dim",

@@ -13,6 +13,7 @@ For complete local extension documentation, see [`EXTENSION.md`](./EXTENSION.md)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Abort support**: Ctrl+C propagates to kill subagent processes
 - **Live transcript view**: Open a fullscreen overlay with `/subagents`, `Ctrl+Shift+O`, or fallback `Alt+O`
+- **Model selection**: Use `/subagent-model` to configure each subagent to inherit the parent model or use a specific available model
 - **Persistent transcripts**: Completed subagent JSON streams are saved as compressed `.jsonl.gz` sidecars and reload with the main session
 
 ## Structure
@@ -146,6 +147,25 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 /implement-and-review add input validation to API endpoints
 ```
 
+### Configure subagent models
+
+```text
+/subagent-model
+```
+
+This opens an interactive loop:
+
+1. Select a subagent.
+2. Select `inherit` or a specific available model.
+3. After saving, return to the subagent list to configure another one.
+4. Press `Esc` from the subagent list to exit.
+
+`inherit` is the default. It means the child subagent process uses the current parent pi model (`ctx.model`) rather than a hard-coded model from the agent file. Model overrides are stored in:
+
+```text
+~/.pi/agent/subagent-models.json
+```
+
 ## Tool Modes
 
 | Mode | Parameter | Description |
@@ -224,7 +244,8 @@ Agents are markdown files with YAML frontmatter:
 name: my-agent
 description: What this agent does
 tools: read, grep, find, ls
-model: claude-haiku-4-5
+model: inherit
+color: cyan
 ---
 
 System prompt for the agent goes here.
@@ -236,14 +257,50 @@ System prompt for the agent goes here.
 
 Project agents override user agents with the same name when `agentScope: "both"`.
 
+### Agent colors
+
+Agents can define a presentation-only color in frontmatter:
+
+```yaml
+color: cyan
+```
+
+The color is used in the `/subagents` live viewer and in the normal `subagent` tool result to make agents easier to distinguish. It is also persisted in run details so historical runs keep the color they had when executed.
+
+Supported simple color names:
+
+```text
+red, green, yellow, blue, magenta, purple, cyan, orange, gray, grey, white
+```
+
+Supported pi theme color names:
+
+```text
+accent, border, borderAccent, borderMuted, success, error, warning, muted, dim, text,
+thinkingText, userMessageText, customMessageText, customMessageLabel, toolTitle, toolOutput,
+mdHeading, mdLink, mdLinkUrl, mdCode, mdCodeBlock, mdCodeBlockBorder, mdQuote,
+mdQuoteBorder, mdHr, mdListBullet, toolDiffAdded, toolDiffRemoved, toolDiffContext,
+syntaxComment, syntaxKeyword, syntaxFunction, syntaxVariable, syntaxString, syntaxNumber,
+syntaxType, syntaxOperator, syntaxPunctuation, thinkingOff, thinkingMinimal, thinkingLow,
+thinkingMedium, thinkingHigh, thinkingXhigh, bashMode
+```
+
+Hex truecolor is also supported:
+
+```text
+#38bdf8, #f97316, #a78bfa
+```
+
+Invalid or missing colors fall back to the active pi theme's `accent`/`toolTitle` colors.
+
 ## Sample Agents
 
-| Agent | Purpose | Model | Tools |
-|-------|---------|-------|-------|
-| `scout` | Fast codebase recon | Haiku | read, grep, find, ls, bash |
-| `planner` | Implementation plans | Sonnet | read, grep, find, ls |
-| `reviewer` | Code review | Sonnet | read, grep, find, ls, bash |
-| `worker` | General-purpose | Sonnet | (all default) |
+| Agent | Purpose | Model | Color | Tools |
+|-------|---------|-------|-------|-------|
+| `scout` | Fast codebase recon | inherit | cyan | read, grep, find, ls, bash |
+| `planner` | Implementation plans | inherit | yellow | read, grep, find, ls |
+| `reviewer` | Code review | inherit | red | read, grep, find, ls, bash |
+| `worker` | General-purpose | inherit | green | (all default) |
 
 ## Workflow Prompts
 

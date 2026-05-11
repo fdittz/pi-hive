@@ -1,7 +1,7 @@
 {
   "name": "pi-subagents-live",
   "version": "0.1.0",
-  "description": "Self-contained pi subagent extension with live fullscreen transcript viewer and persistent gzipped transcripts.",
+  "description": "Self-contained pi subagent extension with live fullscreen transcript viewer, model selection, and persistent gzipped transcripts.",
   "type": "module",
   "license": "MIT",
   "keywords": [

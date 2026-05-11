@@ -1,5 +1,6 @@
 import { VERSION, type Theme } from "@earendil-works/pi-coding-agent";
 import type { Message } from "@earendil-works/pi-ai";
+import { colorAgentText } from "./agent-colors.js";
 import type { StoredTranscriptEvent, SubagentRunRecord } from "./transcript-types.js";
 
 export function getCompatibilityWarning(): string | undefined {
@@ -83,7 +84,7 @@ export function renderPlainTranscript(run: SubagentRunRecord, theme?: Theme): st
 	const accent = (s: string) => (theme ? theme.fg("accent", s) : s);
 	const error = (s: string) => (theme ? theme.fg("error", s) : s);
 	const lines: string[] = [];
-	lines.push(`${accent(run.agent)} ${muted(`[${run.status}]`)} ${run.model ? muted(run.model) : ""}`.trimEnd());
+	lines.push(`${theme ? colorAgentText(theme, run.agentColor, run.agent, "accent") : accent(run.agent)} ${muted(`[${run.status}]`)} ${run.model ? muted(run.model) : ""}`.trimEnd());
 	lines.push(`${muted("Task:")} ${run.task}`);
 	if (run.transcriptStorageError) lines.push(error(`Transcript storage: ${run.transcriptStorageError}`));
 	if (run.errorMessage) lines.push(error(`Error: ${run.errorMessage}`));

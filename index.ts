@@ -22,9 +22,12 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { colorAgentText } from "./agent-colors.js";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { getCompatibilityWarning } from "./compatibility.js";
 import { LiveSubagentRegistry } from "./live-registry.js";
+import { loadSubagentModelConfig, resolveAgentModel } from "./model-overrides.js";
+import { openSubagentModelSelector } from "./model-selector.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
 import { TranscriptStorage } from "./transcript-storage.js";
 import { shouldPersistReplayEvent, type StoredTranscriptEvent, type SubagentRunMode, type TranscriptStorageRef } from "./transcript-types.js";
@@ -152,6 +155,7 @@ interface SingleResult {
 	runId?: string;
 	agent: string;
 	agentSource: "package" | "user" | "project" | "unknown";
+	agentColor?: string;
 	task: string;
 	cwd?: string;
 	exitCode: number;
@@ -255,6 +259,7 @@ type RunMeta = {
 	mode: SubagentRunMode;
 	index?: number;
 	sessionFile?: string;
+	parentModel?: { provider: string; id: string };
 };
 
 async function runSingleAgent(
@@ -286,20 +291,23 @@ async function runSingleAgent(
 	}
 
 	const effectiveCwd = cwd ?? defaultCwd;
+	const modelConfig = loadSubagentModelConfig();
+	const resolvedModel = resolveAgentModel(agent, runMeta.parentModel, modelConfig);
 	const run = registry.startRun({
 		parentToolCallId: runMeta.parentToolCallId,
 		mode: runMeta.mode,
 		agent: agentName,
 		agentSource: agent.source,
+		agentColor: agent.color,
 		task,
 		cwd: effectiveCwd,
 		step,
 		index: runMeta.index,
-		model: agent.model,
+		model: resolvedModel.display,
 	});
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (agent.model) args.push("--model", agent.model);
+	if (resolvedModel.modelArg) args.push("--model", resolvedModel.modelArg);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;
@@ -309,13 +317,14 @@ async function runSingleAgent(
 		runId: run.id,
 		agent: agentName,
 		agentSource: agent.source,
+		agentColor: agent.color,
 		task,
 		cwd: effectiveCwd,
 		exitCode: 0,
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
+		model: resolvedModel.display,
 		step,
 		index: runMeta.index,
 		replayEvents: [],
@@ -547,6 +556,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("subagent-model", {
+		description: "Configure which model each subagent uses",
+		handler: async (_args, ctx) => {
+			await openSubagentModelSelector(ctx);
+		},
+	});
+
 	pi.registerShortcut("ctrl+shift+o", {
 		description: "Open/close the live subagent view",
 		handler: async (ctx) => {
@@ -578,6 +594,7 @@ export default function (pi: ExtensionAPI) {
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 			const sessionFile = getSessionFile(ctx);
+			const parentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
@@ -664,7 +681,7 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						chainUpdate,
 						makeDetails("chain"),
-						{ parentToolCallId: toolCallId, mode: "chain", index: i, sessionFile },
+						{ parentToolCallId: toolCallId, mode: "chain", index: i, sessionFile, parentModel },
 					);
 					results.push(result);
 
@@ -745,7 +762,7 @@ export default function (pi: ExtensionAPI) {
 							}
 						},
 						makeDetails("parallel"),
-						{ parentToolCallId: toolCallId, mode: "parallel", index, sessionFile },
+						{ parentToolCallId: toolCallId, mode: "parallel", index, sessionFile, parentModel },
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -780,7 +797,7 @@ export default function (pi: ExtensionAPI) {
 					signal,
 					onUpdate,
 					makeDetails("single"),
-					{ parentToolCallId: toolCallId, mode: "single", index: 0, sessionFile },
+					{ parentToolCallId: toolCallId, mode: "single", index: 0, sessionFile, parentModel },
 				);
 				const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 				if (isError) {
@@ -857,6 +874,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const mdTheme = getMarkdownTheme();
+			const renderAgentName = (r: SingleResult) => colorAgentText(theme, r.agentColor, r.agent, "accent");
+			const renderAgentTitle = (r: SingleResult) => theme.bold(colorAgentText(theme, r.agentColor, r.agent, "toolTitle"));
 
 			const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
 				const toShow = limit ? items.slice(-limit) : items;
@@ -883,7 +902,7 @@ export default function (pi: ExtensionAPI) {
 
 				if (expanded) {
 					const container = new Container();
-					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+					let header = `${icon} ${renderAgentTitle(r)}${theme.fg("muted", ` (${r.agentSource})`)}`;
 					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					container.addChild(new Text(header, 0, 0));
 					if (isError && r.errorMessage)
@@ -919,7 +938,7 @@ export default function (pi: ExtensionAPI) {
 					return container;
 				}
 
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+				let text = `${icon} ${renderAgentTitle(r)}${theme.fg("muted", ` (${r.agentSource})`)}`;
 				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
 				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
@@ -970,7 +989,7 @@ export default function (pi: ExtensionAPI) {
 						container.addChild(new Spacer(1));
 						container.addChild(
 							new Text(
-								`${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}`,
+								`${theme.fg("muted", `─── Step ${r.step}: `) + renderAgentName(r)} ${rIcon}`,
 								0,
 								0,
 							),
@@ -1017,7 +1036,7 @@ export default function (pi: ExtensionAPI) {
 				for (const r of details.results) {
 					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
+					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${renderAgentName(r)} ${rIcon}`;
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}
@@ -1058,7 +1077,7 @@ export default function (pi: ExtensionAPI) {
 
 						container.addChild(new Spacer(1));
 						container.addChild(
-							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
+							new Text(`${theme.fg("muted", "─── ") + renderAgentName(r)} ${rIcon}`, 0, 0),
 						);
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 
@@ -1103,7 +1122,7 @@ export default function (pi: ExtensionAPI) {
 								? theme.fg("success", "✓")
 								: theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
+					text += `\n\n${theme.fg("muted", "─── ")}${renderAgentName(r)} ${rIcon}`;
 					if (displayItems.length === 0)
 						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;

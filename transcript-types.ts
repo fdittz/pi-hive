@@ -31,6 +31,7 @@ export interface SubagentRunRecord {
 	mode: SubagentRunMode;
 	agent: string;
 	agentSource: AgentSource;
+	agentColor?: string;
 	task: string;
 	cwd: string;
 	step?: number;
@@ -62,6 +63,7 @@ export interface StartRunInput {
 	mode: SubagentRunMode;
 	agent: string;
 	agentSource: AgentSource;
+	agentColor?: string;
 	task: string;
 	cwd: string;
 	step?: number;
@@ -81,6 +83,7 @@ export interface HistoricalResultLike {
 	runId?: string;
 	agent: string;
 	agentSource?: AgentSource;
+	agentColor?: string;
 	task: string;
 	cwd?: string;
 	exitCode?: number;
