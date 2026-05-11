@@ -145,36 +145,35 @@ function sameMessageStream(a: StoredTranscriptEvent, b: StoredTranscriptEvent): 
 	return Boolean(left.role && right.role && left.role === right.role);
 }
 
-function removePendingMessageUpdates(events: StoredTranscriptEvent[], event: StoredTranscriptEvent): void {
+function findPendingMessageUpdateIndex(events: StoredTranscriptEvent[], event: StoredTranscriptEvent): number {
 	for (let i = events.length - 1; i >= 0; i--) {
 		const existing = events[i];
-		if (existing.type === "message_update" && sameMessageStream(existing, event)) {
-			events.splice(i, 1);
-			continue;
-		}
-		if ((existing.type === "message_start" || existing.type === "message_end") && sameMessageStream(existing, event)) {
-			break;
-		}
+		if (existing.type === "message_update" && sameMessageStream(existing, event)) return i;
+		if ((existing.type === "message_start" || existing.type === "message_end") && sameMessageStream(existing, event)) break;
 	}
+	return -1;
 }
 
-function removePendingToolUpdates(events: StoredTranscriptEvent[], toolCallId: unknown): void {
-	if (!toolCallId) return;
+function findPendingToolUpdateIndex(events: StoredTranscriptEvent[], toolCallId: unknown): number {
+	if (!toolCallId) return -1;
 	for (let i = events.length - 1; i >= 0; i--) {
 		const existing = events[i];
 		if (existing.toolCallId !== toolCallId) continue;
-		if (existing.type === "tool_execution_update") events.splice(i, 1);
+		if (existing.type === "tool_execution_update") return i;
 		if (existing.type === "tool_execution_start" || existing.type === "tool_execution_end") break;
 	}
+	return -1;
 }
 
 export function appendCoalescedTranscriptEvent(events: StoredTranscriptEvent[], event: StoredTranscriptEvent): void {
-	if (event.type === "message_update" || event.type === "message_end") {
-		removePendingMessageUpdates(events, event);
-	} else if (event.type === "tool_execution_update" || event.type === "tool_execution_end") {
-		removePendingToolUpdates(events, event.toolCallId);
+	let replacementIndex = -1;
+	if (event.type === "message_update") {
+		replacementIndex = findPendingMessageUpdateIndex(events, event);
+	} else if (event.type === "tool_execution_update") {
+		replacementIndex = findPendingToolUpdateIndex(events, event.toolCallId);
 	}
-	events.push(event);
+	if (replacementIndex >= 0) events[replacementIndex] = event;
+	else events.push(event);
 }
 
 export function shouldPersistReplayEvent(event: StoredTranscriptEvent): boolean {

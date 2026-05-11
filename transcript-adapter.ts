@@ -65,10 +65,21 @@ export class TranscriptAdapter {
 		}
 	}
 
+	consumeMany(events: readonly StoredTranscriptEvent[], startIndex = 0): number {
+		let consumed = 0;
+		for (let i = Math.max(0, startIndex); i < events.length; i++) {
+			this.consume(events[i]);
+			consumed++;
+			if (this.failed) break;
+		}
+		return consumed;
+	}
+
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
 		for (const component of this.pendingTools.values()) component.setExpanded(expanded);
 		this.setExpandedOnChildren(this.container.children, expanded);
+		this.container.invalidate();
 	}
 
 	render(width: number): string[] {

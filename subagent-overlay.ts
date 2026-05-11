@@ -110,7 +110,6 @@ export class SubagentOverlay implements Component {
 		}
 		if (matchesKey(data, "ctrl+o")) {
 			this.expanded = !this.expanded;
-			this.transcriptView.invalidate();
 			this.tui.requestRender();
 			return;
 		}
