@@ -1,0 +1,40 @@
+{
+  "name": "pi-subagents-live",
+  "version": "0.1.0",
+  "description": "Self-contained pi subagent extension with live fullscreen transcript viewer and persistent gzipped transcripts.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "subagents",
+    "agent-orchestration"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "prompts": [
+      "./prompts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "files": [
+    "*.ts",
+    "agents/",
+    "prompts/",
+    "docs/",
+    "README.md",
+    "EXTENSION.md"
+  ],
+  "scripts": {
+    "check:load": "pi --no-extensions -e ./index.ts --list-models",
+    "check:no-private-imports": "! grep -R 'pi-coding-agent/dist' . --include='*.ts'"
+  }
+}

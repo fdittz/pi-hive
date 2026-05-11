@@ -1,0 +1,123 @@
+import type { Message } from "@earendil-works/pi-ai";
+
+export type SubagentRunStatus = "running" | "done" | "failed" | "aborted";
+export type SubagentRunMode = "single" | "parallel" | "chain";
+export type AgentSource = "package" | "user" | "project" | "unknown";
+
+export interface StoredTranscriptEvent {
+	type: string;
+	[key: string]: unknown;
+}
+
+export interface TranscriptStorageRef {
+	kind: "gzip-jsonl-v1";
+	relativePath: string;
+	absolutePath?: string;
+	sha256: string;
+	eventCount: number;
+	uncompressedBytes: number;
+	compressedBytes: number;
+	createdAt: number;
+}
+
+export interface TranscriptPersistResult {
+	ref?: TranscriptStorageRef;
+	error?: string;
+}
+
+export interface SubagentRunRecord {
+	id: string;
+	parentToolCallId: string;
+	mode: SubagentRunMode;
+	agent: string;
+	agentSource: AgentSource;
+	task: string;
+	cwd: string;
+	step?: number;
+	index?: number;
+	model?: string;
+	status: SubagentRunStatus;
+	startedAt: number;
+	endedAt?: number;
+	exitCode?: number;
+	stopReason?: string;
+	errorMessage?: string;
+	stderr?: string;
+
+	/** Live event stream, may contain high-frequency message_update/tool_execution_update events. */
+	liveEvents: StoredTranscriptEvent[];
+
+	/** Compact replay events safe to persist into session details as fallback. */
+	replayEvents: StoredTranscriptEvent[];
+
+	/** Full transcript sidecar reference, available after a run finishes and storage succeeds. */
+	transcriptRef?: TranscriptStorageRef;
+
+	/** Storage failure message, if full gzip persistence failed but normal tool execution continued. */
+	transcriptStorageError?: string;
+}
+
+export interface StartRunInput {
+	parentToolCallId: string;
+	mode: SubagentRunMode;
+	agent: string;
+	agentSource: AgentSource;
+	task: string;
+	cwd: string;
+	step?: number;
+	index?: number;
+	model?: string;
+}
+
+export interface FinishRunInput {
+	status: SubagentRunStatus;
+	exitCode?: number;
+	stopReason?: string;
+	errorMessage?: string;
+	stderr?: string;
+}
+
+export interface HistoricalResultLike {
+	runId?: string;
+	agent: string;
+	agentSource?: AgentSource;
+	task: string;
+	cwd?: string;
+	exitCode?: number;
+	messages?: Message[];
+	model?: string;
+	stopReason?: string;
+	errorMessage?: string;
+	stderr?: string;
+	step?: number;
+	index?: number;
+	replayEvents?: StoredTranscriptEvent[];
+	transcriptRef?: TranscriptStorageRef;
+	transcriptStorageError?: string;
+}
+
+export function hasMessage(event: StoredTranscriptEvent): event is StoredTranscriptEvent & { message: Message } {
+	return typeof event === "object" && event !== null && "message" in event;
+}
+
+export function shouldPersistReplayEvent(event: StoredTranscriptEvent): boolean {
+	// Keep session details compact. The full stream, including high-frequency and aggregate
+	// lifecycle events, is persisted in the gzip sidecar. The fallback only needs finalized
+	// messages plus tool start/end events to reconstruct a useful transcript.
+	switch (event.type) {
+		case "message_end":
+		case "tool_execution_start":
+		case "tool_execution_end":
+		case "tool_result_end":
+			return true;
+		default:
+			return false;
+	}
+}
+
+export function statusFromExit(exitCode: number | undefined, stopReason?: string): SubagentRunStatus {
+	if (stopReason === "aborted") return "aborted";
+	if (exitCode === undefined || exitCode === -1) return "running";
+	if (exitCode === 0 && stopReason !== "error") return "done";
+	return "failed";
+}
