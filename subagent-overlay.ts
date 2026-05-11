@@ -3,7 +3,7 @@ import { Key, matchesKey, truncateToWidth, visibleWidth, type Component, type TU
 import { colorAgentText } from "./agent-colors.js";
 import type { LiveSubagentRegistry } from "./live-registry.js";
 import { TranscriptView } from "./transcript-view.js";
-import type { SubagentRunRecord } from "./transcript-types.js";
+import { formatRunLabel, getRunShortId, type SubagentRunRecord } from "./transcript-types.js";
 
 function statusIcon(status: string): string {
 	switch (status) {
@@ -37,6 +37,7 @@ export class SubagentOverlay implements Component {
 		private theme: Theme,
 		private done: () => void,
 		private registry: LiveSubagentRegistry,
+		private initialRunId?: string,
 	) {
 		this.unsubscribe = registry.subscribe(() => {
 			this.transcriptView.invalidate();
@@ -49,7 +50,10 @@ export class SubagentOverlay implements Component {
 		const height = Math.max(8, this.tui.terminal.rows || 24);
 		const runs = this.registry.getRunsSortedByStartTime();
 		if (runs.length === 0) return this.renderEmpty(safeWidth, height);
-		if (this.selectedIndex < 0) this.selectedIndex = runs.length - 1;
+		if (this.selectedIndex < 0) {
+			const initialIndex = this.initialRunId ? runs.findIndex((run) => run.id === this.initialRunId) : -1;
+			this.selectedIndex = initialIndex >= 0 ? initialIndex : runs.length - 1;
+		}
 		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, runs.length - 1));
 		const run = runs[this.selectedIndex];
 
@@ -145,9 +149,10 @@ export class SubagentOverlay implements Component {
 	private renderHeader(run: SubagentRunRecord, total: number, width: number): string[] {
 		const borderColor = run.agentColor || "borderAccent";
 		const top = colorAgentText(this.theme, borderColor, "─".repeat(Math.max(0, width)), "borderAccent");
-		const agentName = this.theme.bold(colorAgentText(this.theme, run.agentColor, run.agent, "toolTitle"));
+		const runLabel = formatRunLabel(run.agent, run.id);
+		const agentName = this.theme.bold(colorAgentText(this.theme, run.agentColor, runLabel, "toolTitle"));
 		const title = `${this.theme.bold(this.theme.fg("accent", "Subagents"))} ${this.theme.fg("muted", `${this.selectedIndex + 1}/${total}`)} ${statusIcon(run.status)} ${agentName} ${this.theme.fg("muted", `[${run.mode}]`)} ${run.model ? this.theme.fg("dim", run.model) : ""}`;
-		const ctx = `${this.theme.fg("muted", "cwd:")} ${this.theme.fg("dim", shortCwd(run.cwd || process.cwd()))}`;
+		const ctx = `${this.theme.fg("muted", "id:")} ${this.theme.fg("dim", getRunShortId(run.id))} ${this.theme.fg("muted", "cwd:")} ${this.theme.fg("dim", shortCwd(run.cwd || process.cwd()))}`;
 		const help = this.theme.fg(
 			"dim",
 			"←/→ agent · ↑/↓ scroll · PgUp/PgDn · Ctrl+O expand · Alt+O/Esc/q back",

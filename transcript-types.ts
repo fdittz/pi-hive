@@ -124,3 +124,33 @@ export function statusFromExit(exitCode: number | undefined, stopReason?: string
 	if (exitCode === 0 && stopReason !== "error") return "done";
 	return "failed";
 }
+
+export function getRunUuid(runId: string | undefined): string {
+	if (!runId) return "";
+	return runId.split(":").pop() || runId;
+}
+
+export function getRunShortId(runId: string | undefined, length = 8): string {
+	const compact = getRunUuid(runId).replace(/-/g, "");
+	return compact.slice(0, Math.max(1, length));
+}
+
+export function formatRunLabel(agent: string, runId: string | undefined, length = 8): string {
+	const shortId = getRunShortId(runId, length);
+	return shortId ? `${agent}@${shortId}` : agent;
+}
+
+export function runMatchesPrefix(run: Pick<SubagentRunRecord, "id" | "agent">, query: string): boolean {
+	const normalized = query.trim().toLowerCase();
+	if (!normalized) return false;
+	const shortId = getRunShortId(run.id, 32).toLowerCase();
+	const uuid = getRunUuid(run.id).toLowerCase();
+	const full = run.id.toLowerCase();
+	const label = formatRunLabel(run.agent, run.id, 32).toLowerCase();
+	return (
+		shortId.startsWith(normalized) ||
+		uuid.startsWith(normalized) ||
+		full.includes(normalized) ||
+		label.startsWith(normalized)
+	);
+}

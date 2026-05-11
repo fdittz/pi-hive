@@ -182,11 +182,29 @@ Open the subagent transcript viewer with:
 
 ```text
 /subagents
+/subagents <run-prefix>
 Ctrl+Shift+O
 Alt+O
 ```
 
 `Alt+O` is provided as a fallback because some terminals do not distinguish `Ctrl+Shift+O` from `Ctrl+O`.
+
+Runs are displayed as `agent@shortid`, similar to short Git commit hashes, for example:
+
+```text
+scout@d82c9a36
+planner@a91c2f11
+worker@e2b4a77c
+```
+
+The short id is derived from the final UUID segment of the full run id. You can open a specific run by unique prefix:
+
+```text
+/subagents d82c9a36
+/subagents scout@d82c9a36
+```
+
+If the prefix is ambiguous or not found, pi shows a warning and does not open the viewer.
 
 Inside the viewer:
 

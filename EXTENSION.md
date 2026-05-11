@@ -80,6 +80,15 @@ Open the live/historical subagent transcript viewer.
 /subagents
 ```
 
+Open a specific run by unique short id or label prefix:
+
+```text
+/subagents d82c9a36
+/subagents scout@d82c9a36
+```
+
+Runs are displayed as `agent@shortid`, similar to short Git commit hashes. The short id is derived from the final UUID segment of the full run id. If a prefix matches more than one run, the command reports an ambiguity warning.
+
 The command is UI-only. In JSON/print mode it exits without opening an overlay because no TUI is available.
 
 ### `Ctrl+Shift+O`
@@ -361,6 +370,7 @@ Registers:
 - `Ctrl+Shift+O` shortcut
 - `Alt+O` shortcut
 - session hydration/shutdown hooks
+- short run labels such as `scout@d82c9a36`
 
 Captures JSON events from child pi processes and stores run metadata.
 

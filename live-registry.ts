@@ -9,6 +9,7 @@ import {
 	type StoredTranscriptEvent,
 	type SubagentRunRecord,
 	statusFromExit,
+	runMatchesPrefix,
 	type TranscriptStorageRef,
 } from "./transcript-types.js";
 
@@ -113,6 +114,12 @@ export class LiveSubagentRegistry {
 
 	getRunsSortedByStartTime(): SubagentRunRecord[] {
 		return Array.from(this.runs.values()).sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
+	}
+
+	findRunsByPrefix(query: string): SubagentRunRecord[] {
+		const trimmed = query.trim();
+		if (!trimmed) return [];
+		return this.getRunsSortedByStartTime().filter((run) => runMatchesPrefix(run, trimmed));
 	}
 
 	clearRuns(): void {

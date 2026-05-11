@@ -30,7 +30,7 @@ import { loadSubagentModelConfig, resolveAgentModel } from "./model-overrides.js
 import { openSubagentModelSelector } from "./model-selector.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
 import { TranscriptStorage } from "./transcript-storage.js";
-import { shouldPersistReplayEvent, type StoredTranscriptEvent, type SubagentRunMode, type TranscriptStorageRef } from "./transcript-types.js";
+import { formatRunLabel, shouldPersistReplayEvent, type StoredTranscriptEvent, type SubagentRunMode, type TranscriptStorageRef } from "./transcript-types.js";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -508,11 +508,25 @@ function getSessionFile(ctx: ExtensionContext): string | undefined {
 	return typeof sessionManager.getSessionFile === "function" ? sessionManager.getSessionFile() : undefined;
 }
 
-async function openSubagentsOverlay(ctx: ExtensionContext): Promise<void> {
+async function openSubagentsOverlay(ctx: ExtensionContext, runQuery?: string): Promise<void> {
 	if (!ctx.hasUI) return;
 	if (activeOverlayClose) {
 		activeOverlayClose();
 		return;
+	}
+	let initialRunId: string | undefined;
+	const query = runQuery?.trim();
+	if (query) {
+		const matches = registry.findRunsByPrefix(query);
+		if (matches.length === 0) {
+			ctx.ui.notify(`No subagent run matches "${query}".`, "warning");
+			return;
+		}
+		if (matches.length > 1) {
+			ctx.ui.notify(`Ambiguous subagent run prefix "${query}" (${matches.length} matches).`, "warning");
+			return;
+		}
+		initialRunId = matches[0].id;
 	}
 	const warning = getCompatibilityWarning();
 	if (warning) ctx.ui.notify(warning, "warning");
@@ -521,7 +535,7 @@ async function openSubagentsOverlay(ctx: ExtensionContext): Promise<void> {
 			(tui, theme, _keybindings, done) => {
 				const close = () => done(undefined);
 				activeOverlayClose = close;
-				return new SubagentOverlay(tui, theme, close, registry);
+				return new SubagentOverlay(tui, theme, close, registry, initialRunId);
 			},
 			{
 				overlay: true,
@@ -550,9 +564,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("subagents", {
-		description: "Open the live/historical subagent view",
-		handler: async (_args, ctx) => {
-			await openSubagentsOverlay(ctx);
+		description: "Open the live/historical subagent view, optionally focused by run id prefix",
+		handler: async (args, ctx) => {
+			await openSubagentsOverlay(ctx, args);
 		},
 	});
 
@@ -874,8 +888,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const mdTheme = getMarkdownTheme();
-			const renderAgentName = (r: SingleResult) => colorAgentText(theme, r.agentColor, r.agent, "accent");
-			const renderAgentTitle = (r: SingleResult) => theme.bold(colorAgentText(theme, r.agentColor, r.agent, "toolTitle"));
+			const renderAgentName = (r: SingleResult) => colorAgentText(theme, r.agentColor, formatRunLabel(r.agent, r.runId), "accent");
+			const renderAgentTitle = (r: SingleResult) => theme.bold(colorAgentText(theme, r.agentColor, formatRunLabel(r.agent, r.runId), "toolTitle"));
 
 			const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
 				const toShow = limit ? items.slice(-limit) : items;
