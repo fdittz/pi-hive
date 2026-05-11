@@ -1,6 +1,6 @@
-# Subagent Example
+# pi-hive
 
-Delegate tasks to specialized subagents with isolated context windows.
+Coordinated subagent orchestration for pi with isolated context windows.
 
 For complete local extension documentation, see [`EXTENSION.md`](./EXTENSION.md).
 
@@ -20,7 +20,7 @@ For complete local extension documentation, see [`EXTENSION.md`](./EXTENSION.md)
 ## Structure
 
 ```
-subagent/
+pi-hive/
 ├── README.md            # This file
 ├── index.ts             # The extension (entry point)
 ├── agents.ts             # Agent discovery logic
@@ -96,28 +96,15 @@ Or test without installing:
 pi --no-extensions -e <project-dir>/index.ts
 ```
 
-## Legacy symlink installation
+## Local extension-only test
 
-From the repository root, symlink the files:
+To test only the extension entrypoint without installing package prompts:
 
 ```bash
-# Symlink the extension (must be in a subdirectory with index.ts)
-mkdir -p ~/.pi/agent/extensions/subagent
-ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/index.ts" ~/.pi/agent/extensions/subagent/index.ts
-ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/agents.ts" ~/.pi/agent/extensions/subagent/agents.ts
-
-# Symlink agents
-mkdir -p ~/.pi/agent/agents
-for f in packages/coding-agent/examples/extensions/subagent/agents/*.md; do
-  ln -sf "$(pwd)/$f" ~/.pi/agent/agents/$(basename "$f")
-done
-
-# Symlink workflow prompts
-mkdir -p ~/.pi/agent/prompts
-for f in packages/coding-agent/examples/extensions/subagent/prompts/*.md; do
-  ln -sf "$(pwd)/$f" ~/.pi/agent/prompts/$(basename "$f")
-done
+pi --no-extensions -e <project-dir>/index.ts
 ```
+
+For normal usage, prefer `pi install <project-dir>` or GitHub installation so prompt templates are discovered too.
 
 ## Security Model
 

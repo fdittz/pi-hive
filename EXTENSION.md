@@ -1,4 +1,4 @@
-# Subagent Extension Documentation
+# pi-hive Extension Documentation
 
 This extension adds a `subagent` tool to pi. The tool delegates work to specialized agents that run in isolated `pi --mode json -p --no-session` subprocesses. It also provides a live fullscreen transcript viewer for inspecting subagent runs while they stream and after the main session is resumed.
 
@@ -48,7 +48,7 @@ The package manifest is in `package.json` and exposes:
 When installed globally by pi, package files are cloned under pi's package storage. The active global development copy in this environment is:
 
 ```text
-~/.pi/agent/extensions/subagent/
+~/.pi/agent/extensions/pi-hive/
 ```
 
 The project/repository copy is:
@@ -699,7 +699,7 @@ gzip -dc ~/.pi/agent/subagent-transcripts/<session-key>/<run-id>.jsonl.gz | head
 
 ```bash
 pi --no-extensions \
-  -e ~/.pi/agent/extensions/subagent/index.ts \
+  -e ~/.pi/agent/extensions/pi-hive/index.ts \
   --list-models
 ```
 
@@ -707,7 +707,7 @@ pi --no-extensions \
 
 ```bash
 grep -R "pi-coding-agent/dist" \
-  ~/.pi/agent/extensions/subagent \
+  ~/.pi/agent/extensions/pi-hive \
   --include='*.ts'
 ```
 
@@ -718,10 +718,10 @@ Expected: no output.
 ```bash
 cd ~
 pi --no-extensions \
-  -e ~/.pi/agent/extensions/subagent/index.ts \
+  -e ~/.pi/agent/extensions/pi-hive/index.ts \
   --tools subagent \
   --mode json \
-  -p "Use the subagent tool with agent scout and task: list the top-level files in ~/.pi/agent/extensions/subagent and return a concise summary."
+  -p "Use the subagent tool with agent scout and task: list the top-level files in ~/.pi/agent/extensions/pi-hive and return a concise summary."
 ```
 
 Expected:
@@ -856,8 +856,8 @@ A pre-live-view backup exists at:
 To restore that backup:
 
 ```bash
-rm -rf ~/.pi/agent/extensions/subagent
-cp -a ~/.pi/agent/backups/subagent-live-view-implementation-20260511-095905/subagent.before ~/.pi/agent/extensions/subagent
+rm -rf ~/.pi/agent/extensions/pi-hive
+cp -a <backup-path>/pi-hive.before ~/.pi/agent/extensions/pi-hive
 ```
 
 Then reload pi:
@@ -879,7 +879,7 @@ Then reload pi:
 The implementation manifest is stored at:
 
 ```text
-~/.pi/agent/extensions/subagent/LIVE_VIEW_IMPLEMENTATION_MANIFEST.txt
+~/.pi/agent/extensions/pi-hive/LIVE_VIEW_IMPLEMENTATION_MANIFEST.txt
 ```
 
 It records changed files, validation commands, and checksums.

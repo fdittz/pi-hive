@@ -1,14 +1,15 @@
 {
-  "name": "pi-subagents-live",
+  "name": "pi-hive",
   "version": "0.1.0",
-  "description": "Self-contained pi subagent extension with live fullscreen transcript viewer, model selection, and persistent gzipped transcripts.",
+  "description": "Coordinated subagent orchestration for pi with live transcripts, handoffs, continuable runs, model selection, and custom headers.",
   "type": "module",
   "license": "MIT",
   "keywords": [
     "pi-package",
     "pi-extension",
     "subagents",
-    "agent-orchestration"
+    "agent-orchestration",
+    "pi-hive"
   ],
   "pi": {
     "extensions": [
