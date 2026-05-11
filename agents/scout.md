@@ -49,3 +49,20 @@ Brief explanation of how the pieces connect.
 
 ## Start Here
 Which file to look at first and why.
+
+## Optional handoff
+
+If another specialized subagent should continue the work, include a JSON handoff block in your final answer:
+
+```json
+{
+  "handoff": {
+    "agent": "reviewer",
+    "task": "Review the files I found for security issues.",
+    "reason": "Security-sensitive code was identified."
+  }
+}
+```
+
+Use handoff only when it materially improves the result. Do not hand off to yourself unless explicitly necessary.
+

@@ -26,9 +26,17 @@ import { colorAgentText } from "./agent-colors.js";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { ChildSessionStorage } from "./child-session-storage.js";
 import { getCompatibilityWarning } from "./compatibility.js";
+import {
+	confirmHandoff,
+	decideHandoff,
+	extractHandoffRequests,
+	openSubagentHandoffConfig,
+	shouldAskApprovalForHandoff,
+} from "./handoff.js";
 import { LiveSubagentRegistry } from "./live-registry.js";
 import { loadSubagentModelConfig, resolveAgentModel } from "./model-overrides.js";
 import { openSubagentModelSelector } from "./model-selector.js";
+import { loadSubagentConfig } from "./subagent-config.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
 import { TranscriptStorage } from "./transcript-storage.js";
 import { formatRunLabel, shouldPersistReplayEvent, type ChildSessionRef, type StoredTranscriptEvent, type SubagentRunMode, type TranscriptSegmentRef, type TranscriptStorageRef } from "./transcript-types.js";
@@ -266,6 +274,7 @@ type RunMeta = {
 	parentModel?: { provider: string; id: string };
 	existingRunId?: string;
 	continuation?: boolean;
+	handoffDepth?: number;
 };
 
 async function runSingleAgent(
@@ -596,6 +605,65 @@ function parseContinueArgs(args: string): { run: string; instruction?: string } 
 	return { run, instruction: rest.join(" ").trim() || undefined };
 }
 
+async function executeHandoffsForResult(
+	ctx: ExtensionContext,
+	agents: AgentConfig[],
+	sourceResult: SingleResult,
+	signal: AbortSignal | undefined,
+	onUpdate: OnUpdateCallback | undefined,
+	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	runMeta: RunMeta,
+): Promise<SingleResult[]> {
+	const output = getFinalOutput(sourceResult.messages);
+	const requests = extractHandoffRequests(output);
+	if (requests.length === 0) return [];
+	const config = loadSubagentConfig();
+	const sourceAgent = agents.find((agent) => agent.name === sourceResult.agent);
+	if (!sourceAgent) return [];
+	const childResults: SingleResult[] = [];
+	for (let i = 0; i < requests.length; i++) {
+		const request = requests[i];
+		const targetAgent = agents.find((agent) => agent.name === request.agent);
+		const decision = decideHandoff(request, sourceAgent, targetAgent, config, runMeta.handoffDepth ?? 0, i);
+		if (!decision.allowed || !targetAgent) {
+			if (ctx.hasUI && decision.reason) ctx.ui.notify(`Handoff skipped: ${decision.reason}`, "warning");
+			continue;
+		}
+		if (await shouldAskApprovalForHandoff(ctx, request, sourceAgent, targetAgent, config)) {
+			const ok = await confirmHandoff(ctx, request, sourceAgent, targetAgent);
+			if (!ok) continue;
+		}
+		const handoffTask = request.reason ? `${request.task}\n\nHandoff reason from ${sourceAgent.name}: ${request.reason}` : request.task;
+		const result = await runSingleAgent(
+			request.cwd || sourceResult.cwd || ctx.cwd,
+			agents,
+			targetAgent.name,
+			handoffTask,
+			request.cwd || sourceResult.cwd || ctx.cwd,
+			undefined,
+			signal,
+			onUpdate,
+			makeDetails,
+			{
+				parentToolCallId: `${sourceResult.runId ?? runMeta.parentToolCallId}:handoff:${i}`,
+				mode: runMeta.mode,
+				index: i,
+				sessionFile: runMeta.sessionFile,
+				parentModel: runMeta.parentModel,
+				handoffDepth: (runMeta.handoffDepth ?? 0) + 1,
+			},
+		);
+		childResults.push(result);
+		const nested = await executeHandoffsForResult(ctx, agents, result, signal, onUpdate, makeDetails, {
+			...runMeta,
+			parentToolCallId: result.runId ?? runMeta.parentToolCallId,
+			handoffDepth: (runMeta.handoffDepth ?? 0) + 1,
+		});
+		childResults.push(...nested);
+	}
+	return childResults;
+}
+
 async function continueSubagentRun(
 	ctx: ExtensionContext,
 	runQuery: string,
@@ -673,6 +741,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("subagent-handoff", {
+		description: "Configure subagent handoff behavior",
+		handler: async (_args, ctx) => {
+			await openSubagentHandoffConfig(ctx);
+		},
+	});
+
 	pi.registerCommand("subagent-continue", {
 		description: "Continue a previous continuable subagent run by run id prefix",
 		handler: async (args, ctx) => {
@@ -740,6 +815,7 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Subagents may request handoffs by emitting JSON with handoff or handoffs; handoffs run automatically by default.",
 			'Default agent scope is "user" (from ~/.pi/agent/agents).',
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
 		].join(" "),
@@ -853,6 +929,16 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
+					const handoffResults = await executeHandoffsForResult(
+						ctx,
+						agents,
+						result,
+						signal,
+						chainUpdate,
+						makeDetails("chain"),
+						{ parentToolCallId: toolCallId, mode: "chain", index: i, sessionFile, parentModel, handoffDepth: 0 },
+					);
+					results.push(...handoffResults);
 					previousOutput = getFinalOutput(result.messages);
 				}
 				return {
@@ -926,8 +1012,22 @@ export default function (pi: ExtensionAPI) {
 					return result;
 				});
 
-				const successCount = results.filter((r) => r.exitCode === 0).length;
-				const summaries = results.map((r) => {
+				const handoffResults: SingleResult[] = [];
+				for (const result of results) {
+					if (result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted") continue;
+					handoffResults.push(
+						...(await executeHandoffsForResult(ctx, agents, result, signal, onUpdate, makeDetails("parallel"), {
+							parentToolCallId: toolCallId,
+							mode: "parallel",
+							sessionFile,
+							parentModel,
+							handoffDepth: 0,
+						})),
+					);
+				}
+				const allParallelResults = [...results, ...handoffResults];
+				const successCount = allParallelResults.filter((r) => r.exitCode === 0).length;
+				const summaries = allParallelResults.map((r) => {
 					const output = getFinalOutput(r.messages);
 					const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
 					return `[${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}: ${preview || "(no output)"}`;
@@ -936,10 +1036,10 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`,
+							text: `Parallel: ${successCount}/${allParallelResults.length} succeeded\n\n${summaries.join("\n\n")}`,
 						},
 					],
-					details: makeDetails("parallel")(results),
+					details: makeDetails("parallel")(allParallelResults),
 				};
 			}
 
@@ -966,9 +1066,18 @@ export default function (pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
+				const handoffResults = await executeHandoffsForResult(ctx, agents, result, signal, onUpdate, makeDetails("chain"), {
+					parentToolCallId: toolCallId,
+					mode: "chain",
+					index: 0,
+					sessionFile,
+					parentModel,
+					handoffDepth: 0,
+				});
+				const allResults = [result, ...handoffResults];
 				return {
 					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-					details: makeDetails("single")([result]),
+					details: makeDetails(handoffResults.length > 0 ? "chain" : "single")(allResults),
 				};
 			}
 

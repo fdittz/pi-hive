@@ -23,3 +23,20 @@ Anything the main agent should know.
 If handing off to another agent (e.g. reviewer), include:
 - Exact file paths changed
 - Key functions/types touched (short list)
+
+## Optional handoff
+
+If another specialized subagent should continue the work, include a JSON handoff block in your final answer:
+
+```json
+{
+  "handoff": {
+    "agent": "reviewer",
+    "task": "Review the files I found for security issues.",
+    "reason": "Security-sensitive code was identified."
+  }
+}
+```
+
+Use handoff only when it materially improves the result. Do not hand off to yourself unless explicitly necessary.
+

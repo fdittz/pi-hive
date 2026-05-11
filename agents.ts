@@ -16,6 +16,7 @@ export interface AgentConfig {
 	tools?: string[];
 	model?: string;
 	color?: string;
+	handoffAllowList?: string[];
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
@@ -66,6 +67,12 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			?.split(",")
 			.map((t: string) => t.trim())
 			.filter(Boolean);
+		const handoffAllowListRaw =
+			frontmatter.handoffAllowList ?? frontmatter.handoffAllowlist ?? frontmatter["handoff-allow-list"] ?? frontmatter.allowList;
+		const handoffAllowList = handoffAllowListRaw
+			?.split(",")
+			.map((t: string) => t.trim())
+			.filter(Boolean);
 
 		agents.push({
 			name: frontmatter.name,
@@ -73,6 +80,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			tools: tools && tools.length > 0 ? tools : undefined,
 			model: frontmatter.model,
 			color: frontmatter.color,
+			handoffAllowList: handoffAllowList && handoffAllowList.length > 0 ? handoffAllowList : undefined,
 			systemPrompt: body,
 			source,
 			filePath,

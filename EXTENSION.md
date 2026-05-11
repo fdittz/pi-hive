@@ -114,13 +114,46 @@ Flow:
 
 `inherit` is the default. It means the subagent process inherits the current parent pi model (`ctx.model`) explicitly. If no parent model is available, the child process falls back to pi's default model behavior.
 
-Overrides are stored in:
+Overrides are stored in the unified extension config:
 
 ```text
-~/.pi/agent/subagent-models.json
+~/.pi/agent/subagent.json
 ```
 
 Selecting `inherit` removes that agent's override from the config file.
+
+### `/subagent-handoff`
+
+Configure handoff behavior stored in:
+
+```text
+~/.pi/agent/subagent.json
+```
+
+Defaults:
+
+```json
+{
+  "handoff": {
+    "enabled": true,
+    "mode": "auto",
+    "maxDepth": 2,
+    "maxHandoffsPerRun": 3,
+    "requireApprovalForProjectAgents": false,
+    "blockSelfHandoff": false
+  }
+}
+```
+
+`mode: "auto"` means handoffs execute without confirmation. `mode: "manual"` asks for confirmation when UI is available. `mode: "off"` disables handoff execution.
+
+By default, all subagents can hand off to all other subagents. Restrict a source agent with frontmatter:
+
+```yaml
+handoffAllowList: reviewer, planner
+```
+
+Supported aliases are `handoffAllowList`, `handoffAllowlist`, `handoff-allow-list`, and `allowList`.
 
 ### `/subagent-continue`
 
@@ -249,6 +282,7 @@ description: Fast codebase recon that returns compressed context for handoff to 
 tools: read, grep, find, ls, bash
 model: inherit
 color: cyan
+handoffAllowList: reviewer, planner
 ---
 
 System prompt goes here.
@@ -410,17 +444,27 @@ model-overrides.ts
 model-selector.ts
 ```
 
-`model-overrides.ts` reads and writes `~/.pi/agent/subagent-models.json`, resolves `inherit`, and formats model references.
+`subagent-config.ts` owns the unified `~/.pi/agent/subagent.json` config file.
+
+`model-overrides.ts` reads and writes the `models.overrides` section, resolves `inherit`, and formats model references.
 
 `model-selector.ts` implements the `/subagent-model` interactive loop.
 
 Resolution order:
 
-1. saved override in `~/.pi/agent/subagent-models.json`;
+1. saved override in `~/.pi/agent/subagent.json` (`models.overrides`);
 2. `model:` in the agent frontmatter;
 3. `inherit` if no model is set.
 
 When the resolved setting is `inherit`, the extension passes the current parent model (`provider/id`) to the child `pi` process. This gives real parent-model inheritance rather than falling back to the global default model.
+
+### Handoff
+
+```text
+handoff.ts
+```
+
+Parses JSON handoff requests, evaluates config and frontmatter allow lists, confirms manual handoffs, and implements `/subagent-handoff`.
 
 ### Live run registry
 

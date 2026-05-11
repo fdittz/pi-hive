@@ -160,11 +160,62 @@ This opens an interactive loop:
 3. After saving, return to the subagent list to configure another one.
 4. Press `Esc` from the subagent list to exit.
 
-`inherit` is the default. It means the child subagent process uses the current parent pi model (`ctx.model`) rather than a hard-coded model from the agent file. Model overrides are stored in:
+`inherit` is the default. It means the child subagent process uses the current parent pi model (`ctx.model`) rather than a hard-coded model from the agent file. Model overrides are stored in the unified extension config:
 
 ```text
-~/.pi/agent/subagent-models.json
+~/.pi/agent/subagent.json
 ```
+
+### Configure handoff behavior
+
+```text
+/subagent-handoff
+```
+
+Handoff is enabled by default and runs automatically without confirmation. Configuration is stored in:
+
+```text
+~/.pi/agent/subagent.json
+```
+
+Default handoff config:
+
+```json
+{
+  "handoff": {
+    "enabled": true,
+    "mode": "auto",
+    "maxDepth": 2,
+    "maxHandoffsPerRun": 3,
+    "requireApprovalForProjectAgents": false,
+    "blockSelfHandoff": false
+  }
+}
+```
+
+A subagent can request handoff by returning a JSON block:
+
+````markdown
+```json
+{
+  "handoff": {
+    "agent": "reviewer",
+    "task": "Review src/auth.ts for security issues.",
+    "reason": "Scout found token handling code."
+  }
+}
+```
+````
+
+Multiple handoffs are supported with `handoffs: [...]`.
+
+By default, every subagent can hand off to every other subagent. To restrict a specific source agent, add an explicit frontmatter allow list to that agent's `.md` file:
+
+```yaml
+handoffAllowList: reviewer, planner
+```
+
+Supported aliases are `handoffAllowList`, `handoffAllowlist`, `handoff-allow-list`, and `allowList`.
 
 ### Continue a subagent run
 
@@ -279,6 +330,7 @@ description: What this agent does
 tools: read, grep, find, ls
 model: inherit
 color: cyan
+handoffAllowList: reviewer, planner
 ---
 
 System prompt for the agent goes here.
