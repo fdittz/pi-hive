@@ -165,11 +165,13 @@ Subagent child processes can inject custom headers into provider/model requests.
     "enabled": true,
     "providers": ["*"],
     "headers": {
-      "x-initiator": "{agent}"
+      "x-initiator": "agent"
     }
   }
 }
 ```
+
+The default is the literal string `agent`, not the agent name. Use `{agent}` if you want the actual subagent name.
 
 This affects provider/model requests made by child subagent `pi` processes. It does not intercept arbitrary HTTP traffic from shell commands.
 

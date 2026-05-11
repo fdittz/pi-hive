@@ -39,7 +39,7 @@ const DEFAULT_CONFIG: SubagentConfig = {
 		enabled: true,
 		providers: ["*"],
 		headers: {
-			"x-initiator": "{agent}",
+			"x-initiator": "agent",
 		},
 	},
 };

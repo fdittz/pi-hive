@@ -167,7 +167,7 @@ Example:
     "enabled": true,
     "providers": ["*"],
     "headers": {
-      "x-initiator": "{agent}"
+      "x-initiator": "agent"
     }
   }
 }
@@ -202,11 +202,13 @@ Default:
     "enabled": true,
     "providers": ["*"],
     "headers": {
-      "x-initiator": "{agent}"
+      "x-initiator": "agent"
     }
   }
 }
 ```
+
+The default is the literal string `agent`, not the agent name. Use `{agent}` if you want the actual subagent name.
 
 Supported templates:
 
