@@ -36,6 +36,7 @@ import {
 import { LiveSubagentRegistry } from "./live-registry.js";
 import { loadSubagentModelConfig, resolveAgentModel } from "./model-overrides.js";
 import { openSubagentModelSelector } from "./model-selector.js";
+import { buildSubagentHeaderEnv, registerSubagentRequestHeaders } from "./request-headers.js";
 import { loadSubagentConfig } from "./subagent-config.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
 import { TranscriptStorage } from "./transcript-storage.js";
@@ -387,10 +388,21 @@ async function runSingleAgent(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
+			const childEnv = {
+				...process.env,
+				...buildSubagentHeaderEnv({
+					agent: agentName,
+					runId: run.id,
+					mode: runMeta.mode,
+					source: agent.source,
+					parentToolCallId: runMeta.parentToolCallId,
+				}),
+			};
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: effectiveCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
+				env: childEnv,
 			});
 			let buffer = "";
 
@@ -717,6 +729,8 @@ async function continueSubagentRun(
 }
 
 export default function (pi: ExtensionAPI) {
+	registerSubagentRequestHeaders(pi);
+
 	pi.on("session_start", async (_event, ctx) => {
 		await registry.hydrateFromSessionEntries(ctx.sessionManager.getBranch(), transcriptStorage);
 	});

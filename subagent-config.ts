@@ -17,6 +17,11 @@ export interface SubagentConfig {
 		requireApprovalForProjectAgents: boolean;
 		blockSelfHandoff: boolean;
 	};
+	requestHeaders: {
+		enabled: boolean;
+		providers: string[];
+		headers: Record<string, string>;
+	};
 }
 
 const DEFAULT_CONFIG: SubagentConfig = {
@@ -29,6 +34,13 @@ const DEFAULT_CONFIG: SubagentConfig = {
 		maxHandoffsPerRun: 3,
 		requireApprovalForProjectAgents: false,
 		blockSelfHandoff: false,
+	},
+	requestHeaders: {
+		enabled: true,
+		providers: ["*"],
+		headers: {
+			"x-initiator": "{agent}",
+		},
 	},
 };
 
@@ -57,7 +69,11 @@ function normalizeConfig(parsed: unknown): SubagentConfig {
 	const root = isRecord(parsed) ? parsed : {};
 	const models = isRecord(root.models) ? root.models : {};
 	const handoff = isRecord(root.handoff) ? root.handoff : {};
+	const requestHeaders = isRecord(root.requestHeaders) ? root.requestHeaders : {};
 	const mode = handoff.mode === "manual" || handoff.mode === "off" || handoff.mode === "auto" ? handoff.mode : DEFAULT_CONFIG.handoff.mode;
+	const providers = Array.isArray(requestHeaders.providers)
+		? requestHeaders.providers.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+		: DEFAULT_CONFIG.requestHeaders.providers;
 	return {
 		version: 1,
 		models: {
@@ -80,6 +96,14 @@ function normalizeConfig(parsed: unknown): SubagentConfig {
 					: DEFAULT_CONFIG.handoff.requireApprovalForProjectAgents,
 			blockSelfHandoff:
 				typeof handoff.blockSelfHandoff === "boolean" ? handoff.blockSelfHandoff : DEFAULT_CONFIG.handoff.blockSelfHandoff,
+		},
+		requestHeaders: {
+			enabled: typeof requestHeaders.enabled === "boolean" ? requestHeaders.enabled : DEFAULT_CONFIG.requestHeaders.enabled,
+			providers: providers.length > 0 ? providers : DEFAULT_CONFIG.requestHeaders.providers,
+			headers:
+				Object.keys(normalizeStringMap(requestHeaders.headers)).length > 0
+					? normalizeStringMap(requestHeaders.headers)
+					: { ...DEFAULT_CONFIG.requestHeaders.headers },
 		},
 	};
 }
@@ -105,6 +129,7 @@ export function loadSubagentConfig(): SubagentConfig {
 			...DEFAULT_CONFIG,
 			models: { overrides: loadLegacyModelOverrides() },
 			handoff: { ...DEFAULT_CONFIG.handoff },
+			requestHeaders: { ...DEFAULT_CONFIG.requestHeaders, headers: { ...DEFAULT_CONFIG.requestHeaders.headers } },
 		};
 	}
 }
@@ -123,5 +148,6 @@ export function getDefaultSubagentConfig(): SubagentConfig {
 		...DEFAULT_CONFIG,
 		models: { overrides: {} },
 		handoff: { ...DEFAULT_CONFIG.handoff },
+		requestHeaders: { ...DEFAULT_CONFIG.requestHeaders, headers: { ...DEFAULT_CONFIG.requestHeaders.headers } },
 	};
 }

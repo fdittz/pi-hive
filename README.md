@@ -162,6 +162,13 @@ Example:
     "maxHandoffsPerRun": 3,
     "requireApprovalForProjectAgents": false,
     "blockSelfHandoff": false
+  },
+  "requestHeaders": {
+    "enabled": true,
+    "providers": ["*"],
+    "headers": {
+      "x-initiator": "{agent}"
+    }
   }
 }
 ```
@@ -177,8 +184,60 @@ Example:
 | `handoff.maxHandoffsPerRun` | Maximum handoffs accepted from a single run output |
 | `handoff.requireApprovalForProjectAgents` | Require confirmation when target agent comes from `.pi/agents` |
 | `handoff.blockSelfHandoff` | Prevent an agent from handing off to itself |
+| `requestHeaders.enabled` | Enable provider/model request headers inside child subagent pi processes |
+| `requestHeaders.providers` | Provider allowlist for headers; `"*"` means all providers |
+| `requestHeaders.headers` | Header templates to inject into matching providers |
 
 The old `~/.pi/agent/subagent-models.json` file is read as a migration fallback for model overrides, but new writes go to `subagent.json`.
+
+### Subagent request headers
+
+`requestHeaders` injects custom HTTP headers into provider/model requests made by child subagent `pi` processes. It does **not** intercept arbitrary network traffic from shell commands such as `curl`, `gh`, `npm`, or Python scripts.
+
+Default:
+
+```json
+{
+  "requestHeaders": {
+    "enabled": true,
+    "providers": ["*"],
+    "headers": {
+      "x-initiator": "{agent}"
+    }
+  }
+}
+```
+
+Supported templates:
+
+| Template | Meaning |
+|----------|---------|
+| `{agent}` | Agent name, e.g. `scout` |
+| `{runId}` | Full run id |
+| `{shortRunId}` | Short run id, e.g. `40f8e738` |
+| `{runLabel}` | Label, e.g. `scout@40f8e738` |
+| `{mode}` | `single`, `parallel`, or `chain` |
+| `{source}` | `package`, `user`, or `project` |
+| `{parentToolCallId}` | Parent `subagent` tool call id |
+
+Example:
+
+```json
+{
+  "requestHeaders": {
+    "enabled": true,
+    "providers": ["copproxy"],
+    "headers": {
+      "x-initiator": "{agent}",
+      "x-pi-subagent": "true",
+      "x-pi-subagent-run": "{shortRunId}",
+      "x-pi-subagent-label": "{runLabel}"
+    }
+  }
+}
+```
+
+The parent process marks child subagent launches with `PI_SUBAGENT_*` environment variables. When the extension loads inside the child process, it uses those values to register provider headers.
 
 ## Usage
 

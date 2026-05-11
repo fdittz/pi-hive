@@ -155,6 +155,51 @@ handoffAllowList: reviewer, planner
 
 Supported aliases are `handoffAllowList`, `handoffAllowlist`, `handoff-allow-list`, and `allowList`.
 
+### Request headers
+
+Subagent child processes can inject custom headers into provider/model requests. The default config enables:
+
+```json
+{
+  "requestHeaders": {
+    "enabled": true,
+    "providers": ["*"],
+    "headers": {
+      "x-initiator": "{agent}"
+    }
+  }
+}
+```
+
+This affects provider/model requests made by child subagent `pi` processes. It does not intercept arbitrary HTTP traffic from shell commands.
+
+Supported templates:
+
+```text
+{agent}
+{runId}
+{shortRunId}
+{runLabel}
+{mode}
+{source}
+{parentToolCallId}
+```
+
+Example:
+
+```json
+{
+  "requestHeaders": {
+    "enabled": true,
+    "providers": ["copproxy"],
+    "headers": {
+      "x-initiator": "{agent}",
+      "x-pi-subagent-label": "{runLabel}"
+    }
+  }
+}
+```
+
 ### `/subagent-continue`
 
 Continue a previous run by unique short id or label prefix:
@@ -437,11 +482,13 @@ agent-colors.ts
 
 Resolves `color:` frontmatter values to ANSI/theme styling for the live viewer and tool result rendering.
 
-### Model overrides
+### Unified config and model overrides
 
 ```text
+subagent-config.ts
 model-overrides.ts
 model-selector.ts
+request-headers.ts
 ```
 
 `subagent-config.ts` owns the unified `~/.pi/agent/subagent.json` config file.
@@ -449,6 +496,8 @@ model-selector.ts
 `model-overrides.ts` reads and writes the `models.overrides` section, resolves `inherit`, and formats model references.
 
 `model-selector.ts` implements the `/subagent-model` interactive loop.
+
+`request-headers.ts` applies `requestHeaders` templates inside child subagent processes.
 
 Resolution order:
 
