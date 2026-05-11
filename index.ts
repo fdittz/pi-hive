@@ -40,7 +40,7 @@ import { buildSubagentHeaderEnv, registerSubagentRequestHeaders } from "./reques
 import { loadSubagentConfig } from "./subagent-config.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
 import { TranscriptStorage } from "./transcript-storage.js";
-import { formatRunLabel, shouldPersistReplayEvent, type ChildSessionRef, type StoredTranscriptEvent, type SubagentRunMode, type TranscriptSegmentRef, type TranscriptStorageRef } from "./transcript-types.js";
+import { appendCoalescedTranscriptEvent, formatRunLabel, shouldPersistReplayEvent, type ChildSessionRef, type StoredTranscriptEvent, type SubagentRunMode, type TranscriptSegmentRef, type TranscriptStorageRef } from "./transcript-types.js";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -416,10 +416,11 @@ async function runSingleAgent(
 					return;
 				}
 
-				segmentEvents.push(event as StoredTranscriptEvent);
-				registry.recordEvent(run.id, event as StoredTranscriptEvent);
-				if (shouldPersistReplayEvent(event as StoredTranscriptEvent)) {
-					registry.recordReplayEvent(run.id, event as StoredTranscriptEvent);
+				const transcriptEvent = event as StoredTranscriptEvent;
+				appendCoalescedTranscriptEvent(segmentEvents, transcriptEvent);
+				registry.recordEvent(run.id, transcriptEvent);
+				if (shouldPersistReplayEvent(transcriptEvent)) {
+					registry.recordReplayEvent(run.id, transcriptEvent);
 				}
 
 				if (event.type === "message_end" && event.message) {

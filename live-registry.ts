@@ -6,6 +6,7 @@ import {
 	type FinishRunInput,
 	type HistoricalResultLike,
 	type StartRunInput,
+	appendCoalescedTranscriptEvent,
 	type StoredTranscriptEvent,
 	type SubagentRunRecord,
 	statusFromExit,
@@ -47,6 +48,10 @@ export class LiveSubagentRegistry {
 	private runs = new Map<string, SubagentRunRecord>();
 	private subscribers = new Set<() => void>();
 
+	private touch(run: SubagentRunRecord): void {
+		run.revision = (run.revision ?? 0) + 1;
+	}
+
 	startRun(input: StartRunInput): SubagentRunRecord {
 		const id = `${input.parentToolCallId}:${input.mode}:${input.index ?? input.step ?? 0}:${input.agent}:${randomUUID()}`;
 		const run: SubagentRunRecord = {
@@ -64,6 +69,7 @@ export class LiveSubagentRegistry {
 			status: "running",
 			startedAt: Date.now(),
 			liveEvents: [],
+			revision: 0,
 			replayEvents: [],
 		};
 		this.runs.set(run.id, run);
@@ -74,7 +80,8 @@ export class LiveSubagentRegistry {
 	recordEvent(runId: string, event: StoredTranscriptEvent): void {
 		const run = this.runs.get(runId);
 		if (!run) return;
-		run.liveEvents.push(cloneEvent(event));
+		appendCoalescedTranscriptEvent(run.liveEvents, cloneEvent(event));
+		this.touch(run);
 		this.notify();
 	}
 
@@ -82,12 +89,14 @@ export class LiveSubagentRegistry {
 		const run = this.runs.get(runId);
 		if (!run) return;
 		run.replayEvents.push(cloneEvent(event));
+		this.touch(run);
 	}
 
 	attachTranscriptRef(runId: string, ref: TranscriptStorageRef | undefined): void {
 		const run = this.runs.get(runId);
 		if (!run || !ref) return;
 		run.transcriptRef = ref;
+		this.touch(run);
 		this.notify();
 	}
 
@@ -98,6 +107,7 @@ export class LiveSubagentRegistry {
 			(a, b) => a.index - b.index,
 		);
 		if (!run.transcriptRef) run.transcriptRef = segment;
+		this.touch(run);
 		this.notify();
 	}
 
@@ -105,6 +115,7 @@ export class LiveSubagentRegistry {
 		const run = this.runs.get(runId);
 		if (!run || !ref) return;
 		run.childSessionRef = ref;
+		this.touch(run);
 		this.notify();
 	}
 
@@ -113,6 +124,7 @@ export class LiveSubagentRegistry {
 		if (!run) return;
 		run.status = "running";
 		run.errorMessage = undefined;
+		this.touch(run);
 		this.notify();
 	}
 
@@ -120,6 +132,7 @@ export class LiveSubagentRegistry {
 		const run = this.runs.get(runId);
 		if (!run || !error) return;
 		run.transcriptStorageError = error;
+		this.touch(run);
 		this.notify();
 	}
 
@@ -132,6 +145,7 @@ export class LiveSubagentRegistry {
 		run.errorMessage = result.errorMessage;
 		run.stderr = result.stderr;
 		run.endedAt = Date.now();
+		this.touch(run);
 		this.notify();
 	}
 
@@ -217,6 +231,7 @@ export class LiveSubagentRegistry {
 			existing.errorMessage = result.errorMessage ?? existing.errorMessage;
 			existing.stderr = result.stderr ?? existing.stderr;
 			existing.endedAt = fallbackStartedAt;
+			this.touch(existing);
 			return;
 		}
 		const run: SubagentRunRecord = {
@@ -233,6 +248,7 @@ export class LiveSubagentRegistry {
 			model: result.model,
 			status: statusFromExit(result.exitCode, result.stopReason),
 			startedAt: resultStartedAt(result, fallbackStartedAt + index),
+			revision: 0,
 			endedAt: fallbackStartedAt,
 			exitCode: result.exitCode,
 			stopReason: result.stopReason,

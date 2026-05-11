@@ -24,6 +24,7 @@ export class TranscriptView {
 		const key = [
 			run.id,
 			run.status,
+			run.revision ?? 0,
 			events.length,
 			run.transcriptRef?.sha256 ?? "no-ref",
 			run.transcriptStorageError ?? "no-storage-error",

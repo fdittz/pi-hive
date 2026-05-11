@@ -53,6 +53,8 @@ export class SubagentOverlay implements Component {
 	private stickToBottom = true;
 	private transcriptView = new TranscriptView();
 	private unsubscribe?: () => void;
+	private renderTimer?: ReturnType<typeof setTimeout>;
+	private disposed = false;
 
 	constructor(
 		private tui: TUI,
@@ -63,8 +65,7 @@ export class SubagentOverlay implements Component {
 	) {
 		this.enableMouseReporting();
 		this.unsubscribe = registry.subscribe(() => {
-			this.transcriptView.invalidate();
-			this.tui.requestRender();
+			this.scheduleRender();
 		});
 	}
 
@@ -154,9 +155,22 @@ export class SubagentOverlay implements Component {
 	}
 
 	dispose(): void {
+		this.disposed = true;
+		if (this.renderTimer) {
+			clearTimeout(this.renderTimer);
+			this.renderTimer = undefined;
+		}
 		this.disableMouseReporting();
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+	}
+
+	private scheduleRender(): void {
+		if (this.disposed || this.renderTimer) return;
+		this.renderTimer = setTimeout(() => {
+			this.renderTimer = undefined;
+			if (!this.disposed) this.tui.requestRender();
+		}, 33);
 	}
 
 	private selectRelative(delta: number): void {

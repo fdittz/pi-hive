@@ -56,8 +56,11 @@ export interface SubagentRunRecord {
 	errorMessage?: string;
 	stderr?: string;
 
-	/** Live event stream, may contain high-frequency message_update/tool_execution_update events. */
+	/** Live event stream, with high-frequency updates coalesced while a run is active. */
 	liveEvents: StoredTranscriptEvent[];
+
+	/** Incremented whenever render-relevant run state changes. */
+	revision: number;
 
 	/** Compact replay events safe to persist into session details as fallback. */
 	replayEvents: StoredTranscriptEvent[];
@@ -120,6 +123,58 @@ export interface HistoricalResultLike {
 
 export function hasMessage(event: StoredTranscriptEvent): event is StoredTranscriptEvent & { message: Message } {
 	return typeof event === "object" && event !== null && "message" in event;
+}
+
+function eventMessage(event: StoredTranscriptEvent): any | undefined {
+	return hasMessage(event) ? (event.message as any) : undefined;
+}
+
+function messageIdentity(event: StoredTranscriptEvent): { id?: string; role?: string } | undefined {
+	const message = eventMessage(event);
+	if (!message || typeof message !== "object") return undefined;
+	const id = typeof message.id === "string" ? message.id : undefined;
+	const role = typeof message.role === "string" ? message.role : undefined;
+	return id || role ? { id, role } : undefined;
+}
+
+function sameMessageStream(a: StoredTranscriptEvent, b: StoredTranscriptEvent): boolean {
+	const left = messageIdentity(a);
+	const right = messageIdentity(b);
+	if (!left || !right) return false;
+	if (left.id && right.id) return left.id === right.id;
+	return Boolean(left.role && right.role && left.role === right.role);
+}
+
+function removePendingMessageUpdates(events: StoredTranscriptEvent[], event: StoredTranscriptEvent): void {
+	for (let i = events.length - 1; i >= 0; i--) {
+		const existing = events[i];
+		if (existing.type === "message_update" && sameMessageStream(existing, event)) {
+			events.splice(i, 1);
+			continue;
+		}
+		if ((existing.type === "message_start" || existing.type === "message_end") && sameMessageStream(existing, event)) {
+			break;
+		}
+	}
+}
+
+function removePendingToolUpdates(events: StoredTranscriptEvent[], toolCallId: unknown): void {
+	if (!toolCallId) return;
+	for (let i = events.length - 1; i >= 0; i--) {
+		const existing = events[i];
+		if (existing.toolCallId !== toolCallId) continue;
+		if (existing.type === "tool_execution_update") events.splice(i, 1);
+		if (existing.type === "tool_execution_start" || existing.type === "tool_execution_end") break;
+	}
+}
+
+export function appendCoalescedTranscriptEvent(events: StoredTranscriptEvent[], event: StoredTranscriptEvent): void {
+	if (event.type === "message_update" || event.type === "message_end") {
+		removePendingMessageUpdates(events, event);
+	} else if (event.type === "tool_execution_update" || event.type === "tool_execution_end") {
+		removePendingToolUpdates(events, event.toolCallId);
+	}
+	events.push(event);
 }
 
 export function shouldPersistReplayEvent(event: StoredTranscriptEvent): boolean {
