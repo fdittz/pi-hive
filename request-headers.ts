@@ -74,6 +74,34 @@ function providerMatches(provider: string, patterns: string[]): boolean {
 	return patterns.includes("*") || patterns.includes(provider);
 }
 
+function intersectHeaders(headerSets: Array<Record<string, string> | undefined>): Record<string, string> {
+	const concrete = headerSets.filter((headers): headers is Record<string, string> => !!headers);
+	if (concrete.length === 0) return {};
+	const [first, ...rest] = concrete;
+	const common: Record<string, string> = {};
+	for (const [name, value] of Object.entries(first)) {
+		if (rest.every((headers) => headers[name] === value)) common[name] = value;
+	}
+	return common;
+}
+
+async function getExistingProviderHeaders(ctx: ExtensionContext, provider: string): Promise<Record<string, string>> {
+	const models = ctx.modelRegistry.getAll().filter((model) => model.provider === provider);
+	const headerSets = await Promise.all(
+		models.map(async (model) => {
+			const result = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			return result.ok ? result.headers : undefined;
+		}),
+	);
+	return intersectHeaders(headerSets);
+}
+
+async function getProviderApiKeyToPreserve(ctx: ExtensionContext, provider: string): Promise<string | undefined> {
+	const authStatus = ctx.modelRegistry.getProviderAuthStatus(provider);
+	if (authStatus.source !== "models_json_key" && authStatus.source !== "models_json_command") return undefined;
+	return ctx.modelRegistry.getApiKeyForProvider(provider);
+}
+
 export function registerSubagentRequestHeaders(pi: ExtensionAPI): void {
 	const env = readEnv();
 	if (!env) return;
@@ -81,12 +109,15 @@ export function registerSubagentRequestHeaders(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 		const config = loadSubagentConfig().requestHeaders;
 		if (!config.enabled) return;
-		const headers = renderHeaders(config.headers, env);
-		if (Object.keys(headers).length === 0) return;
+		const requestedHeaders = renderHeaders(config.headers, env);
+		if (Object.keys(requestedHeaders).length === 0) return;
 		const providers = new Set(ctx.modelRegistry.getAll().map((model) => model.provider));
 		for (const provider of providers) {
 			if (!providerMatches(provider, config.providers)) continue;
-			pi.registerProvider(provider, { headers });
+			const existingHeaders = await getExistingProviderHeaders(ctx, provider);
+			const headers = { ...existingHeaders, ...requestedHeaders };
+			const apiKey = await getProviderApiKeyToPreserve(ctx, provider);
+			pi.registerProvider(provider, apiKey ? { apiKey, headers } : { headers });
 		}
 	});
 }
