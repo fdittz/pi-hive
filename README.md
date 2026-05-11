@@ -320,6 +320,22 @@ Invalid or missing colors fall back to the active pi theme's `accent`/`toolTitle
 | `reviewer` | Code review | inherit | red | read, grep, find, ls, bash |
 | `worker` | General-purpose | inherit | green | (all default) |
 
+## Continuable runs design
+
+Continuing a previous subagent run is planned but not implemented yet. The design is documented in:
+
+```text
+docs/continuable-runs.md
+```
+
+Planned deterministic command:
+
+```text
+/subagent-continue <run-prefix> [instruction]
+```
+
+Natural-language requests such as `continue a sessao 238831282893` require an additional LLM-callable `subagent_continue` tool or deterministic input alias; a slash command alone is not invoked automatically from ordinary chat text.
+
 ## Workflow Prompts
 
 | Prompt | Flow |

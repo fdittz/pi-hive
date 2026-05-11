@@ -619,6 +619,22 @@ print('LAST_EVENT', json.loads(lines[-1])['type'])
 PY
 ```
 
+## Continuable runs design
+
+Continuing a previous subagent run is planned but not implemented yet. The design is documented in:
+
+```text
+docs/continuable-runs.md
+```
+
+Key decisions:
+
+- new runs need real child pi session JSONL files;
+- older runs created before child sessions are view-only (Option A);
+- transcript continuation should use gzip segments instead of appending to one gzip file;
+- `/subagent-continue <run-prefix> [instruction]` is the deterministic command;
+- natural-language requests require a future `subagent_continue` tool or input alias.
+
 ## Operational workflow
 
 After editing this extension, reload pi:
