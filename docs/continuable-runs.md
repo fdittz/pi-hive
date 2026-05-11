@@ -1,6 +1,6 @@
 # Continuable Subagent Runs Design
 
-Status: planned, not implemented in the current package version.
+Status: implemented for new runs. Runs created before child-session support remain view-only.
 
 This document describes the intended design for continuing a subagent run after its original child `pi` process has exited.
 
@@ -15,7 +15,7 @@ Example UX:
 /subagent-continue 40f8e738
 ```
 
-Inside `/subagents`, the selected run may also expose a `c` keybinding in the future:
+Inside `/subagents`, a future enhancement may expose a `c` keybinding:
 
 ```text
 c  continue selected run
@@ -166,13 +166,13 @@ continue a sessao 238831282893
 
 With only a slash command, this will **not** be deterministic. Slash commands are handled before normal LLM processing; a natural-language message is sent to the main model and the command is not automatically invoked.
 
-To support natural language, add an LLM-callable tool in addition to the slash command:
+Natural language is supported through the LLM-callable tool in addition to the slash command:
 
 ```ts
 subagent_continue({ run: "238831282893", instruction?: string })
 ```
 
-Then add prompt metadata:
+The tool includes prompt metadata:
 
 ```ts
 promptSnippet: "Continue a previous subagent run by short run id or agent@id label"
@@ -276,24 +276,18 @@ Mitigation:
 
 ## Recommended implementation phases
 
-### Phase 1
+### Implemented
 
-- Add child session files for new runs.
-- Persist `childSessionRef`.
-- Mark older runs as view-only.
+- Child session files for new runs.
+- `childSessionRef` persistence.
+- Older runs marked as view-only.
+- `/subagent-continue` command.
+- Transcript segments.
+- `subagent_continue` LLM-callable tool with prompt metadata/guidelines.
+- Hydration from original `subagent`, later `subagent_continue`, and custom `subagent-run-update` entries.
 
-### Phase 2
+### Future enhancements
 
-- Add `/subagent-continue`.
-- Add transcript segments.
-- Add continuation lock.
-
-### Phase 3
-
-- Add `subagent_continue` LLM-callable tool for natural-language requests.
-- Add prompt metadata/guidelines.
-
-### Phase 4
-
-- Add optional `c` keybinding in `/subagents` overlay.
-- Add cleanup command.
+- Per-run continuation lock for concurrent interactive use.
+- Optional `c` keybinding in `/subagents` overlay.
+- Cleanup command for orphaned child sessions and transcript segments.

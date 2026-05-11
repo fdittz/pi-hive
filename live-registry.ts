@@ -10,6 +10,8 @@ import {
 	type SubagentRunRecord,
 	statusFromExit,
 	runMatchesPrefix,
+	type ChildSessionRef,
+	type TranscriptSegmentRef,
 	type TranscriptStorageRef,
 } from "./transcript-types.js";
 
@@ -89,6 +91,31 @@ export class LiveSubagentRegistry {
 		this.notify();
 	}
 
+	attachTranscriptSegment(runId: string, segment: TranscriptSegmentRef | undefined): void {
+		const run = this.runs.get(runId);
+		if (!run || !segment) return;
+		run.transcriptSegments = [...(run.transcriptSegments ?? []).filter((s) => s.index !== segment.index), segment].sort(
+			(a, b) => a.index - b.index,
+		);
+		if (!run.transcriptRef) run.transcriptRef = segment;
+		this.notify();
+	}
+
+	attachChildSessionRef(runId: string, ref: ChildSessionRef | undefined): void {
+		const run = this.runs.get(runId);
+		if (!run || !ref) return;
+		run.childSessionRef = ref;
+		this.notify();
+	}
+
+	markRunRunning(runId: string): void {
+		const run = this.runs.get(runId);
+		if (!run) return;
+		run.status = "running";
+		run.errorMessage = undefined;
+		this.notify();
+	}
+
 	setTranscriptStorageError(runId: string, error: string | undefined): void {
 		const run = this.runs.get(runId);
 		if (!run || !error) return;
@@ -131,53 +158,94 @@ export class LiveSubagentRegistry {
 		this.runs.clear();
 		for (const entry of entries) {
 			const anyEntry = entry as any;
+			const fallbackStartedAt = safeTimestamp(anyEntry.timestamp, Date.now());
+
+			if (anyEntry.type === "custom" && anyEntry.customType === "subagent-run-update" && anyEntry.data?.result) {
+				await this.hydrateResult(anyEntry.data.result as HistoricalResultLike, "single", anyEntry.id || "custom", fallbackStartedAt, 0, storage);
+				continue;
+			}
+
 			if (anyEntry.type !== "message") continue;
 			const message = anyEntry.message;
-			if (!message || message.role !== "toolResult" || message.toolName !== "subagent") continue;
+			if (!message || message.role !== "toolResult") continue;
 			const details = message.details;
-			if (!details || !Array.isArray(details.results)) continue;
-			const mode = details.mode === "parallel" || details.mode === "chain" || details.mode === "single" ? details.mode : "single";
-			const fallbackStartedAt = safeTimestamp(anyEntry.timestamp, message.timestamp ?? Date.now());
-			for (let index = 0; index < details.results.length; index++) {
-				const result = details.results[index] as HistoricalResultLike;
-				if (!result || typeof result.agent !== "string") continue;
-				const runId = result.runId || `${message.toolCallId || anyEntry.id || "historical"}:${mode}:${index}:${result.agent}`;
-				if (this.runs.has(runId)) continue;
+			if (!details) continue;
 
-				let loadedEvents: StoredTranscriptEvent[] | undefined;
-				if (result.transcriptRef) {
-					loadedEvents = await storage.loadTranscript(result.transcriptRef);
+			if (message.toolName === "subagent" && Array.isArray(details.results)) {
+				const mode = details.mode === "parallel" || details.mode === "chain" || details.mode === "single" ? details.mode : "single";
+				const startedAt = safeTimestamp(anyEntry.timestamp, message.timestamp ?? Date.now());
+				for (let index = 0; index < details.results.length; index++) {
+					await this.hydrateResult(details.results[index] as HistoricalResultLike, mode, message.toolCallId || anyEntry.id || "historical", startedAt, index, storage);
 				}
-				const replayEvents = Array.isArray(result.replayEvents) ? result.replayEvents : messagesToReplayEvents(result.messages);
-				const liveEvents = loadedEvents && loadedEvents.length > 0 ? loadedEvents : replayEvents;
-				const run: SubagentRunRecord = {
-					id: runId,
-					parentToolCallId: message.toolCallId || "historical",
-					mode,
-					agent: result.agent,
-					agentSource: result.agentSource ?? "unknown",
-					agentColor: result.agentColor,
-					task: result.task ?? "",
-					cwd: result.cwd ?? "",
-					step: result.step,
-					index: result.index ?? index,
-					model: result.model,
-					status: statusFromExit(result.exitCode, result.stopReason),
-					startedAt: resultStartedAt(result, fallbackStartedAt + index),
-					endedAt: fallbackStartedAt,
-					exitCode: result.exitCode,
-					stopReason: result.stopReason,
-					errorMessage: result.errorMessage,
-					stderr: result.stderr,
-					liveEvents,
-					replayEvents,
-					transcriptRef: result.transcriptRef,
-					transcriptStorageError: result.transcriptStorageError,
-				};
-				this.runs.set(run.id, run);
+			} else if (message.toolName === "subagent_continue" && details.result) {
+				const result = details.result as HistoricalResultLike;
+				await this.hydrateResult(result, "single", message.toolCallId || anyEntry.id || "continue", fallbackStartedAt, result.index ?? 0, storage);
 			}
 		}
 		this.notify();
+	}
+
+	private async hydrateResult(
+		result: HistoricalResultLike,
+		mode: "single" | "parallel" | "chain",
+		parentToolCallId: string,
+		fallbackStartedAt: number,
+		index: number,
+		storage: TranscriptStorage,
+	): Promise<void> {
+		if (!result || typeof result.agent !== "string") return;
+		const runId = result.runId || `${parentToolCallId}:${mode}:${index}:${result.agent}`;
+		let loadedEvents: StoredTranscriptEvent[] | undefined;
+		if (Array.isArray(result.transcriptSegments) && result.transcriptSegments.length > 0) {
+			loadedEvents = await storage.loadTranscriptSegments(result.transcriptSegments);
+		}
+		if (!loadedEvents && result.transcriptRef) {
+			loadedEvents = await storage.loadTranscript(result.transcriptRef);
+		}
+		const replayEvents = Array.isArray(result.replayEvents) ? result.replayEvents : messagesToReplayEvents(result.messages);
+		const liveEvents = loadedEvents && loadedEvents.length > 0 ? loadedEvents : replayEvents;
+		const existing = this.runs.get(runId);
+		if (existing) {
+			existing.liveEvents = liveEvents.length > 0 ? liveEvents : existing.liveEvents;
+			existing.replayEvents = replayEvents.length > 0 ? replayEvents : existing.replayEvents;
+			existing.transcriptRef = result.transcriptRef ?? existing.transcriptRef;
+			existing.transcriptSegments = result.transcriptSegments ?? existing.transcriptSegments;
+			existing.childSessionRef = result.childSessionRef ?? existing.childSessionRef;
+			existing.status = statusFromExit(result.exitCode, result.stopReason);
+			existing.exitCode = result.exitCode ?? existing.exitCode;
+			existing.stopReason = result.stopReason ?? existing.stopReason;
+			existing.errorMessage = result.errorMessage ?? existing.errorMessage;
+			existing.stderr = result.stderr ?? existing.stderr;
+			existing.endedAt = fallbackStartedAt;
+			return;
+		}
+		const run: SubagentRunRecord = {
+			id: runId,
+			parentToolCallId,
+			mode,
+			agent: result.agent,
+			agentSource: result.agentSource ?? "unknown",
+			agentColor: result.agentColor,
+			task: result.task ?? "",
+			cwd: result.cwd ?? "",
+			step: result.step,
+			index: result.index ?? index,
+			model: result.model,
+			status: statusFromExit(result.exitCode, result.stopReason),
+			startedAt: resultStartedAt(result, fallbackStartedAt + index),
+			endedAt: fallbackStartedAt,
+			exitCode: result.exitCode,
+			stopReason: result.stopReason,
+			errorMessage: result.errorMessage,
+			stderr: result.stderr,
+			liveEvents,
+			replayEvents,
+			transcriptRef: result.transcriptRef,
+			transcriptSegments: result.transcriptSegments,
+			childSessionRef: result.childSessionRef,
+			transcriptStorageError: result.transcriptStorageError,
+		};
+		this.runs.set(run.id, run);
 	}
 
 	subscribe(listener: () => void): () => void {

@@ -24,13 +24,14 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { colorAgentText } from "./agent-colors.js";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
+import { ChildSessionStorage } from "./child-session-storage.js";
 import { getCompatibilityWarning } from "./compatibility.js";
 import { LiveSubagentRegistry } from "./live-registry.js";
 import { loadSubagentModelConfig, resolveAgentModel } from "./model-overrides.js";
 import { openSubagentModelSelector } from "./model-selector.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
 import { TranscriptStorage } from "./transcript-storage.js";
-import { formatRunLabel, shouldPersistReplayEvent, type StoredTranscriptEvent, type SubagentRunMode, type TranscriptStorageRef } from "./transcript-types.js";
+import { formatRunLabel, shouldPersistReplayEvent, type ChildSessionRef, type StoredTranscriptEvent, type SubagentRunMode, type TranscriptSegmentRef, type TranscriptStorageRef } from "./transcript-types.js";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -38,6 +39,7 @@ const COLLAPSED_ITEM_COUNT = 10;
 
 const registry = new LiveSubagentRegistry();
 const transcriptStorage = new TranscriptStorage();
+const childSessionStorage = new ChildSessionStorage();
 let activeOverlayClose: (() => void) | undefined;
 
 function formatTokens(count: number): string {
@@ -169,6 +171,8 @@ interface SingleResult {
 	index?: number;
 	replayEvents?: StoredTranscriptEvent[];
 	transcriptRef?: TranscriptStorageRef;
+	transcriptSegments?: TranscriptSegmentRef[];
+	childSessionRef?: ChildSessionRef;
 	transcriptStorageError?: string;
 }
 
@@ -260,6 +264,8 @@ type RunMeta = {
 	index?: number;
 	sessionFile?: string;
 	parentModel?: { provider: string; id: string };
+	existingRunId?: string;
+	continuation?: boolean;
 };
 
 async function runSingleAgent(
@@ -293,20 +299,38 @@ async function runSingleAgent(
 	const effectiveCwd = cwd ?? defaultCwd;
 	const modelConfig = loadSubagentModelConfig();
 	const resolvedModel = resolveAgentModel(agent, runMeta.parentModel, modelConfig);
-	const run = registry.startRun({
-		parentToolCallId: runMeta.parentToolCallId,
-		mode: runMeta.mode,
-		agent: agentName,
-		agentSource: agent.source,
-		agentColor: agent.color,
-		task,
-		cwd: effectiveCwd,
-		step,
-		index: runMeta.index,
-		model: resolvedModel.display,
-	});
+	let run = runMeta.existingRunId ? registry.getRun(runMeta.existingRunId) : undefined;
+	if (run) {
+		registry.markRunRunning(run.id);
+	} else {
+		run = registry.startRun({
+			parentToolCallId: runMeta.parentToolCallId,
+			mode: runMeta.mode,
+			agent: agentName,
+			agentSource: agent.source,
+			agentColor: agent.color,
+			task,
+			cwd: effectiveCwd,
+			step,
+			index: runMeta.index,
+			model: resolvedModel.display,
+		});
+	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	let childSessionPath: string | undefined;
+	if (run.childSessionRef) {
+		childSessionPath = childSessionStorage.resolveRef(run.childSessionRef);
+	} else {
+		const prepared = await childSessionStorage.prepareRunSession(run, runMeta.sessionFile);
+		if (prepared) {
+			childSessionPath = prepared.path;
+			registry.attachChildSessionRef(run.id, prepared.ref);
+		}
+	}
+
+	const args: string[] = ["--mode", "json", "-p"];
+	if (childSessionPath) args.push("--session", childSessionPath);
+	else args.push("--no-session");
 	if (resolvedModel.modelArg) args.push("--model", resolvedModel.modelArg);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
@@ -328,6 +352,7 @@ async function runSingleAgent(
 		step,
 		index: runMeta.index,
 		replayEvents: [],
+		childSessionRef: run.childSessionRef,
 	};
 
 	const emitUpdate = () => {
@@ -349,6 +374,7 @@ async function runSingleAgent(
 
 		args.push(`Task: ${task}`);
 		let wasAborted = false;
+		const segmentEvents: StoredTranscriptEvent[] = [];
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
@@ -368,6 +394,7 @@ async function runSingleAgent(
 					return;
 				}
 
+				segmentEvents.push(event as StoredTranscriptEvent);
 				registry.recordEvent(run.id, event as StoredTranscriptEvent);
 				if (shouldPersistReplayEvent(event as StoredTranscriptEvent)) {
 					registry.recordReplayEvent(run.id, event as StoredTranscriptEvent);
@@ -449,12 +476,17 @@ async function runSingleAgent(
 			errorMessage: currentResult.errorMessage,
 			stderr: currentResult.stderr,
 		});
-		const persistResult = await transcriptStorage.persistRun(registry.getRun(run.id)!, runMeta.sessionFile);
-		if (persistResult.ref) registry.attachTranscriptRef(run.id, persistResult.ref);
+		const storedBeforePersist = registry.getRun(run.id)!;
+		const segmentIndex = (storedBeforePersist.transcriptSegments?.length ?? 0) + 1;
+		const persistResult = await transcriptStorage.persistRunSegment(storedBeforePersist, runMeta.sessionFile, segmentEvents, segmentIndex);
+		if (persistResult.segment) registry.attachTranscriptSegment(run.id, persistResult.segment);
+		if (persistResult.ref && segmentIndex === 1) registry.attachTranscriptRef(run.id, persistResult.ref);
 		if (persistResult.error) registry.setTranscriptStorageError(run.id, persistResult.error);
 		const storedRun = registry.getRun(run.id);
 		currentResult.replayEvents = storedRun?.replayEvents ?? [];
 		currentResult.transcriptRef = storedRun?.transcriptRef;
+		currentResult.transcriptSegments = storedRun?.transcriptSegments;
+		currentResult.childSessionRef = storedRun?.childSessionRef;
 		currentResult.transcriptStorageError = storedRun?.transcriptStorageError;
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
@@ -501,6 +533,11 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+});
+
+const SubagentContinueParams = Type.Object({
+	run: Type.String({ description: "Run prefix, short id, full id, or agent@id label to continue" }),
+	instruction: Type.Optional(Type.String({ description: "Optional continuation instruction" })),
 });
 
 function getSessionFile(ctx: ExtensionContext): string | undefined {
@@ -552,6 +589,65 @@ async function openSubagentsOverlay(ctx: ExtensionContext, runQuery?: string): P
 	}
 }
 
+function parseContinueArgs(args: string): { run: string; instruction?: string } | undefined {
+	const trimmed = args.trim();
+	if (!trimmed) return undefined;
+	const [run, ...rest] = trimmed.split(/\s+/);
+	return { run, instruction: rest.join(" ").trim() || undefined };
+}
+
+async function continueSubagentRun(
+	ctx: ExtensionContext,
+	runQuery: string,
+	instruction: string | undefined,
+	signal: AbortSignal | undefined,
+	onUpdate: OnUpdateCallback | undefined,
+	parentToolCallId: string,
+): Promise<SingleResult> {
+	const matches = registry.findRunsByPrefix(runQuery);
+	if (matches.length === 0) throw new Error(`No subagent run matches "${runQuery}".`);
+	if (matches.length > 1) throw new Error(`Ambiguous subagent run prefix "${runQuery}" (${matches.length} matches).`);
+	const run = matches[0];
+	if (!run.childSessionRef) {
+		throw new Error(`Run ${formatRunLabel(run.agent, run.id)} was created before child sessions were enabled and is view-only.`);
+	}
+	const childSessionPath = childSessionStorage.resolveRef(run.childSessionRef);
+	if (!childSessionPath || !fs.existsSync(childSessionPath)) {
+		throw new Error(`Run ${formatRunLabel(run.agent, run.id)} has no readable child session file.`);
+	}
+	const discovery = discoverAgents(run.cwd || ctx.cwd, "both");
+	const agents = discovery.agents;
+	const task = instruction
+		? `Continue from where you stopped. ${instruction}`
+		: "Continue from where you stopped. Continue the previous task from the existing subagent session context.";
+	const makeDetails = (_results: SingleResult[]): SubagentDetails => ({
+		mode: run.mode,
+		agentScope: "both",
+		projectAgentsDir: discovery.projectAgentsDir,
+		results: _results,
+	});
+	return runSingleAgent(
+		run.cwd || ctx.cwd,
+		agents,
+		run.agent,
+		task,
+		run.cwd || ctx.cwd,
+		run.step,
+		signal,
+		onUpdate,
+		makeDetails,
+		{
+			parentToolCallId,
+			mode: run.mode,
+			index: run.index,
+			sessionFile: getSessionFile(ctx),
+			parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+			existingRunId: run.id,
+			continuation: true,
+		},
+	);
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		await registry.hydrateFromSessionEntries(ctx.sessionManager.getBranch(), transcriptStorage);
@@ -577,6 +673,24 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("subagent-continue", {
+		description: "Continue a previous continuable subagent run by run id prefix",
+		handler: async (args, ctx) => {
+			const parsed = parseContinueArgs(args);
+			if (!parsed) {
+				ctx.ui.notify("Usage: /subagent-continue <run-prefix> [instruction]", "warning");
+				return;
+			}
+			try {
+				const result = await continueSubagentRun(ctx, parsed.run, parsed.instruction, ctx.signal, undefined, `command:${parsed.run}`);
+				pi.appendEntry("subagent-run-update", { result });
+				ctx.ui.notify(`Continued ${formatRunLabel(result.agent, result.runId)}.`, "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+			}
+		},
+	});
+
 	pi.registerShortcut("ctrl+shift+o", {
 		description: "Open/close the live subagent view",
 		handler: async (ctx) => {
@@ -588,6 +702,35 @@ export default function (pi: ExtensionAPI) {
 		description: "Fallback: open/close the live subagent view",
 		handler: async (ctx) => {
 			await openSubagentsOverlay(ctx);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_continue",
+		label: "Continue Subagent",
+		description: "Continue a previous continuable subagent run by short run id, full id, or agent@id label.",
+		promptSnippet: "Continue a previous subagent run by short run id or agent@id label",
+		promptGuidelines: [
+			"Use subagent_continue when the user asks to continue, resume, or pick up a previous subagent run by id, short id, or agent@id label.",
+		],
+		parameters: SubagentContinueParams,
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const result = await continueSubagentRun(
+				ctx,
+				params.run,
+				params.instruction,
+				signal,
+				onUpdate
+					? (partial) => {
+							onUpdate({ content: partial.content, details: { result: partial.details?.results[0] } });
+						}
+					: undefined,
+				toolCallId,
+			);
+			return {
+				content: [{ type: "text", text: getFinalOutput(result.messages) || `Continued ${formatRunLabel(result.agent, result.runId)}.` }],
+				details: { result },
+			};
 		},
 	});
 

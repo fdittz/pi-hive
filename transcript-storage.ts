@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { gunzip as gunzipCallback, gzip as gzipCallback } from "node:zlib";
 import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { promisify } from "node:util";
-import type { StoredTranscriptEvent, SubagentRunRecord, TranscriptPersistResult, TranscriptStorageRef } from "./transcript-types.js";
+import { getRunShortId, type StoredTranscriptEvent, type SubagentRunRecord, type TranscriptPersistResult, type TranscriptSegmentRef, type TranscriptStorageRef } from "./transcript-types.js";
 
 const gzip = promisify(gzipCallback);
 const gunzip = promisify(gunzipCallback);
@@ -51,18 +51,27 @@ export class TranscriptStorage {
 	}
 
 	async persistRun(run: SubagentRunRecord, sessionFile: string | undefined): Promise<TranscriptPersistResult> {
+		return this.persistRunSegment(run, sessionFile, run.liveEvents, 1);
+	}
+
+	async persistRunSegment(
+		run: SubagentRunRecord,
+		sessionFile: string | undefined,
+		events: StoredTranscriptEvent[],
+		index: number,
+	): Promise<TranscriptPersistResult & { segment?: TranscriptSegmentRef }> {
 		try {
 			const sessionKey = this.getSessionKey(sessionFile, run.cwd);
 			if (!sessionKey) return { error: "Main session file is unavailable; transcript sidecar persistence skipped." };
-			if (run.liveEvents.length === 0) return { error: "No transcript events captured; transcript sidecar persistence skipped." };
+			if (events.length === 0) return { error: "No transcript events captured; transcript sidecar persistence skipped." };
 
-			const sessionDir = path.join(this.baseDir, sessionKey);
+			const safeRunId = sanitizeSegment(`${run.agent}-${getRunShortId(run.id)}-${run.id}`).slice(0, 180);
+			const sessionDir = path.join(this.baseDir, sessionKey, safeRunId);
 			await fs.promises.mkdir(sessionDir, { recursive: true, mode: 0o700 });
 
-			const safeRunId = sanitizeSegment(run.id).slice(0, 160);
-			const filePath = path.join(sessionDir, `${safeRunId}.jsonl.gz`);
+			const filePath = path.join(sessionDir, `${String(index).padStart(4, "0")}.jsonl.gz`);
 			const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-			const jsonl = `${run.liveEvents.map((event) => JSON.stringify(event)).join("\n")}\n`;
+			const jsonl = `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
 			const uncompressed = Buffer.from(jsonl, "utf8");
 			const compressed = await gzip(uncompressed, { level: 9 });
 			const digest = sha256(compressed);
@@ -73,17 +82,17 @@ export class TranscriptStorage {
 			});
 
 			const relativePath = toPortableRelative(path.relative(this.agentDir, filePath));
-			return {
-				ref: {
-					kind: STORAGE_KIND,
-					relativePath,
-					sha256: digest,
-					eventCount: run.liveEvents.length,
-					uncompressedBytes: uncompressed.byteLength,
-					compressedBytes: compressed.byteLength,
-					createdAt: Date.now(),
-				},
+			const segment: TranscriptSegmentRef = {
+				kind: STORAGE_KIND,
+				index,
+				relativePath,
+				sha256: digest,
+				eventCount: events.length,
+				uncompressedBytes: uncompressed.byteLength,
+				compressedBytes: compressed.byteLength,
+				createdAt: Date.now(),
 			};
+			return { ref: segment, segment };
 		} catch (error) {
 			return { error: error instanceof Error ? error.message : String(error) };
 		}
@@ -109,6 +118,16 @@ export class TranscriptStorage {
 		} catch {
 			return undefined;
 		}
+	}
+
+	async loadTranscriptSegments(segments: TranscriptSegmentRef[]): Promise<StoredTranscriptEvent[] | undefined> {
+		const events: StoredTranscriptEvent[] = [];
+		for (const segment of [...segments].sort((a, b) => a.index - b.index)) {
+			const loaded = await this.loadTranscript(segment);
+			if (!loaded) return undefined;
+			events.push(...loaded);
+		}
+		return events;
 	}
 
 	private resolveRef(ref: TranscriptStorageRef): string | undefined {

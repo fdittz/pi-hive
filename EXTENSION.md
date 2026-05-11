@@ -122,6 +122,18 @@ Overrides are stored in:
 
 Selecting `inherit` removes that agent's override from the config file.
 
+### `/subagent-continue`
+
+Continue a previous run by unique short id or label prefix:
+
+```text
+/subagent-continue <run-prefix> [instruction]
+/subagent-continue 40f8e738
+/subagent-continue scout@40f8e738 continue investigating the auth flow
+```
+
+Only runs with `childSessionRef` are continuable. Older runs created before child sessions existed are view-only.
+
 ## Live viewer keybindings
 
 Inside the fullscreen viewer:
@@ -140,10 +152,11 @@ Inside the fullscreen viewer:
 
 ## Tool usage
 
-The extension registers one tool:
+The extension registers two tools:
 
 ```text
 subagent
+subagent_continue
 ```
 
 ### Single agent
@@ -619,9 +632,9 @@ print('LAST_EVENT', json.loads(lines[-1])['type'])
 PY
 ```
 
-## Continuable runs design
+## Continuable runs
 
-Continuing a previous subagent run is planned but not implemented yet. The design is documented in:
+Continuing a previous subagent run is implemented for runs created after child-session support was added. Full design and storage details are documented in:
 
 ```text
 docs/continuable-runs.md
@@ -629,11 +642,11 @@ docs/continuable-runs.md
 
 Key decisions:
 
-- new runs need real child pi session JSONL files;
+- new runs use real child pi session JSONL files under `~/.pi/agent/subagent-sessions/`;
 - older runs created before child sessions are view-only (Option A);
-- transcript continuation should use gzip segments instead of appending to one gzip file;
+- transcript continuation uses gzip segments (`0001.jsonl.gz`, `0002.jsonl.gz`, ...) instead of appending to one gzip file;
 - `/subagent-continue <run-prefix> [instruction]` is the deterministic command;
-- natural-language requests require a future `subagent_continue` tool or input alias.
+- `subagent_continue` is an LLM-callable tool for natural-language continuation requests.
 
 ## Operational workflow
 

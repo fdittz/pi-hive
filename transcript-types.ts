@@ -20,6 +20,17 @@ export interface TranscriptStorageRef {
 	createdAt: number;
 }
 
+export interface TranscriptSegmentRef extends TranscriptStorageRef {
+	index: number;
+}
+
+export interface ChildSessionRef {
+	kind: "pi-session-jsonl-v1";
+	relativePath: string;
+	absolutePath?: string;
+	createdAt: number;
+}
+
 export interface TranscriptPersistResult {
 	ref?: TranscriptStorageRef;
 	error?: string;
@@ -53,6 +64,12 @@ export interface SubagentRunRecord {
 
 	/** Full transcript sidecar reference, available after a run finishes and storage succeeds. */
 	transcriptRef?: TranscriptStorageRef;
+
+	/** Transcript segments, used when a run is continued after the initial process exits. */
+	transcriptSegments?: TranscriptSegmentRef[];
+
+	/** Real child pi session used to continue this subagent run. Missing means view-only. */
+	childSessionRef?: ChildSessionRef;
 
 	/** Storage failure message, if full gzip persistence failed but normal tool execution continued. */
 	transcriptStorageError?: string;
@@ -96,6 +113,8 @@ export interface HistoricalResultLike {
 	index?: number;
 	replayEvents?: StoredTranscriptEvent[];
 	transcriptRef?: TranscriptStorageRef;
+	transcriptSegments?: TranscriptSegmentRef[];
+	childSessionRef?: ChildSessionRef;
 	transcriptStorageError?: string;
 }
 

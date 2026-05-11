@@ -166,6 +166,21 @@ This opens an interactive loop:
 ~/.pi/agent/subagent-models.json
 ```
 
+### Continue a subagent run
+
+```text
+/subagent-continue <run-prefix> [instruction]
+```
+
+Examples:
+
+```text
+/subagent-continue 40f8e738
+/subagent-continue scout@40f8e738 continue investigating the auth flow
+```
+
+The extension also registers an LLM-callable tool named `subagent_continue`, so natural-language requests like `continue a sessao 40f8e738` can work when the main model chooses that tool. For deterministic behavior, use `/subagent-continue`.
+
 ## Tool Modes
 
 | Mode | Parameter | Description |
@@ -320,21 +335,34 @@ Invalid or missing colors fall back to the active pi theme's `accent`/`toolTitle
 | `reviewer` | Code review | inherit | red | read, grep, find, ls, bash |
 | `worker` | General-purpose | inherit | green | (all default) |
 
-## Continuable runs design
+## Continuable runs
 
-Continuing a previous subagent run is planned but not implemented yet. The design is documented in:
+New subagent runs are continuable because each run gets a real child pi session file under:
 
 ```text
-docs/continuable-runs.md
+~/.pi/agent/subagent-sessions/<session-key>/<run-id>.jsonl
 ```
 
-Planned deterministic command:
+Continue a run deterministically with:
 
 ```text
 /subagent-continue <run-prefix> [instruction]
 ```
 
-Natural-language requests such as `continue a sessao 238831282893` require an additional LLM-callable `subagent_continue` tool or deterministic input alias; a slash command alone is not invoked automatically from ordinary chat text.
+Examples:
+
+```text
+/subagent-continue 40f8e738
+/subagent-continue scout@40f8e738 continue investigating the auth flow
+```
+
+Natural-language requests such as `continue a sessao 238831282893` can work through the LLM-callable `subagent_continue` tool, but the slash command remains the deterministic path. Runs created before child sessions existed are view-only.
+
+Full design and storage details:
+
+```text
+docs/continuable-runs.md
+```
 
 ## Workflow Prompts
 
