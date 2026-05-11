@@ -437,11 +437,14 @@ Inside the viewer:
 | `←` / `→` | Switch between all known subagent runs in the current main session |
 | `↑` / `↓` | Scroll one line |
 | `PageUp` / `PageDown` | Scroll one page |
+| Mouse wheel | Scroll the transcript inside the overlay |
 | `Home` / `End` | Jump to top/bottom |
 | `Ctrl+O` | Toggle expanded/collapsed tool rendering inside the viewer |
 | `Esc`, `q`, `Alt+O`, `Ctrl+Shift+O` | Close the viewer |
 
 The viewer replays the same JSON event stream emitted by child `pi --mode json` processes and renders built-in tool calls with public pi components such as `ToolExecutionComponent` and `AssistantMessageComponent`.
+
+While the viewer is open, pi-hive enables terminal mouse reporting so the mouse wheel scrolls the transcript instead of the terminal scrollback. Mouse reporting is disabled again when the viewer closes.
 
 ### Persistent transcript storage
 

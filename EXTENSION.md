@@ -223,6 +223,7 @@ Inside the fullscreen viewer:
 | `←` / `→` | Switch between all known subagent runs in the current main session |
 | `↑` / `↓` | Scroll one line |
 | `PageUp` / `PageDown` | Scroll one page |
+| Mouse wheel | Scroll the transcript inside the overlay |
 | `Home` / `End` | Jump to top/bottom |
 | `Ctrl+O` | Toggle expanded/collapsed tool rendering inside the viewer |
 | `Esc` | Close viewer and return to main pi UI |

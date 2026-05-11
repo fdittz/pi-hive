@@ -24,6 +24,28 @@ function shortCwd(cwd: string): string {
 	return cwd;
 }
 
+function parseMouseWheelDelta(data: string): number | undefined {
+	// SGR mouse mode: ESC [ < button ; col ; row M/m. Wheel up/down are 64/65,
+	// with modifier bits possibly added.
+	const sgr = data.match(/^\x1b\[<(\d+);\d+;\d+[mM]$/);
+	if (sgr) {
+		const button = Number(sgr[1]);
+		const base = button & ~28; // strip shift/meta/ctrl bits (4, 8, 16)
+		if (base === 64) return -3;
+		if (base === 65) return 3;
+	}
+
+	// Normal xterm mouse mode: ESC [ M Cb Cx Cy, where Cb = 32 + button.
+	if (data.startsWith("\x1b[M") && data.length >= 6) {
+		const button = data.charCodeAt(3) - 32;
+		const base = button & ~28;
+		if (base === 64) return -3;
+		if (base === 65) return 3;
+	}
+
+	return undefined;
+}
+
 export class SubagentOverlay implements Component {
 	private selectedIndex = -1;
 	private scrollOffset = 0;
@@ -39,6 +61,7 @@ export class SubagentOverlay implements Component {
 		private registry: LiveSubagentRegistry,
 		private initialRunId?: string,
 	) {
+		this.enableMouseReporting();
 		this.unsubscribe = registry.subscribe(() => {
 			this.transcriptView.invalidate();
 			this.tui.requestRender();
@@ -74,6 +97,12 @@ export class SubagentOverlay implements Component {
 	}
 
 	handleInput(data: string): void {
+		const wheelDelta = parseMouseWheelDelta(data);
+		if (wheelDelta !== undefined) {
+			this.scrollBy(wheelDelta);
+			return;
+		}
+
 		if (matchesKey(data, "ctrl+shift+o") || matchesKey(data, "alt+o") || matchesKey(data, Key.escape) || data === "q") {
 			this.done();
 			return;
@@ -125,6 +154,7 @@ export class SubagentOverlay implements Component {
 	}
 
 	dispose(): void {
+		this.disableMouseReporting();
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 	}
@@ -144,6 +174,17 @@ export class SubagentOverlay implements Component {
 		this.scrollOffset = Math.max(0, this.scrollOffset + delta);
 		this.stickToBottom = false;
 		this.tui.requestRender();
+	}
+
+	private enableMouseReporting(): void {
+		// Capture wheel events while the fullscreen overlay is focused. Without this,
+		// many terminals scroll their scrollback buffer, revealing the parent session
+		// behind the overlay. SGR mode keeps coordinates parseable.
+		this.tui.terminal.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+	}
+
+	private disableMouseReporting(): void {
+		this.tui.terminal.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
 	}
 
 	private renderHeader(run: SubagentRunRecord, total: number, width: number): string[] {
