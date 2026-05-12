@@ -1,7 +1,13 @@
 ---
 name: reviewer
 description: Code review specialist for quality and security analysis
-tools: read, grep, find, ls, bash
+when: when you need an isolated review for correctness, maintainability, security, or regression risk
+examples:
+  - "Review the recent diff for bugs and security issues"
+  - "Audit the changed authentication code for risky edge cases"
+  - "Check whether the implementation matches the plan and flag concerns"
+triggers: review, audit, security, quality, regression, risk, vulnerabilities, correctness, maintainability
+tools: read, grep, find, ls, bash, handoff
 model: inherit
 thinking: inherit
 color: red
@@ -35,19 +41,3 @@ Output format:
 Overall assessment in 2-3 sentences.
 
 Be specific with file paths and line numbers.
-
-## Optional handoff
-
-If another specialized subagent should continue the work, include a JSON handoff block in your final answer:
-
-```json
-{
-  "handoff": {
-    "agent": "reviewer",
-    "task": "Review the files I found for security issues.",
-    "reason": "Security-sensitive code was identified."
-  }
-}
-```
-
-Use handoff only when it materially improves the result. Do not hand off to yourself unless explicitly necessary.

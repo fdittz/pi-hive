@@ -25,18 +25,20 @@ import { Type } from "typebox";
 import { colorAgentText } from "./agent-colors.js";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { ChildSessionStorage } from "./child-session-storage.js";
+import { generateSubagentGuidance } from "./delegation-guidance.js";
 import { getCompatibilityWarning } from "./compatibility.js";
 import {
 	confirmHandoff,
 	decideHandoff,
 	extractHandoffRequests,
+	extractHandoffRequestsFromMessages,
 	openSubagentHandoffConfig,
 	shouldAskApprovalForHandoff,
 } from "./handoff.js";
 import { LiveSubagentRegistry } from "./live-registry.js";
 import { loadSubagentModelConfig, resolveAgentModel } from "./model-overrides.js";
 import { openSubagentModelSelector } from "./model-selector.js";
-import { buildSubagentHeaderEnv, registerSubagentRequestHeaders } from "./request-headers.js";
+import { buildSubagentHeaderEnv, isSubagentChildProcess, registerSubagentRequestHeaders } from "./request-headers.js";
 import { loadSubagentConfig } from "./subagent-config.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
 import { TranscriptStorage } from "./transcript-storage.js";
@@ -45,6 +47,16 @@ import { appendCoalescedTranscriptEvent, formatRunLabel, shouldPersistReplayEven
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
+
+function debugLog(message: string): void {
+	if (process.env.PI_HIVE_DEBUG !== "1" && process.env.PI_SUBAGENT_DEBUG !== "1") return;
+	console.error(`[pi-hive] ${message}`);
+}
+
+function debugPreview(text: string, maxLength = 320): string {
+	const compact = text.replace(/\s+/g, " ").trim();
+	return compact.length > maxLength ? `${compact.slice(0, maxLength)}…` : compact;
+}
 
 const registry = new LiveSubagentRegistry();
 const transcriptStorage = new TranscriptStorage();
@@ -162,6 +174,13 @@ interface UsageStats {
 	turns: number;
 }
 
+interface HandoffInfo {
+	fromAgent: string;
+	fromRunId?: string;
+	reason?: string;
+	depth: number;
+}
+
 interface SingleResult {
 	runId?: string;
 	agent: string;
@@ -183,6 +202,7 @@ interface SingleResult {
 	transcriptSegments?: TranscriptSegmentRef[];
 	childSessionRef?: ChildSessionRef;
 	transcriptStorageError?: string;
+	handoff?: HandoffInfo;
 }
 
 interface SubagentDetails {
@@ -190,6 +210,12 @@ interface SubagentDetails {
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+}
+
+function withSequentialChainSteps(results: SingleResult[]): SingleResult[] {
+	return results.map((result, index) =>
+		result.step === index + 1 ? result : { ...result, step: index + 1 },
+	);
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -273,9 +299,11 @@ type RunMeta = {
 	index?: number;
 	sessionFile?: string;
 	parentModel?: { provider: string; id: string };
+	parentThinking?: string;
 	existingRunId?: string;
 	continuation?: boolean;
 	handoffDepth?: number;
+	handoff?: HandoffInfo;
 };
 
 async function runSingleAgent(
@@ -303,12 +331,13 @@ async function runSingleAgent(
 			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 			step,
+			handoff: runMeta.handoff,
 		};
 	}
 
 	const effectiveCwd = cwd ?? defaultCwd;
 	const modelConfig = loadSubagentModelConfig();
-	const resolvedModel = resolveAgentModel(agent, runMeta.parentModel, modelConfig);
+	const resolvedModel = resolveAgentModel(agent, runMeta.parentModel, modelConfig, runMeta.parentThinking);
 	let run = runMeta.existingRunId ? registry.getRun(runMeta.existingRunId) : undefined;
 	if (run) {
 		registry.markRunRunning(run.id);
@@ -364,6 +393,7 @@ async function runSingleAgent(
 		index: runMeta.index,
 		replayEvents: [],
 		childSessionRef: run.childSessionRef,
+		handoff: runMeta.handoff,
 	};
 
 	const emitUpdate = () => {
@@ -485,6 +515,10 @@ async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
+		const finalOutput = getFinalOutput(currentResult.messages);
+		debugLog(
+			`runSingleAgent complete: agent=${agentName}; runId=${run.id}; exitCode=${exitCode}; stopReason=${currentResult.stopReason ?? "none"}; errorMessage=${currentResult.errorMessage ?? "none"}; stderrLength=${currentResult.stderr.length}; messages=${currentResult.messages.length}; finalOutputLength=${finalOutput.length}; hasHandoffKey=${/"(?:handoff|handoffs|delegate|delegates|delegations)"\s*:/.test(finalOutput)}; finalOutputTail=${JSON.stringify(debugPreview(finalOutput.slice(-1200)))}`,
+		);
 		const finalStatus = wasAborted
 			? "aborted"
 			: exitCode === 0 && currentResult.stopReason !== "error" && currentResult.stopReason !== "aborted"
@@ -619,6 +653,16 @@ function parseContinueArgs(args: string): { run: string; instruction?: string } 
 	return { run, instruction: rest.join(" ").trim() || undefined };
 }
 
+function shouldIncludeProjectAgentGuidance(prompt: string): boolean {
+	const projectAgentTarget = String.raw`(?:project[-\s]?local\s+agents?|project agents?|\.pi\/agents)`;
+	const negatedProjectAgentIntent = new RegExp(
+		String.raw`\b(?:do\s+not|don't|dont|avoid|without|never|no)\b[^.!?\n]{0,80}${projectAgentTarget}\b`,
+		"i",
+	);
+	if (negatedProjectAgentIntent.test(prompt)) return false;
+	return /(?:\.pi\/agents|agentScope\s*[:=]\s*["']?(?:both|project)\b|\b(?:use|include|enable|list|show|discover|load)\s+(?:trusted\s+)?(?:project[-\s]?local\s+agents?|project agents?)\b)/i.test(prompt);
+}
+
 async function executeHandoffsForResult(
 	ctx: ExtensionContext,
 	agents: AgentConfig[],
@@ -627,52 +671,117 @@ async function executeHandoffsForResult(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	runMeta: RunMeta,
+	displayBaseResults: SingleResult[] = [sourceResult],
 ): Promise<SingleResult[]> {
+	const depth = runMeta.handoffDepth ?? 0;
 	const output = getFinalOutput(sourceResult.messages);
-	const requests = extractHandoffRequests(output);
+	debugLog(
+		`executeHandoffsForResult: source=${sourceResult.agent}; runId=${sourceResult.runId ?? "none"}; exitCode=${sourceResult.exitCode}; stopReason=${sourceResult.stopReason ?? "none"}; depth=${depth}; finalOutputLength=${output.length}; hasHandoffKey=${/"(?:handoff|handoffs|delegate|delegates|delegations)"\s*:/.test(output)}`,
+	);
+	if (sourceResult.exitCode !== 0 || sourceResult.stopReason === "error" || sourceResult.stopReason === "aborted") {
+		debugLog(`executeHandoffsForResult: skipped for ${sourceResult.agent} because source run did not complete successfully`);
+		return [];
+	}
+	const toolRequests = extractHandoffRequestsFromMessages(sourceResult.messages);
+	const textRequests = toolRequests.length === 0 ? extractHandoffRequests(output) : [];
+	const requests = [...toolRequests, ...textRequests];
+	debugLog(
+		`executeHandoffsForResult: extracted ${requests.length} request(s) from ${sourceResult.agent}; tool=${toolRequests.length}; text=${textRequests.length}`,
+	);
 	if (requests.length === 0) return [];
 	const config = loadSubagentConfig();
+	debugLog(
+		`executeHandoffsForResult: loaded config handoff=${JSON.stringify(config.handoff)}; availableAgents=${agents.map((agent) => `${agent.name}:${agent.source}`).join(",")}`,
+	);
 	const sourceAgent = agents.find((agent) => agent.name === sourceResult.agent);
-	if (!sourceAgent) return [];
+	if (!sourceAgent) {
+		debugLog(`executeHandoffsForResult: source agent '${sourceResult.agent}' not found in discovered agents; skipping`);
+		return [];
+	}
+	debugLog(
+		`executeHandoffsForResult: sourceAgent=${sourceAgent.name}; source=${sourceAgent.source}; allowList=${JSON.stringify(sourceAgent.handoffAllowList ?? [])}`,
+	);
 	const childResults: SingleResult[] = [];
 	for (let i = 0; i < requests.length; i++) {
 		const request = requests[i];
 		const targetAgent = agents.find((agent) => agent.name === request.agent);
-		const decision = decideHandoff(request, sourceAgent, targetAgent, config, runMeta.handoffDepth ?? 0, i);
+		debugLog(
+			`executeHandoffsForResult: evaluating request #${i + 1}/${requests.length}: ${sourceAgent.name} -> ${request.agent}; targetFound=${Boolean(targetAgent)}; taskLength=${request.task.length}; reason=${JSON.stringify(request.reason ?? "")}`,
+		);
+		const decision = decideHandoff(request, sourceAgent, targetAgent, config, depth, i);
 		if (!decision.allowed || !targetAgent) {
+			debugLog(`executeHandoffsForResult: request #${i + 1} skipped; reason=${decision.reason ?? "unknown"}`);
 			if (ctx.hasUI && decision.reason) ctx.ui.notify(`Handoff skipped: ${decision.reason}`, "warning");
 			continue;
 		}
 		if (await shouldAskApprovalForHandoff(ctx, request, sourceAgent, targetAgent, config)) {
+			debugLog(`executeHandoffsForResult: requesting approval for ${sourceAgent.name} -> ${targetAgent.name}`);
 			const ok = await confirmHandoff(ctx, request, sourceAgent, targetAgent);
+			debugLog(`executeHandoffsForResult: approval ${ok ? "granted" : "denied"} for ${sourceAgent.name} -> ${targetAgent.name}`);
 			if (!ok) continue;
 		}
 		const handoffTask = request.reason ? `${request.task}\n\nHandoff reason from ${sourceAgent.name}: ${request.reason}` : request.task;
+		const visibleBefore = [...displayBaseResults, ...childResults];
+		const handoffStep = visibleBefore.length + 1;
+		const handoffInfo: HandoffInfo = {
+			fromAgent: sourceAgent.name,
+			depth: depth + 1,
+			...(sourceResult.runId ? { fromRunId: sourceResult.runId } : {}),
+			...(request.reason ? { reason: request.reason } : {}),
+		};
+		const handoffUpdate: OnUpdateCallback | undefined = onUpdate
+			? (partial) => {
+					const currentResult = partial.details?.results[partial.details.results.length - 1];
+					if (!currentResult) {
+						onUpdate(partial);
+						return;
+					}
+					onUpdate({
+						content: partial.content,
+						details: makeDetails([...visibleBefore, currentResult]),
+					});
+				}
+			: undefined;
+		debugLog(`executeHandoffsForResult: executing handoff ${sourceAgent.name} -> ${targetAgent.name}; depth=${depth + 1}; step=${handoffStep}`);
 		const result = await runSingleAgent(
 			request.cwd || sourceResult.cwd || ctx.cwd,
 			agents,
 			targetAgent.name,
 			handoffTask,
 			request.cwd || sourceResult.cwd || ctx.cwd,
-			undefined,
+			handoffStep,
 			signal,
-			onUpdate,
+			handoffUpdate,
 			makeDetails,
 			{
 				parentToolCallId: `${sourceResult.runId ?? runMeta.parentToolCallId}:handoff:${i}`,
 				mode: runMeta.mode,
-				index: i,
+				index: handoffStep - 1,
 				sessionFile: runMeta.sessionFile,
 				parentModel: runMeta.parentModel,
+				parentThinking: runMeta.parentThinking,
 				handoffDepth: (runMeta.handoffDepth ?? 0) + 1,
+				handoff: handoffInfo,
 			},
 		);
 		childResults.push(result);
-		const nested = await executeHandoffsForResult(ctx, agents, result, signal, onUpdate, makeDetails, {
-			...runMeta,
-			parentToolCallId: result.runId ?? runMeta.parentToolCallId,
-			handoffDepth: (runMeta.handoffDepth ?? 0) + 1,
-		});
+		debugLog(
+			`executeHandoffsForResult: handoff result ${targetAgent.name}; exitCode=${result.exitCode}; stopReason=${result.stopReason ?? "none"}; runId=${result.runId ?? "none"}`,
+		);
+		const nested = await executeHandoffsForResult(
+			ctx,
+			agents,
+			result,
+			signal,
+			onUpdate,
+			makeDetails,
+			{
+				...runMeta,
+				parentToolCallId: result.runId ?? runMeta.parentToolCallId,
+				handoffDepth: (runMeta.handoffDepth ?? 0) + 1,
+			},
+			[...displayBaseResults, ...childResults],
+		);
 		childResults.push(...nested);
 	}
 	return childResults;
@@ -685,6 +794,7 @@ async function continueSubagentRun(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	parentToolCallId: string,
+	parentThinking?: string,
 ): Promise<SingleResult> {
 	const matches = registry.findRunsByPrefix(runQuery);
 	if (matches.length === 0) throw new Error(`No subagent run matches "${runQuery}".`);
@@ -724,6 +834,7 @@ async function continueSubagentRun(
 			index: run.index,
 			sessionFile: getSessionFile(ctx),
 			parentModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+			parentThinking,
 			existingRunId: run.id,
 			continuation: true,
 		},
@@ -731,7 +842,13 @@ async function continueSubagentRun(
 }
 
 export default function (pi: ExtensionAPI) {
+	const runningAsSubagent = isSubagentChildProcess();
 	registerSubagentRequestHeaders(pi);
+	debugLog(
+		runningAsSubagent
+			? `Detected child subagent process${process.env.PI_SUBAGENT_AGENT ? ` (${process.env.PI_SUBAGENT_AGENT})` : ""}; skipping subagent orchestration tools.`
+			: "Detected parent pi process; registering subagent orchestration tools.",
+	);
 
 	pi.on("session_start", async (_event, ctx) => {
 		await registry.hydrateFromSessionEntries(ctx.sessionManager.getBranch(), transcriptStorage);
@@ -753,7 +870,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("subagent-model", {
 		description: "Configure which model each subagent uses",
 		handler: async (_args, ctx) => {
-			await openSubagentModelSelector(ctx);
+			await openSubagentModelSelector(ctx, "both", pi.getThinkingLevel());
 		},
 	});
 
@@ -773,7 +890,15 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			try {
-				const result = await continueSubagentRun(ctx, parsed.run, parsed.instruction, ctx.signal, undefined, `command:${parsed.run}`);
+				const result = await continueSubagentRun(
+					ctx,
+					parsed.run,
+					parsed.instruction,
+					ctx.signal,
+					undefined,
+					`command:${parsed.run}`,
+					pi.getThinkingLevel(),
+				);
 				pi.appendEntry("subagent-run-update", { result });
 				ctx.ui.notify(`Continued ${formatRunLabel(result.agent, result.runId)}.`, "info");
 			} catch (error) {
@@ -796,152 +921,345 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
-		name: "subagent_continue",
-		label: "Continue Subagent",
-		description: "Continue a previous continuable subagent run by short run id, full id, or agent@id label.",
-		promptSnippet: "Continue a previous subagent run by short run id or agent@id label",
-		promptGuidelines: [
-			"Use subagent_continue when the user asks to continue, resume, or pick up a previous subagent run by id, short id, or agent@id label.",
-		],
-		parameters: SubagentContinueParams,
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const result = await continueSubagentRun(
-				ctx,
-				params.run,
-				params.instruction,
-				signal,
-				onUpdate
-					? (partial) => {
-							onUpdate({ content: partial.content, details: { result: partial.details?.results[0] } });
-						}
-					: undefined,
-				toolCallId,
-			);
-			return {
-				content: [{ type: "text", text: getFinalOutput(result.messages) || `Continued ${formatRunLabel(result.agent, result.runId)}.` }],
-				details: { result },
-			};
-		},
+	const initialSubagentGuidance = generateSubagentGuidance(discoverAgents(process.cwd(), "user").agents);
+
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (!event.systemPromptOptions.selectedTools?.includes("subagent")) return;
+		const guidanceScope: AgentScope = shouldIncludeProjectAgentGuidance(event.prompt) ? "both" : "user";
+		const dynamicGuidance = generateSubagentGuidance(discoverAgents(ctx.cwd, guidanceScope).agents);
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n${dynamicGuidance.promptSection}`,
+		};
 	});
 
-	pi.registerTool({
-		name: "subagent",
-		label: "Subagent",
-		description: [
-			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			"Subagents may request handoffs by emitting JSON with handoff or handoffs; handoffs run automatically by default.",
-			'Default agent scope is "user" (from ~/.pi/agent/agents).',
-			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
-		].join(" "),
-		parameters: SubagentParams,
-
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const agentScope: AgentScope = params.agentScope ?? "user";
-			const discovery = discoverAgents(ctx.cwd, agentScope);
-			const agents = discovery.agents;
-			const confirmProjectAgents = params.confirmProjectAgents ?? true;
-			const sessionFile = getSessionFile(ctx);
-			const parentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
-
-			const hasChain = (params.chain?.length ?? 0) > 0;
-			const hasTasks = (params.tasks?.length ?? 0) > 0;
-			const hasSingle = Boolean(params.agent && params.task);
-			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
-
-			const makeDetails =
-				(mode: "single" | "parallel" | "chain") =>
-				(results: SingleResult[]): SubagentDetails => ({
-					mode,
-					agentScope,
-					projectAgentsDir: discovery.projectAgentsDir,
-					results,
-				});
-
-			if (modeCount !== 1) {
-				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+	if (runningAsSubagent) {
+		pi.registerTool({
+			name: "handoff",
+			label: "Handoff",
+			description: "Request that another specialized agent continues the work after you finish. The parent process will invoke the target agent.",
+			parameters: Type.Object({
+				agent: Type.String({ description: "Name of the target agent to hand off to" }),
+				task: Type.String({ description: "Task description for the target agent" }),
+				reason: Type.Optional(Type.String({ description: "Why this handoff is needed" })),
+			}),
+			async execute(_toolCallId, params) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`,
+							text: `Handoff to "${params.agent}" registered. The parent process will invoke ${params.agent} after you finish.`,
 						},
 					],
-					details: makeDetails("single")([]),
 				};
-			}
-
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
-				const requestedAgentNames = new Set<string>();
-				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
-				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
-				if (params.agent) requestedAgentNames.add(params.agent);
-
-				const projectAgentsRequested = Array.from(requestedAgentNames)
-					.map((name) => agents.find((a) => a.name === name))
-					.filter((a): a is AgentConfig => a?.source === "project");
-
-				if (projectAgentsRequested.length > 0) {
-					const names = projectAgentsRequested.map((a) => a.name).join(", ");
-					const dir = discovery.projectAgentsDir ?? "(unknown)";
-					const ok = await ctx.ui.confirm(
-						"Run project-local agents?",
-						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
-					);
-					if (!ok)
-						return {
-							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
-							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-						};
-				}
-			}
-
-			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
-
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
+			},
+		});
+	} else {
+		pi.registerTool({
+			name: "subagent_continue",
+			label: "Continue Subagent",
+			description: "Continue a previous continuable subagent run by short run id, full id, or agent@id label.",
+			promptSnippet: "Continue a previous subagent run by short run id or agent@id label",
+			promptGuidelines: [
+				"Use subagent_continue when the user asks to continue, resume, or pick up a previous subagent run by id, short id, or agent@id label.",
+			],
+			parameters: SubagentContinueParams,
+			async execute(toolCallId, params, signal, onUpdate, ctx) {
+				const result = await continueSubagentRun(
+					ctx,
+					params.run,
+					params.instruction,
+					signal,
+					onUpdate
 						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
+								onUpdate({ content: partial.content, details: { result: partial.details?.results[0] } });
 							}
-						: undefined;
+						: undefined,
+					toolCallId,
+					pi.getThinkingLevel(),
+				);
+				return {
+					content: [{ type: "text", text: getFinalOutput(result.messages) || `Continued ${formatRunLabel(result.agent, result.runId)}.` }],
+					details: { result },
+				};
+			},
+		});
 
+		pi.registerTool({
+			name: "subagent",
+			label: "Subagent",
+			description: [
+				"Delegate tasks to specialized subagents with isolated context.",
+				"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+				"Child subagents may request handoffs by calling the handoff tool; legacy JSON handoff output remains supported as a fallback.",
+				'Default agent scope is "user" (from ~/.pi/agent/agents).',
+				'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
+			].join(" "),
+			promptSnippet: initialSubagentGuidance.promptSnippet,
+			promptGuidelines: initialSubagentGuidance.promptGuidelines,
+			parameters: SubagentParams,
+
+			async execute(toolCallId, params, signal, onUpdate, ctx) {
+				const agentScope: AgentScope = params.agentScope ?? "user";
+				const discovery = discoverAgents(ctx.cwd, agentScope);
+				const agents = discovery.agents;
+				const confirmProjectAgents = params.confirmProjectAgents ?? true;
+				const sessionFile = getSessionFile(ctx);
+				const parentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
+				const parentThinking = pi.getThinkingLevel();
+
+				const hasChain = (params.chain?.length ?? 0) > 0;
+				const hasTasks = (params.tasks?.length ?? 0) > 0;
+				const hasSingle = Boolean(params.agent && params.task);
+				const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
+
+				const makeDetails =
+					(mode: "single" | "parallel" | "chain") =>
+					(results: SingleResult[]): SubagentDetails => ({
+						mode,
+						agentScope,
+						projectAgentsDir: discovery.projectAgentsDir,
+						results: mode === "chain" ? withSequentialChainSteps(results) : results,
+					});
+
+				if (modeCount !== 1) {
+					const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`,
+							},
+						],
+						details: makeDetails("single")([]),
+					};
+				}
+
+				if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
+					const requestedAgentNames = new Set<string>();
+					if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
+					if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
+					if (params.agent) requestedAgentNames.add(params.agent);
+
+					const projectAgentsRequested = Array.from(requestedAgentNames)
+						.map((name) => agents.find((a) => a.name === name))
+						.filter((a): a is AgentConfig => a?.source === "project");
+
+					if (projectAgentsRequested.length > 0) {
+						const names = projectAgentsRequested.map((a) => a.name).join(", ");
+						const dir = discovery.projectAgentsDir ?? "(unknown)";
+						const ok = await ctx.ui.confirm(
+							"Run project-local agents?",
+							`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+						);
+						if (!ok)
+							return {
+								content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
+								details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+							};
+					}
+				}
+
+				if (params.chain && params.chain.length > 0) {
+					const results: SingleResult[] = [];
+					let previousOutput = "";
+
+					for (let i = 0; i < params.chain.length; i++) {
+						const step = params.chain[i];
+						const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+
+						// Create update callback that includes all previous results
+						const chainUpdate: OnUpdateCallback | undefined = onUpdate
+							? (partial) => {
+									// Combine completed results with current streaming result
+									const currentResult = partial.details?.results[0];
+									if (currentResult) {
+										const allResults = [...results, currentResult];
+										onUpdate({
+											content: partial.content,
+											details: makeDetails("chain")(allResults),
+										});
+									}
+								}
+							: undefined;
+
+						const result = await runSingleAgent(
+							ctx.cwd,
+							agents,
+							step.agent,
+							taskWithContext,
+							step.cwd,
+							i + 1,
+							signal,
+							chainUpdate,
+							makeDetails("chain"),
+							{ parentToolCallId: toolCallId, mode: "chain", index: i, sessionFile, parentModel, parentThinking },
+						);
+						results.push(result);
+
+						const isError =
+							result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+						if (isError) {
+							const errorMsg =
+								result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+							return {
+								content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
+								details: makeDetails("chain")(results),
+								isError: true,
+							};
+						}
+						const handoffResults = await executeHandoffsForResult(
+							ctx,
+							agents,
+							result,
+							signal,
+							onUpdate,
+							makeDetails("chain"),
+							{
+								parentToolCallId: toolCallId,
+								mode: "chain",
+								index: i,
+								sessionFile,
+								parentModel,
+								parentThinking,
+								handoffDepth: 0,
+							},
+							results,
+						);
+						results.push(...handoffResults);
+						previousOutput = getFinalOutput(result.messages);
+					}
+					return {
+						content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+						details: makeDetails("chain")(results),
+					};
+				}
+
+				if (params.tasks && params.tasks.length > 0) {
+					if (params.tasks.length > MAX_PARALLEL_TASKS)
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+								},
+							],
+							details: makeDetails("parallel")([]),
+						};
+
+					// Track all results for streaming updates
+					const allResults: SingleResult[] = new Array(params.tasks.length);
+
+					// Initialize placeholder results
+					for (let i = 0; i < params.tasks.length; i++) {
+						allResults[i] = {
+							agent: params.tasks[i].agent,
+							agentSource: "unknown",
+							task: params.tasks[i].task,
+							exitCode: -1, // -1 = still running
+							messages: [],
+							stderr: "",
+							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+						};
+					}
+
+					const emitParallelUpdate = () => {
+						if (onUpdate) {
+							const running = allResults.filter((r) => r.exitCode === -1).length;
+							const done = allResults.filter((r) => r.exitCode !== -1).length;
+							onUpdate({
+								content: [
+									{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
+								],
+								details: makeDetails("parallel")([...allResults]),
+							});
+						}
+					};
+
+					const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+						const result = await runSingleAgent(
+							ctx.cwd,
+							agents,
+							t.agent,
+							t.task,
+							t.cwd,
+							undefined,
+							signal,
+							// Per-task update callback
+							(partial) => {
+								if (partial.details?.results[0]) {
+									allResults[index] = partial.details.results[0];
+									emitParallelUpdate();
+								}
+							},
+							makeDetails("parallel"),
+							{ parentToolCallId: toolCallId, mode: "parallel", index, sessionFile, parentModel, parentThinking },
+						);
+						allResults[index] = result;
+						emitParallelUpdate();
+						return result;
+					});
+
+					const handoffResults: SingleResult[] = [];
+					for (const result of results) {
+						if (result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted") continue;
+						handoffResults.push(
+							...(await executeHandoffsForResult(
+								ctx,
+								agents,
+								result,
+								signal,
+								onUpdate,
+								makeDetails("parallel"),
+								{
+									parentToolCallId: toolCallId,
+									mode: "parallel",
+									sessionFile,
+									parentModel,
+									parentThinking,
+									handoffDepth: 0,
+								},
+								[...results, ...handoffResults],
+							)),
+						);
+					}
+					const allParallelResults = [...results, ...handoffResults];
+					const successCount = allParallelResults.filter((r) => r.exitCode === 0).length;
+					const summaries = allParallelResults.map((r) => {
+						const output = getFinalOutput(r.messages);
+						const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
+						return `[${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}: ${preview || "(no output)"}`;
+					});
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Parallel: ${successCount}/${allParallelResults.length} succeeded\n\n${summaries.join("\n\n")}`,
+							},
+						],
+						details: makeDetails("parallel")(allParallelResults),
+					};
+				}
+
+				if (params.agent && params.task) {
 					const result = await runSingleAgent(
 						ctx.cwd,
 						agents,
-						step.agent,
-						taskWithContext,
-						step.cwd,
-						i + 1,
+						params.agent,
+						params.task,
+						params.cwd,
+						undefined,
 						signal,
-						chainUpdate,
-						makeDetails("chain"),
-						{ parentToolCallId: toolCallId, mode: "chain", index: i, sessionFile, parentModel },
+						onUpdate,
+						makeDetails("single"),
+						{ parentToolCallId: toolCallId, mode: "single", index: 0, sessionFile, parentModel, parentThinking },
 					);
-					results.push(result);
-
-					const isError =
-						result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+					const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 					if (isError) {
 						const errorMsg =
 							result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
 						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
+							content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+							details: makeDetails("single")([result]),
 							isError: true,
 						};
 					}
@@ -950,475 +1268,358 @@ export default function (pi: ExtensionAPI) {
 						agents,
 						result,
 						signal,
-						chainUpdate,
+						onUpdate,
 						makeDetails("chain"),
-						{ parentToolCallId: toolCallId, mode: "chain", index: i, sessionFile, parentModel, handoffDepth: 0 },
-					);
-					results.push(...handoffResults);
-					previousOutput = getFinalOutput(result.messages);
-				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-					details: makeDetails("chain")(results),
-				};
-			}
-
-			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
-
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
-
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						exitCode: -1, // -1 = still running
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-					};
-				}
-
-				const emitParallelUpdate = () => {
-					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
-						const done = allResults.filter((r) => r.exitCode !== -1).length;
-						onUpdate({
-							content: [
-								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
-							],
-							details: makeDetails("parallel")([...allResults]),
-						});
-					}
-				};
-
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-						{ parentToolCallId: toolCallId, mode: "parallel", index, sessionFile, parentModel },
-					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
-
-				const handoffResults: SingleResult[] = [];
-				for (const result of results) {
-					if (result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted") continue;
-					handoffResults.push(
-						...(await executeHandoffsForResult(ctx, agents, result, signal, onUpdate, makeDetails("parallel"), {
+						{
 							parentToolCallId: toolCallId,
-							mode: "parallel",
+							mode: "chain",
+							index: 0,
 							sessionFile,
 							parentModel,
+							parentThinking,
 							handoffDepth: 0,
-						})),
-					);
-				}
-				const allParallelResults = [...results, ...handoffResults];
-				const successCount = allParallelResults.filter((r) => r.exitCode === 0).length;
-				const summaries = allParallelResults.map((r) => {
-					const output = getFinalOutput(r.messages);
-					const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
-					return `[${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}: ${preview || "(no output)"}`;
-				});
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Parallel: ${successCount}/${allParallelResults.length} succeeded\n\n${summaries.join("\n\n")}`,
 						},
-					],
-					details: makeDetails("parallel")(allParallelResults),
-				};
-			}
-
-			if (params.agent && params.task) {
-				const result = await runSingleAgent(
-					ctx.cwd,
-					agents,
-					params.agent,
-					params.task,
-					params.cwd,
-					undefined,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-					{ parentToolCallId: toolCallId, mode: "single", index: 0, sessionFile, parentModel },
-				);
-				const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-				if (isError) {
-					const errorMsg =
-						result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+					);
+					const allResults = [result, ...handoffResults];
 					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-						details: makeDetails("single")([result]),
-						isError: true,
+						content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+						details: makeDetails(handoffResults.length > 0 ? "chain" : "single")(allResults),
 					};
 				}
-				const handoffResults = await executeHandoffsForResult(ctx, agents, result, signal, onUpdate, makeDetails("chain"), {
-					parentToolCallId: toolCallId,
-					mode: "chain",
-					index: 0,
-					sessionFile,
-					parentModel,
-					handoffDepth: 0,
-				});
-				const allResults = [result, ...handoffResults];
+
+				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-					details: makeDetails(handoffResults.length > 0 ? "chain" : "single")(allResults),
+					content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
+					details: makeDetails("single")([]),
 				};
-			}
+			},
 
-			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
-			return {
-				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
-				details: makeDetails("single")([]),
-			};
-		},
-
-		renderCall(args, theme, _context) {
-			const scope: AgentScope = args.agentScope ?? "user";
-			if (args.chain && args.chain.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `chain (${args.chain.length} steps)`) +
-					theme.fg("muted", ` [${scope}]`);
-				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
-					const step = args.chain[i];
-					// Clean up {previous} placeholder for display
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
-					text +=
-						"\n  " +
-						theme.fg("muted", `${i + 1}.`) +
-						" " +
-						theme.fg("accent", step.agent) +
-						theme.fg("dim", ` ${preview}`);
-				}
-				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
-			if (args.tasks && args.tasks.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					theme.fg("muted", ` [${scope}]`);
-				for (const t of args.tasks.slice(0, 3)) {
-					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
-					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
-				}
-				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
-			const agentName = args.agent || "...";
-			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
-			let text =
-				theme.fg("toolTitle", theme.bold("subagent ")) +
-				theme.fg("accent", agentName) +
-				theme.fg("muted", ` [${scope}]`);
-			text += `\n  ${theme.fg("dim", preview)}`;
-			return new Text(text, 0, 0);
-		},
-
-		renderResult(result, { expanded }, theme, _context) {
-			const details = result.details as SubagentDetails | undefined;
-			if (!details || details.results.length === 0) {
-				const text = result.content[0];
-				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
-			}
-
-			const mdTheme = getMarkdownTheme();
-			const renderAgentName = (r: SingleResult) => colorAgentText(theme, r.agentColor, formatRunLabel(r.agent, r.runId), "accent");
-			const renderAgentTitle = (r: SingleResult) => theme.bold(colorAgentText(theme, r.agentColor, formatRunLabel(r.agent, r.runId), "toolTitle"));
-
-			const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
-				const toShow = limit ? items.slice(-limit) : items;
-				const skipped = limit && items.length > limit ? items.length - limit : 0;
-				let text = "";
-				if (skipped > 0) text += theme.fg("muted", `... ${skipped} earlier items\n`);
-				for (const item of toShow) {
-					if (item.type === "text") {
-						const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
-						text += `${theme.fg("toolOutput", preview)}\n`;
-					} else {
-						text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
+			renderCall(args, theme, _context) {
+				const scope: AgentScope = args.agentScope ?? "user";
+				if (args.chain && args.chain.length > 0) {
+					let text =
+						theme.fg("toolTitle", theme.bold("subagent ")) +
+						theme.fg("accent", `chain (${args.chain.length} steps)`) +
+						theme.fg("muted", ` [${scope}]`);
+					for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
+						const step = args.chain[i];
+						// Clean up {previous} placeholder for display
+						const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
+						const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
+						text +=
+							"\n  " +
+							theme.fg("muted", `${i + 1}.`) +
+							" " +
+							theme.fg("accent", step.agent) +
+							theme.fg("dim", ` ${preview}`);
 					}
+					if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
+					return new Text(text, 0, 0);
 				}
-				return text.trimEnd();
-			};
+				if (args.tasks && args.tasks.length > 0) {
+					let text =
+						theme.fg("toolTitle", theme.bold("subagent ")) +
+						theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
+						theme.fg("muted", ` [${scope}]`);
+					for (const t of args.tasks.slice(0, 3)) {
+						const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
+						text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
+					}
+					if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
+					return new Text(text, 0, 0);
+				}
+				const agentName = args.agent || "...";
+				const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
+				let text =
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", agentName) +
+					theme.fg("muted", ` [${scope}]`);
+				text += `\n  ${theme.fg("dim", preview)}`;
+				return new Text(text, 0, 0);
+			},
 
-			if (details.mode === "single" && details.results.length === 1) {
-				const r = details.results[0];
-				const isError = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
-				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-				const displayItems = getDisplayItems(r.messages);
-				const finalOutput = getFinalOutput(r.messages);
+			renderResult(result, { expanded }, theme, _context) {
+				const details = result.details as SubagentDetails | undefined;
+				if (!details || details.results.length === 0) {
+					const text = result.content[0];
+					return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+				}
 
-				if (expanded) {
-					const container = new Container();
-					let header = `${icon} ${renderAgentTitle(r)}${theme.fg("muted", ` (${r.agentSource})`)}`;
-					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-					container.addChild(new Text(header, 0, 0));
-					if (isError && r.errorMessage)
-						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
-					container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
-					if (displayItems.length === 0 && !finalOutput) {
-						container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
-					} else {
-						for (const item of displayItems) {
-							if (item.type === "toolCall")
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
+				const mdTheme = getMarkdownTheme();
+				const renderAgentName = (r: SingleResult) => colorAgentText(theme, r.agentColor, formatRunLabel(r.agent, r.runId), "accent");
+				const renderAgentTitle = (r: SingleResult) => theme.bold(colorAgentText(theme, r.agentColor, formatRunLabel(r.agent, r.runId), "toolTitle"));
+
+				const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
+					const toShow = limit ? items.slice(-limit) : items;
+					const skipped = limit && items.length > limit ? items.length - limit : 0;
+					let text = "";
+					if (skipped > 0) text += theme.fg("muted", `... ${skipped} earlier items\n`);
+					for (const item of toShow) {
+						if (item.type === "text") {
+							const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
+							text += `${theme.fg("toolOutput", preview)}\n`;
+						} else {
+							text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
 						}
-						if (finalOutput) {
+					}
+					return text.trimEnd();
+				};
+
+				if (details.mode === "single" && details.results.length === 1) {
+					const r = details.results[0];
+					const isError = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
+					const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+					const displayItems = getDisplayItems(r.messages);
+					const finalOutput = getFinalOutput(r.messages);
+
+					if (expanded) {
+						const container = new Container();
+						let header = `${icon} ${renderAgentTitle(r)}${theme.fg("muted", ` (${r.agentSource})`)}`;
+						if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+						container.addChild(new Text(header, 0, 0));
+						if (isError && r.errorMessage)
+							container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
+						container.addChild(new Spacer(1));
+						container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
+						container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
+						container.addChild(new Spacer(1));
+						container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
+						if (displayItems.length === 0 && !finalOutput) {
+							container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
+						} else {
+							for (const item of displayItems) {
+								if (item.type === "toolCall")
+									container.addChild(
+										new Text(
+											theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+											0,
+											0,
+										),
+									);
+							}
+							if (finalOutput) {
+								container.addChild(new Spacer(1));
+								container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
+							}
+						}
+						const usageStr = formatUsageStats(r.usage, r.model);
+						if (usageStr) {
 							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
+							container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
 						}
+						return container;
+					}
+
+					let text = `${icon} ${renderAgentTitle(r)}${theme.fg("muted", ` (${r.agentSource})`)}`;
+					if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+					if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
+					else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+					else {
+						text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
+						if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 					}
 					const usageStr = formatUsageStats(r.usage, r.model);
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
+					if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
+					return new Text(text, 0, 0);
+				}
+
+				const aggregateUsage = (results: SingleResult[]) => {
+					const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+					for (const r of results) {
+						total.input += r.usage.input;
+						total.output += r.usage.output;
+						total.cacheRead += r.usage.cacheRead;
+						total.cacheWrite += r.usage.cacheWrite;
+						total.cost += r.usage.cost;
+						total.turns += r.usage.turns;
 					}
-					return container;
-				}
+					return total;
+				};
 
-				let text = `${icon} ${renderAgentTitle(r)}${theme.fg("muted", ` (${r.agentSource})`)}`;
-				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
-				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-				else {
-					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
-					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-				}
-				const usageStr = formatUsageStats(r.usage, r.model);
-				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
-				return new Text(text, 0, 0);
-			}
+				if (details.mode === "chain") {
+					const successCount = details.results.filter((r) => r.exitCode === 0).length;
+					const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const hasHandoff = details.results.some((r) => r.handoff);
+					const chainTitle = hasHandoff ? "chain + handoff " : "chain ";
+					const renderHandoffNote = (r: SingleResult) =>
+						r.handoff ? theme.fg("muted", ` [handoff from ${r.handoff.fromAgent}]`) : "";
 
-			const aggregateUsage = (results: SingleResult[]) => {
-				const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-				for (const r of results) {
-					total.input += r.usage.input;
-					total.output += r.usage.output;
-					total.cacheRead += r.usage.cacheRead;
-					total.cacheWrite += r.usage.cacheWrite;
-					total.cost += r.usage.cost;
-					total.turns += r.usage.turns;
-				}
-				return total;
-			};
-
-			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
-				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
-
-				if (expanded) {
-					const container = new Container();
-					container.addChild(
-						new Text(
-							icon +
-								" " +
-								theme.fg("toolTitle", theme.bold("chain ")) +
-								theme.fg("accent", `${successCount}/${details.results.length} steps`),
-							0,
-							0,
-						),
-					);
-
-					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-						const displayItems = getDisplayItems(r.messages);
-						const finalOutput = getFinalOutput(r.messages);
-
-						container.addChild(new Spacer(1));
+					if (expanded) {
+						const container = new Container();
 						container.addChild(
 							new Text(
-								`${theme.fg("muted", `─── Step ${r.step}: `) + renderAgentName(r)} ${rIcon}`,
+								icon +
+									" " +
+									theme.fg("toolTitle", theme.bold(chainTitle)) +
+									theme.fg("accent", `${successCount}/${details.results.length} steps`),
 								0,
 								0,
 							),
 						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 
-						// Show tool calls
-						for (const item of displayItems) {
-							if (item.type === "toolCall") {
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-							}
-						}
+						for (let index = 0; index < details.results.length; index++) {
+							const r = details.results[index];
+							const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+							const displayItems = getDisplayItems(r.messages);
+							const finalOutput = getFinalOutput(r.messages);
 
-						// Show final output as markdown
-						if (finalOutput) {
 							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
+							container.addChild(
+								new Text(
+									`${theme.fg("muted", `─── Step ${index + 1}: `) + renderAgentName(r)} ${rIcon}${renderHandoffNote(r)}`,
+									0,
+									0,
+								),
+							);
+							container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+
+							// Show tool calls
+							for (const item of displayItems) {
+								if (item.type === "toolCall") {
+									container.addChild(
+										new Text(
+											theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+											0,
+											0,
+										),
+									);
+								}
+							}
+
+							// Show final output as markdown
+							if (finalOutput) {
+								container.addChild(new Spacer(1));
+								container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
+							}
+
+							const stepUsage = formatUsageStats(r.usage, r.model);
+							if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
 						}
 
-						const stepUsage = formatUsageStats(r.usage, r.model);
-						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
+						const usageStr = formatUsageStats(aggregateUsage(details.results));
+						if (usageStr) {
+							container.addChild(new Spacer(1));
+							container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
+						}
+						return container;
 					}
 
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-					}
-					return container;
-				}
-
-				// Collapsed view
-				let text =
-					icon +
-					" " +
-					theme.fg("toolTitle", theme.bold("chain ")) +
-					theme.fg("accent", `${successCount}/${details.results.length} steps`);
-				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${renderAgentName(r)} ${rIcon}`;
-					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
-				}
-				const usageStr = formatUsageStats(aggregateUsage(details.results));
-				if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
-				text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-				return new Text(text, 0, 0);
-			}
-
-			if (details.mode === "parallel") {
-				const running = details.results.filter((r) => r.exitCode === -1).length;
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
-				const failCount = details.results.filter((r) => r.exitCode > 0).length;
-				const isRunning = running > 0;
-				const icon = isRunning
-					? theme.fg("warning", "⏳")
-					: failCount > 0
-						? theme.fg("warning", "◐")
-						: theme.fg("success", "✓");
-				const status = isRunning
-					? `${successCount + failCount}/${details.results.length} done, ${running} running`
-					: `${successCount}/${details.results.length} tasks`;
-
-				if (expanded && !isRunning) {
-					const container = new Container();
-					container.addChild(
-						new Text(
-							`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
-							0,
-							0,
-						),
-					);
-
-					for (const r of details.results) {
+					// Collapsed view
+					let text =
+						icon +
+						" " +
+						theme.fg("toolTitle", theme.bold(chainTitle)) +
+						theme.fg("accent", `${successCount}/${details.results.length} steps`);
+					for (let index = 0; index < details.results.length; index++) {
+						const r = details.results[index];
 						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
-						const finalOutput = getFinalOutput(r.messages);
-
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new Text(`${theme.fg("muted", "─── ") + renderAgentName(r)} ${rIcon}`, 0, 0),
-						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
-
-						// Show tool calls
-						for (const item of displayItems) {
-							if (item.type === "toolCall") {
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-							}
-						}
-
-						// Show final output as markdown
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-						}
-
-						const taskUsage = formatUsageStats(r.usage, r.model);
-						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
+						text += `\n\n${theme.fg("muted", `─── Step ${index + 1}: `)}${renderAgentName(r)} ${rIcon}${renderHandoffNote(r)}`;
+						if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+						else text += `\n${renderDisplayItems(displayItems, 5)}`;
 					}
-
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-					}
-					return container;
-				}
-
-				// Collapsed view (or still running)
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
-				for (const r of details.results) {
-					const rIcon =
-						r.exitCode === -1
-							? theme.fg("warning", "⏳")
-							: r.exitCode === 0
-								? theme.fg("success", "✓")
-								: theme.fg("error", "✗");
-					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", "─── ")}${renderAgentName(r)} ${rIcon}`;
-					if (displayItems.length === 0)
-						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
-				}
-				if (!isRunning) {
 					const usageStr = formatUsageStats(aggregateUsage(details.results));
 					if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
+					text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+					return new Text(text, 0, 0);
 				}
-				if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-				return new Text(text, 0, 0);
-			}
 
-			const text = result.content[0];
-			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
-		},
-	});
+				if (details.mode === "parallel") {
+					const running = details.results.filter((r) => r.exitCode === -1).length;
+					const successCount = details.results.filter((r) => r.exitCode === 0).length;
+					const failCount = details.results.filter((r) => r.exitCode > 0).length;
+					const isRunning = running > 0;
+					const icon = isRunning
+						? theme.fg("warning", "⏳")
+						: failCount > 0
+							? theme.fg("warning", "◐")
+							: theme.fg("success", "✓");
+					const status = isRunning
+						? `${successCount + failCount}/${details.results.length} done, ${running} running`
+						: `${successCount}/${details.results.length} tasks`;
+					const hasHandoff = details.results.some((r) => r.handoff);
+					const parallelTitle = hasHandoff ? "parallel + handoff " : "parallel ";
+					const renderHandoffNote = (r: SingleResult) =>
+						r.handoff ? theme.fg("muted", ` [handoff from ${r.handoff.fromAgent}]`) : "";
+
+					if (expanded && !isRunning) {
+						const container = new Container();
+						container.addChild(
+							new Text(
+								`${icon} ${theme.fg("toolTitle", theme.bold(parallelTitle))}${theme.fg("accent", status)}`,
+								0,
+								0,
+							),
+						);
+
+						for (const r of details.results) {
+							const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+							const displayItems = getDisplayItems(r.messages);
+							const finalOutput = getFinalOutput(r.messages);
+
+							container.addChild(new Spacer(1));
+							container.addChild(
+								new Text(`${theme.fg("muted", "─── ") + renderAgentName(r)} ${rIcon}${renderHandoffNote(r)}`, 0, 0),
+							);
+							container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+
+							// Show tool calls
+							for (const item of displayItems) {
+								if (item.type === "toolCall") {
+									container.addChild(
+										new Text(
+											theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+											0,
+											0,
+										),
+									);
+								}
+							}
+
+							// Show final output as markdown
+							if (finalOutput) {
+								container.addChild(new Spacer(1));
+								container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
+							}
+
+							const taskUsage = formatUsageStats(r.usage, r.model);
+							if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
+						}
+
+						const usageStr = formatUsageStats(aggregateUsage(details.results));
+						if (usageStr) {
+							container.addChild(new Spacer(1));
+							container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
+						}
+						return container;
+					}
+
+					// Collapsed view (or still running)
+					let text = `${icon} ${theme.fg("toolTitle", theme.bold(parallelTitle))}${theme.fg("accent", status)}`;
+					for (const r of details.results) {
+						const rIcon =
+							r.exitCode === -1
+								? theme.fg("warning", "⏳")
+								: r.exitCode === 0
+									? theme.fg("success", "✓")
+									: theme.fg("error", "✗");
+						const displayItems = getDisplayItems(r.messages);
+						text += `\n\n${theme.fg("muted", "─── ")}${renderAgentName(r)} ${rIcon}${renderHandoffNote(r)}`;
+						if (displayItems.length === 0)
+							text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
+						else text += `\n${renderDisplayItems(displayItems, 5)}`;
+					}
+					if (!isRunning) {
+						const usageStr = formatUsageStats(aggregateUsage(details.results));
+						if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
+					}
+					if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+					return new Text(text, 0, 0);
+				}
+
+				const text = result.content[0];
+				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+			},
+		});
+	}
 }

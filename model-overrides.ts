@@ -5,7 +5,8 @@ import { getSubagentConfigPath, loadSubagentConfig, saveSubagentConfig } from ".
 export const INHERIT_MODEL = "inherit";
 export const INHERIT_THINKING = "inherit";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-export type SubagentThinkingLevel = (typeof THINKING_LEVELS)[number] | typeof INHERIT_THINKING;
+export type ExplicitSubagentThinkingLevel = (typeof THINKING_LEVELS)[number];
+export type SubagentThinkingLevel = ExplicitSubagentThinkingLevel | typeof INHERIT_THINKING;
 
 export interface SubagentModelConfig {
 	version: number;
@@ -43,41 +44,53 @@ export async function saveSubagentModelConfig(config: SubagentModelConfig): Prom
 	await saveSubagentConfig(fullConfig);
 }
 
-function splitModelThinking(value: string): { model: string; thinking?: string } {
+function splitModelThinking(value: string): { model: string; thinking?: ExplicitSubagentThinkingLevel } {
 	const trimmed = value.trim();
 	const match = trimmed.match(/^(.*):(off|minimal|low|medium|high|xhigh)$/);
 	if (!match) return { model: trimmed };
-	return { model: match[1], thinking: match[2] };
+	return { model: match[1], thinking: match[2] as ExplicitSubagentThinkingLevel };
 }
 
 function normalizeThinking(value: string | undefined): SubagentThinkingLevel {
 	const trimmed = value?.trim();
 	if (!trimmed || trimmed === INHERIT_THINKING) return INHERIT_THINKING;
-	return (THINKING_LEVELS as readonly string[]).includes(trimmed) ? (trimmed as SubagentThinkingLevel) : INHERIT_THINKING;
+	return (THINKING_LEVELS as readonly string[]).includes(trimmed) ? (trimmed as ExplicitSubagentThinkingLevel) : INHERIT_THINKING;
+}
+
+function normalizeInheritedThinking(value: string | undefined): ExplicitSubagentThinkingLevel | undefined {
+	const normalized = normalizeThinking(value);
+	return normalized === INHERIT_THINKING ? undefined : normalized;
 }
 
 export function getAgentModelSetting(agent: AgentConfig, config = loadSubagentModelConfig()): string {
-	return config.overrides[agent.name] || agent.model || INHERIT_MODEL;
+	// Only user-selected subagent overrides participate in subagent resolution.
+	// Agent frontmatter model/thinking is for standalone agent defaults; selecting
+	// "inherit" in /subagent-model must inherit the parent pi, not frontmatter.
+	return config.overrides[agent.name] || INHERIT_MODEL;
 }
 
 export function getAgentModelDisplay(
 	agent: AgentConfig,
 	parentModel: Pick<Model<any>, "provider" | "id"> | undefined,
 	config = loadSubagentModelConfig(),
+	parentThinking?: string,
 ): string {
-	return resolveAgentModel(agent, parentModel, config).display;
+	return resolveAgentModel(agent, parentModel, config, parentThinking).display;
 }
 
 export function resolveAgentModel(
 	agent: AgentConfig,
 	parentModel: Pick<Model<any>, "provider" | "id"> | undefined,
 	config = loadSubagentModelConfig(),
+	parentThinking?: string,
 ): ResolvedAgentModel {
 	const rawSetting = getAgentModelSetting(agent, config).trim() || INHERIT_MODEL;
 	const split = splitModelThinking(rawSetting);
 	const setting = split.model || INHERIT_MODEL;
-	const thinking = normalizeThinking(agent.thinking);
-	const thinkingArg = split.thinking ?? (thinking === INHERIT_THINKING ? undefined : thinking);
+	// Precedence for subagent thinking is: explicit override suffix → parent pi → child pi default.
+	// Do not fall back to agent.thinking here; frontmatter defaults are intentionally ignored
+	// when an agent is launched as a subagent.
+	const thinkingArg = split.thinking ?? normalizeInheritedThinking(parentThinking);
 	if (setting === INHERIT_MODEL) {
 		const inherited = parentModel ? formatModelRef(parentModel) : undefined;
 		const displayThinking = thinkingArg ? `:${thinkingArg}` : "";

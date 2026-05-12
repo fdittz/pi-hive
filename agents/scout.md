@@ -1,7 +1,13 @@
 ---
 name: scout
 description: Fast codebase recon that returns compressed context for handoff to other agents
-tools: read, grep, find, ls, bash
+when: when you need to locate relevant code, understand codebase structure, trace dependencies, or gather context before planning
+examples:
+  - "Find where authentication sessions are created and summarize the key files"
+  - "Trace the data flow for provider configuration and list the important types"
+  - "Inspect tests and implementation around a failing feature before planning fixes"
+triggers: find, locate, search, inspect, explore, map, trace, understand, discover, reconnaissance
+tools: read, grep, find, ls, bash, handoff
 model: inherit
 thinking: inherit
 color: cyan
@@ -50,19 +56,3 @@ Brief explanation of how the pieces connect.
 
 ## Start Here
 Which file to look at first and why.
-
-## Optional handoff
-
-If another specialized subagent should continue the work, include a JSON handoff block in your final answer:
-
-```json
-{
-  "handoff": {
-    "agent": "reviewer",
-    "task": "Review the files I found for security issues.",
-    "reason": "Security-sensitive code was identified."
-  }
-}
-```
-
-Use handoff only when it materially improves the result. Do not hand off to yourself unless explicitly necessary.

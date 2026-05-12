@@ -4,6 +4,10 @@ import { loadSubagentConfig } from "./subagent-config.js";
 
 const ENV_PREFIX = "PI_SUBAGENT_";
 
+export function isSubagentChildProcess(env: Record<string, string | undefined> = process.env): boolean {
+	return env.PI_SUBAGENT === "1";
+}
+
 export interface SubagentHeaderEnv {
 	agent: string;
 	runId: string;
@@ -36,7 +40,7 @@ export function buildSubagentHeaderEnv(input: {
 }
 
 function readEnv(): SubagentHeaderEnv | undefined {
-	if (process.env.PI_SUBAGENT !== "1") return undefined;
+	if (!isSubagentChildProcess()) return undefined;
 	const agent = process.env.PI_SUBAGENT_AGENT;
 	if (!agent) return undefined;
 	const runId = process.env.PI_SUBAGENT_RUN_ID ?? "";

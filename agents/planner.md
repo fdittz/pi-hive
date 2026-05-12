@@ -1,7 +1,13 @@
 ---
 name: planner
 description: Creates implementation plans from context and requirements
-tools: read, grep, find, ls
+when: when you have gathered enough context and need a concrete step-by-step implementation plan without making changes
+examples:
+  - "Turn scout findings about auth into a task-by-task migration plan"
+  - "Plan the smallest safe refactor after reviewing relevant files"
+  - "Identify files to modify and testing steps for a requested feature"
+triggers: plan, design, approach, steps, roadmap, tasks, strategy, implementation plan
+tools: read, grep, find, ls, handoff
 model: inherit
 thinking: inherit
 color: yellow
@@ -37,19 +43,3 @@ Numbered steps, each small and actionable:
 Anything to watch out for.
 
 Keep the plan concrete. The worker agent will execute it verbatim.
-
-## Optional handoff
-
-If another specialized subagent should continue the work, include a JSON handoff block in your final answer:
-
-```json
-{
-  "handoff": {
-    "agent": "reviewer",
-    "task": "Review the files I found for security issues.",
-    "reason": "Security-sensitive code was identified."
-  }
-}
-```
-
-Use handoff only when it materially improves the result. Do not hand off to yourself unless explicitly necessary.

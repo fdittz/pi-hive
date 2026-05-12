@@ -4,7 +4,7 @@ import {
 	ToolExecutionComponent,
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
-import { Container, type TUI, Text } from "@earendil-works/pi-tui";
+import { Container, type Component, type TUI, Text } from "@earendil-works/pi-tui";
 import { tryNative } from "./compatibility.js";
 import type { StoredTranscriptEvent } from "./transcript-types.js";
 
@@ -18,14 +18,30 @@ export interface TranscriptAdapterOptions {
 	hiddenThinkingLabel?: string;
 }
 
+export interface TranscriptViewportRender {
+	lines: string[];
+	totalLines: number;
+	version: number;
+}
+
+interface ComponentRenderCache {
+	component: Component;
+	width?: number;
+	lines: string[];
+	dirty: boolean;
+}
+
 export class TranscriptAdapter {
 	private container = new Container();
+	private componentCaches: ComponentRenderCache[] = [];
+	private componentCacheByComponent = new Map<Component, ComponentRenderCache>();
 	private streamingComponent?: AssistantMessageComponent;
 	private streamingMessage?: Message;
 	private pendingTools = new Map<string, ToolExecutionComponent>();
 	private expanded: boolean;
 	private failed = false;
 	private failureMessage?: string;
+	private renderVersion = 0;
 
 	constructor(private options: TranscriptAdapterOptions) {
 		this.expanded = options.expanded;
@@ -60,8 +76,11 @@ export class TranscriptAdapter {
 		} catch (error) {
 			this.failed = true;
 			this.failureMessage = error instanceof Error ? error.message : String(error);
-			this.container.clear();
-			this.container.addChild(new Text(`Native transcript rendering failed: ${this.failureMessage}`, 0, 0));
+			this.streamingComponent = undefined;
+			this.streamingMessage = undefined;
+			this.pendingTools.clear();
+			this.resetComponents();
+			this.addComponent(new Text(`Native transcript rendering failed: ${this.failureMessage}`, 0, 0));
 		}
 	}
 
@@ -76,14 +95,51 @@ export class TranscriptAdapter {
 	}
 
 	setExpanded(expanded: boolean): void {
+		if (this.expanded === expanded) return;
 		this.expanded = expanded;
 		for (const component of this.pendingTools.values()) component.setExpanded(expanded);
 		this.setExpandedOnChildren(this.container.children, expanded);
 		this.container.invalidate();
+		this.markAllComponentsDirty();
 	}
 
 	render(width: number): string[] {
-		return this.container.render(width);
+		return this.renderViewport(width, 0, Number.MAX_SAFE_INTEGER).lines;
+	}
+
+	renderViewport(width: number, offset: number, height: number): TranscriptViewportRender {
+		const safeWidth = Math.max(1, Math.floor(width));
+		const safeOffset = Math.max(0, Math.floor(offset));
+		const safeHeight = Math.max(0, Math.floor(height));
+		const end = safeOffset + safeHeight;
+		const lines: string[] = [];
+		let cursor = 0;
+
+		for (const cache of this.componentCaches) {
+			const componentLines = this.renderComponent(cache, safeWidth);
+			const nextCursor = cursor + componentLines.length;
+			if (safeHeight > 0 && nextCursor > safeOffset && cursor < end) {
+				const startInComponent = Math.max(0, safeOffset - cursor);
+				const endInComponent = Math.min(componentLines.length, end - cursor);
+				lines.push(...componentLines.slice(startInComponent, endInComponent));
+			}
+			cursor = nextCursor;
+		}
+
+		return { lines, totalLines: cursor, version: this.renderVersion };
+	}
+
+	getLineCount(width: number): number {
+		const safeWidth = Math.max(1, Math.floor(width));
+		let total = 0;
+		for (const cache of this.componentCaches) {
+			total += this.renderComponent(cache, safeWidth).length;
+		}
+		return total;
+	}
+
+	getRenderVersion(): number {
+		return this.renderVersion;
 	}
 
 	hasFailed(): boolean {
@@ -95,7 +151,7 @@ export class TranscriptAdapter {
 		if (message.role === "user") {
 			const text = this.getUserText(message);
 			const component = tryNative(() => new UserMessageComponent(text));
-			if (component) this.container.addChild(component);
+			if (component) this.addComponent(component);
 		} else if (message.role === "assistant") {
 			this.streamingComponent = tryNative(
 				() =>
@@ -108,8 +164,9 @@ export class TranscriptAdapter {
 			);
 			this.streamingMessage = message;
 			if (this.streamingComponent) {
-				this.container.addChild(this.streamingComponent);
+				this.addComponent(this.streamingComponent);
 				this.streamingComponent.updateContent(message as any);
+				this.markComponentDirty(this.streamingComponent);
 			}
 		}
 	}
@@ -118,7 +175,10 @@ export class TranscriptAdapter {
 		if (!message || message.role !== "assistant") return;
 		if (!this.streamingComponent) this.handleMessageStart(message);
 		this.streamingMessage = message;
-		this.streamingComponent?.updateContent(message as any);
+		if (this.streamingComponent) {
+			this.streamingComponent.updateContent(message as any);
+			this.markComponentDirty(this.streamingComponent);
+		}
 		this.ensureToolComponentsFromAssistantMessage(message, false);
 	}
 
@@ -135,12 +195,18 @@ export class TranscriptAdapter {
 							this.options.hiddenThinkingLabel ?? "Thinking...",
 						),
 				);
-				if (this.streamingComponent) this.container.addChild(this.streamingComponent);
+				if (this.streamingComponent) this.addComponent(this.streamingComponent);
 			}
 			this.streamingMessage = message;
-			this.streamingComponent?.updateContent(message as any);
+			if (this.streamingComponent) {
+				this.streamingComponent.updateContent(message as any);
+				this.markComponentDirty(this.streamingComponent);
+			}
 			this.ensureToolComponentsFromAssistantMessage(message, true);
-			for (const component of this.pendingTools.values()) component.setArgsComplete();
+			for (const component of this.pendingTools.values()) {
+				component.setArgsComplete();
+				this.markComponentDirty(component);
+			}
 			this.streamingComponent = undefined;
 			this.streamingMessage = undefined;
 		} else if (message.role === "toolResult") {
@@ -148,6 +214,7 @@ export class TranscriptAdapter {
 			const component = this.pendingTools.get(toolResult.toolCallId);
 			if (component) {
 				component.updateResult({ content: toolResult.content ?? [], details: toolResult.details, isError: Boolean(toolResult.isError) });
+				this.markComponentDirty(component);
 				this.pendingTools.delete(toolResult.toolCallId);
 			}
 		}
@@ -161,7 +228,9 @@ export class TranscriptAdapter {
 			toolCallId,
 			(event.args ?? {}) as Record<string, unknown>,
 		);
-		component?.markExecutionStarted();
+		if (!component) return;
+		component.markExecutionStarted();
+		this.markComponentDirty(component);
 	}
 
 	private handleToolExecutionUpdate(event: StoredTranscriptEvent): void {
@@ -169,6 +238,7 @@ export class TranscriptAdapter {
 		const component = this.pendingTools.get(toolCallId);
 		if (!component) return;
 		component.updateResult({ ...((event.partialResult as any) ?? {}), isError: false }, true);
+		this.markComponentDirty(component);
 	}
 
 	private handleToolExecutionEnd(event: StoredTranscriptEvent): void {
@@ -183,6 +253,7 @@ export class TranscriptAdapter {
 		}
 		if (!component) return;
 		component.updateResult({ ...((event.result as any) ?? {}), isError: Boolean(event.isError) });
+		this.markComponentDirty(component);
 		this.pendingTools.delete(toolCallId);
 	}
 
@@ -190,7 +261,10 @@ export class TranscriptAdapter {
 		for (const part of (message as any).content ?? []) {
 			if (part?.type !== "toolCall") continue;
 			const component = this.ensureToolComponent(part.name, part.id, part.arguments ?? {});
-			if (argsComplete) component?.setArgsComplete();
+			if (argsComplete && component) {
+				component.setArgsComplete();
+				this.markComponentDirty(component);
+			}
 		}
 	}
 
@@ -199,6 +273,7 @@ export class TranscriptAdapter {
 		const existing = this.pendingTools.get(id);
 		if (existing) {
 			existing.updateArgs(args);
+			this.markComponentDirty(existing);
 			return existing;
 		}
 		const component = tryNative(
@@ -219,8 +294,45 @@ export class TranscriptAdapter {
 		if (!component) return undefined;
 		component.setExpanded(this.expanded);
 		this.pendingTools.set(id, component);
-		this.container.addChild(component);
+		this.addComponent(component);
 		return component;
+	}
+
+	private addComponent(component: Component): void {
+		this.container.addChild(component);
+		const cache: ComponentRenderCache = { component, lines: [], dirty: true };
+		this.componentCaches.push(cache);
+		this.componentCacheByComponent.set(component, cache);
+		this.bumpRenderVersion();
+	}
+
+	private resetComponents(): void {
+		this.container.clear();
+		this.componentCaches = [];
+		this.componentCacheByComponent.clear();
+	}
+
+	private markComponentDirty(component: Component): void {
+		const cache = this.componentCacheByComponent.get(component);
+		if (cache) cache.dirty = true;
+		this.bumpRenderVersion();
+	}
+
+	private markAllComponentsDirty(): void {
+		for (const cache of this.componentCaches) cache.dirty = true;
+		this.bumpRenderVersion();
+	}
+
+	private bumpRenderVersion(): void {
+		this.renderVersion++;
+	}
+
+	private renderComponent(cache: ComponentRenderCache, width: number): string[] {
+		if (!cache.dirty && cache.width === width) return cache.lines;
+		cache.lines = cache.component.render(width);
+		cache.width = width;
+		cache.dirty = false;
+		return cache.lines;
 	}
 
 	private getUserText(message: Message): string {

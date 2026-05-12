@@ -7,6 +7,7 @@ import {
 	type HistoricalResultLike,
 	type StartRunInput,
 	appendCoalescedTranscriptEvent,
+	type TranscriptAppendResult,
 	type StoredTranscriptEvent,
 	type SubagentRunRecord,
 	statusFromExit,
@@ -24,6 +25,8 @@ function safeTimestamp(value: unknown, fallback = Date.now()): number {
 	}
 	return fallback;
 }
+
+const MAX_LIVE_EVENT_MUTATIONS = 512;
 
 function cloneEvent(event: StoredTranscriptEvent): StoredTranscriptEvent {
 	return JSON.parse(JSON.stringify(event)) as StoredTranscriptEvent;
@@ -52,6 +55,17 @@ export class LiveSubagentRegistry {
 		run.revision = (run.revision ?? 0) + 1;
 	}
 
+	private recordLiveEventMutation(run: SubagentRunRecord, result: TranscriptAppendResult): void {
+		const sequence = (run.liveEventMutationSequence ?? 0) + 1;
+		const mutations = run.liveEventMutations ?? [];
+		mutations.push({ ...result, revision: run.revision ?? 0, sequence });
+		if (mutations.length > MAX_LIVE_EVENT_MUTATIONS) {
+			mutations.splice(0, mutations.length - MAX_LIVE_EVENT_MUTATIONS);
+		}
+		run.liveEventMutations = mutations;
+		run.liveEventMutationSequence = sequence;
+	}
+
 	startRun(input: StartRunInput): SubagentRunRecord {
 		const id = `${input.parentToolCallId}:${input.mode}:${input.index ?? input.step ?? 0}:${input.agent}:${randomUUID()}`;
 		const run: SubagentRunRecord = {
@@ -70,6 +84,8 @@ export class LiveSubagentRegistry {
 			startedAt: Date.now(),
 			liveEvents: [],
 			revision: 0,
+			liveEventMutations: [],
+			liveEventMutationSequence: 0,
 			replayEvents: [],
 		};
 		this.runs.set(run.id, run);
@@ -80,8 +96,9 @@ export class LiveSubagentRegistry {
 	recordEvent(runId: string, event: StoredTranscriptEvent): void {
 		const run = this.runs.get(runId);
 		if (!run) return;
-		appendCoalescedTranscriptEvent(run.liveEvents, cloneEvent(event));
+		const appendResult = appendCoalescedTranscriptEvent(run.liveEvents, cloneEvent(event));
 		this.touch(run);
+		this.recordLiveEventMutation(run, appendResult);
 		this.notify();
 	}
 
@@ -220,7 +237,12 @@ export class LiveSubagentRegistry {
 		const liveEvents = loadedEvents && loadedEvents.length > 0 ? loadedEvents : replayEvents;
 		const existing = this.runs.get(runId);
 		if (existing) {
+			const replacingLiveEvents = liveEvents.length > 0 && liveEvents !== existing.liveEvents;
 			existing.liveEvents = liveEvents.length > 0 ? liveEvents : existing.liveEvents;
+			if (replacingLiveEvents) {
+				existing.liveEventMutations = [];
+				existing.liveEventMutationSequence = 0;
+			}
 			existing.replayEvents = replayEvents.length > 0 ? replayEvents : existing.replayEvents;
 			existing.transcriptRef = result.transcriptRef ?? existing.transcriptRef;
 			existing.transcriptSegments = result.transcriptSegments ?? existing.transcriptSegments;
@@ -249,6 +271,8 @@ export class LiveSubagentRegistry {
 			status: statusFromExit(result.exitCode, result.stopReason),
 			startedAt: resultStartedAt(result, fallbackStartedAt + index),
 			revision: 0,
+			liveEventMutations: [],
+			liveEventMutationSequence: 0,
 			endedAt: fallbackStartedAt,
 			exitCode: result.exitCode,
 			stopReason: result.stopReason,

@@ -13,8 +13,13 @@ For complete local extension documentation, see [`EXTENSION.md`](./EXTENSION.md)
 - **Usage tracking**: Shows turns, tokens, cost, and context usage per agent
 - **Abort support**: Ctrl+C propagates to kill subagent processes
 - **Live transcript view**: Open a fullscreen overlay with `/subagents`, `Ctrl+Shift+O`, or fallback `Alt+O`
-- **Model selection**: Use `/subagent-model` to configure each subagent to inherit the parent model or use a specific available model
-- **Automatic handoff**: Subagents can request follow-up work by another subagent; handoffs run automatically by default
+- **Overlay performance**: Viewport rendering, incremental transcript replay, and per-component render caching keep large transcripts responsive
+- **Model and thinking selection**: Use `/subagent-model` to configure each subagent's model plus optional thinking level
+- **Handoff tool**: Child subagents get a real `handoff` tool to request follow-up work; handoffs run automatically by default
+- **Dynamic agent guidance**: Discovered agents are summarized into `promptSnippet`/`promptGuidelines` so pi can suggest the right specialist
+- **Agent metadata**: Frontmatter supports `when`, `examples`, and `triggers` for better discovery and guidance
+- **Nested subagent prevention**: Child processes cannot call `subagent` or `subagent_continue`; they use `handoff` instead
+- **Debugger agent**: Bundled `debugger` diagnoses root causes and delegates fixes without editing files
 - **Persistent transcripts**: Completed subagent JSON streams are saved as compressed `.jsonl.gz` sidecars and reload with the main session
 
 ## Structure
@@ -23,17 +28,18 @@ For complete local extension documentation, see [`EXTENSION.md`](./EXTENSION.md)
 pi-hive/
 ├── README.md            # This file
 ├── index.ts             # The extension (entry point)
-├── agents.ts             # Agent discovery logic
+├── agents.ts             # Agent discovery and metadata parsing
 ├── agent-colors.ts       # Frontmatter color parsing/rendering helpers
 ├── child-session-storage.ts # Child pi sessions for continuable runs
 ├── compatibility.ts      # Version guard and fallback rendering
-├── handoff.ts            # Handoff parsing, policy, confirmation, and config UI
+├── delegation-guidance.ts # Dynamic promptSnippet/promptGuidelines generation
+├── handoff.ts            # Handoff extraction, policy, confirmation, and config UI
 ├── live-registry.ts      # In-memory and hydrated run registry
-├── model-overrides.ts    # Per-agent model override resolution
+├── model-overrides.ts    # Per-agent model/thinking override resolution
 ├── model-selector.ts     # /subagent-model interactive selector
 ├── subagent-config.ts    # Unified ~/.pi/agent/subagent.json config
-├── subagent-overlay.ts   # Fullscreen live view overlay
-├── transcript-adapter.ts # JSON event stream -> native pi components
+├── subagent-overlay.ts   # Fullscreen live view overlay with viewport rendering
+├── transcript-adapter.ts # JSON event stream -> cached native pi components
 ├── transcript-storage.ts # Gzipped JSONL transcript sidecar storage
 ├── transcript-types.ts   # Shared run/transcript types
 ├── transcript-view.ts    # Native/fallback transcript renderer
@@ -41,6 +47,7 @@ pi-hive/
 │   ├── scout.md         # Fast recon, returns compressed context
 │   ├── planner.md       # Creates implementation plans
 │   ├── reviewer.md      # Code review
+│   ├── debugger.md      # Systematic diagnosis and delegation
 │   └── worker.md        # General-purpose (full capabilities)
 └── prompts/             # Workflow presets (prompt templates)
     ├── implement.md     # scout -> planner -> worker
@@ -87,13 +94,13 @@ The bundled `agents/` directory is discovered by the extension itself, so GitHub
 Install from this working tree:
 
 ```bash
-pi install <project-dir>
+pi install /path/to/pi-hive
 ```
 
 Or test without installing:
 
 ```bash
-pi --no-extensions -e <project-dir>/index.ts
+pi --no-extensions -e /path/to/pi-hive/index.ts
 ```
 
 ## Local extension-only test
@@ -101,18 +108,20 @@ pi --no-extensions -e <project-dir>/index.ts
 To test only the extension entrypoint without installing package prompts:
 
 ```bash
-pi --no-extensions -e <project-dir>/index.ts
+pi --no-extensions -e /path/to/pi-hive/index.ts
 ```
 
-For normal usage, prefer `pi install <project-dir>` or GitHub installation so prompt templates are discovered too.
+For normal usage, prefer `pi install /path/to/pi-hive` or GitHub installation so prompt templates are discovered too.
 
 ## Security Model
 
 This tool executes a separate `pi` subprocess with a delegated system prompt and tool/model configuration.
 
+Child subagent processes are marked with `PI_SUBAGENT=1`. When the extension detects that flag inside a child process, it does not register the orchestration tools (`subagent` / `subagent_continue`) there. Instead, child agents can call the real `handoff` tool; the parent pi process extracts those tool calls after the child finishes and executes accepted follow-up agents. Legacy JSON handoff blocks remain supported as a fallback for older agent prompts.
+
 **Project-local agents** (`.pi/agents/*.md`) are repo-controlled prompts that can instruct the model to read files, run bash commands, etc.
 
-**Default behavior:** Only loads **user-level agents** from `~/.pi/agent/agents`.
+**Default behavior:** Loads bundled package agents plus **user-level agents** from `~/.pi/agent/agents`, but excludes project-local agents.
 
 To enable project-local agents, pass `agentScope: "both"` (or `"project"`). Only do this for repositories you trust.
 
@@ -126,12 +135,6 @@ The extension uses one user-level config file:
 ~/.pi/agent/subagent.json
 ```
 
-In this environment:
-
-```text
-~/.pi/agent/subagent.json
-```
-
 Example:
 
 ```json
@@ -139,7 +142,7 @@ Example:
   "version": 1,
   "models": {
     "overrides": {
-      "planner": "copproxy/gpt-5.5"
+      "planner": "copproxy/gpt-5.5:high"
     }
   },
   "handoff": {
@@ -164,7 +167,7 @@ Example:
 
 | Section | Purpose |
 |---------|---------|
-| `models.overrides` | Optional per-agent model overrides used by `/subagent-model` |
+| `models.overrides` | Optional per-agent model overrides used by `/subagent-model`; values may include `:<thinking>` |
 | `handoff.enabled` | Master switch for handoff execution |
 | `handoff.mode` | `auto`, `manual`, or `off` |
 | `handoff.maxDepth` | Maximum nested handoff depth |
@@ -262,10 +265,11 @@ This opens an interactive loop:
 
 1. Select a subagent.
 2. Select `inherit` or a specific available model.
-3. After saving, return to the subagent list to configure another one.
-4. Press `Esc` from the subagent list to exit.
+3. Optionally configure an explicit thinking level (`off`, `minimal`, `low`, `medium`, `high`, or `xhigh`).
+4. After saving, return to the subagent list to configure another one.
+5. Press `Esc` from the subagent list to exit.
 
-`inherit` is the default. It means the child subagent process uses the current parent pi model (`ctx.model`) rather than a hard-coded model from the agent file. Model overrides are stored in the unified extension config:
+`inherit` is the default. It means the child subagent process uses the current parent pi model (`ctx.model`) and thinking level rather than hard-coded values from the agent file. Explicit thinking choices are stored as a model suffix, for example `inherit:high` or `copproxy/gpt-5.5:high`. Resolution order is saved override → parent pi model/thinking → child pi defaults. Model overrides are stored in the unified extension config:
 
 ```text
 ~/.pi/agent/subagent.json
@@ -315,45 +319,25 @@ Handoff modes:
 | `manual` | Ask for confirmation before executing accepted handoffs when UI is available |
 | `off` | Do not execute handoffs |
 
-A subagent can request handoff by returning a JSON block in its final output:
+A child subagent can request handoff by calling the `handoff` tool. The tool is available only inside child subagent processes; it records the request in the child transcript, then the parent executes accepted handoffs after the child finishes.
 
-````markdown
+Tool parameters:
+
 ```json
 {
-  "handoff": {
-    "agent": "reviewer",
-    "task": "Review src/auth.ts for security issues.",
-    "reason": "Scout found token handling code.",
-    "cwd": "/optional/working/directory"
-  }
+  "agent": "reviewer",
+  "task": "Review src/auth.ts for security issues.",
+  "reason": "Scout found token handling code."
 }
 ```
-````
 
-Multiple handoffs are supported with `handoffs: [...]`:
+Multiple handoffs are supported by making multiple `handoff` tool calls. The parent extracts all valid `handoff` tool calls from assistant messages and applies the same config and allow-list policy to each request.
 
-````markdown
-```json
-{
-  "handoffs": [
-    {
-      "agent": "reviewer",
-      "task": "Review authentication code.",
-      "reason": "Security-sensitive code was identified."
-    },
-    {
-      "agent": "planner",
-      "task": "Create a refactor plan for the auth module.",
-      "reason": "The module has multiple responsibilities."
-    }
-  ]
-}
-```
-````
-
-Aliases are also accepted for parser compatibility:
+Legacy JSON handoff blocks in final output are still accepted as a fallback for older agents and docs. Supported fallback keys include:
 
 ```json
+{ "handoff": { "agent": "reviewer", "task": "..." } }
+{ "handoffs": [{ "agent": "reviewer", "task": "..." }] }
 { "delegate": { "agent": "reviewer", "task": "..." } }
 { "delegations": [{ "agent": "reviewer", "task": "..." }] }
 ```
@@ -397,6 +381,12 @@ The extension also registers an LLM-callable tool named `subagent_continue`, so 
 | Single | `{ agent, task }` | One agent, one task |
 | Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
+
+## Dynamic agent guidance
+
+pi-hive discovers bundled agents plus user-level agents when the extension registers the `subagent` tool. It turns that discovery result into `promptSnippet` and `promptGuidelines` so the parent model can choose agents naturally instead of relying on hard-coded names.
+
+When a conversation starts, the extension also injects a compact **Dynamic Subagent Guidance** section into the system prompt for sessions where `subagent` is selected. The section lists each available agent's source, description, `when` guidance, `triggers`, and examples. Project-local `.pi/agents` are included only when the user explicitly requests trusted project scope.
 
 ## Output Display
 
@@ -444,6 +434,8 @@ Inside the viewer:
 
 The viewer replays the same JSON event stream emitted by child `pi --mode json` processes and renders built-in tool calls with public pi components such as `ToolExecutionComponent` and `AssistantMessageComponent`.
 
+Large transcripts are rendered through a viewport instead of redrawing the entire history every frame. `TranscriptView` incrementally consumes new events, `TranscriptAdapter` caches rendered lines per native component, and the overlay coalesces live updates to avoid excessive TUI renders while a subagent is streaming.
+
 While the viewer is open, pi-hive enables terminal mouse reporting so the mouse wheel scrolls the transcript instead of the terminal scrollback. Mouse reporting is disabled again when the viewer closes.
 
 ### Persistent transcript storage
@@ -482,13 +474,19 @@ The main session stores only a small `transcriptRef` plus compact fallback event
 
 ## Agent Definitions
 
+For comprehensive agent documentation, including bundled agents, frontmatter reference, custom agent creation, workflows, best practices, and troubleshooting, see [`AGENTS.md`](./AGENTS.md).
+
 Agents are markdown files with YAML frontmatter:
 
 ```markdown
 ---
 name: my-agent
 description: What this agent does
-tools: read, grep, find, ls
+when: when this agent should be selected
+examples:
+  - "A representative user request for this agent"
+triggers: keyword, phrase, domain term
+tools: read, grep, find, ls, handoff
 model: inherit
 thinking: inherit
 color: cyan
@@ -503,6 +501,18 @@ System prompt for the agent goes here.
 - `.pi/agents/*.md` - Project-level (only with `agentScope: "project"` or `"both"`)
 
 Project agents override user agents with the same name when `agentScope: "both"`.
+
+### Agent metadata
+
+Agent frontmatter now supports optional selection metadata:
+
+| Field | Purpose |
+|-------|---------|
+| `when` | Short natural-language guidance for when to use the agent |
+| `examples` | YAML list or multiline list of representative requests |
+| `triggers` | Comma-separated keywords/phrases that should make pi consider the agent |
+
+This metadata is used by `delegation-guidance.ts` to build dynamic `promptSnippet`, `promptGuidelines`, and the injected guidance section for the parent model, in addition to documenting the child agent itself.
 
 ### Agent colors
 
@@ -554,23 +564,24 @@ Supported values:
 inherit, off, minimal, low, medium, high, xhigh
 ```
 
-`inherit` is the default and means the child process uses pi's inherited/default thinking behavior. Explicit values are passed to child `pi` with `--thinking <level>`.
+`inherit` is the default. When launched through pi-hive as a subagent, inheritance comes from the parent pi's current model/thinking (or child pi defaults when parent values are unavailable), not from agent frontmatter. Explicit subagent overrides are configured with `/subagent-model` and passed to child `pi` with `--thinking <level>`.
 
-You may also use pi's model shorthand in `model:`:
+For standalone agent defaults, you may also use pi's model shorthand in `model:`:
 
 ```yaml
 model: copproxy/gpt-5.5:high
 ```
 
-An explicit suffix in `model:` takes precedence over `thinking:`.
+An explicit suffix in `model:` takes precedence over `thinking:` for standalone frontmatter defaults.
 
 ## Sample Agents
 
 | Agent | Purpose | Model | Thinking | Color | Tools |
 |-------|---------|-------|----------|-------|-------|
-| `scout` | Fast codebase recon | inherit | inherit | cyan | read, grep, find, ls, bash |
-| `planner` | Implementation plans | inherit | inherit | yellow | read, grep, find, ls |
-| `reviewer` | Code review | inherit | inherit | red | read, grep, find, ls, bash |
+| `scout` | Fast codebase recon | inherit | inherit | cyan | read, grep, find, ls, bash, handoff |
+| `planner` | Implementation plans | inherit | inherit | yellow | read, grep, find, ls, handoff |
+| `reviewer` | Code review | inherit | inherit | red | read, grep, find, ls, bash, handoff |
+| `debugger` | Systematic bug diagnosis and delegation | inherit | inherit | orange | read, grep, find, ls, bash, handoff |
 | `worker` | General-purpose | inherit | inherit | green | (all default) |
 
 ## Continuable runs
@@ -622,7 +633,7 @@ docs/continuable-runs.md
 
 ## Handoff safety notes
 
-Handoff gives subagents a way to ask the parent orchestrator to run other subagents. It is intentionally mediated by the parent process rather than exposing the `subagent` tool directly to child agents.
+Handoff gives subagents a way to ask the parent orchestrator to run other subagents. It is intentionally mediated by the parent process through the `handoff` tool rather than exposing the `subagent` tool directly to child agents.
 
 Safety controls:
 

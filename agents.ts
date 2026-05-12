@@ -18,9 +18,29 @@ export interface AgentConfig {
 	thinking?: string;
 	color?: string;
 	handoffAllowList?: string[];
+	when?: string;
+	examples?: string[];
+	triggers?: string[];
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
+}
+
+interface AgentFrontmatter {
+	name?: unknown;
+	description?: unknown;
+	tools?: unknown;
+	model?: unknown;
+	thinking?: unknown;
+	color?: unknown;
+	handoffAllowList?: unknown;
+	handoffAllowlist?: unknown;
+	"handoff-allow-list"?: unknown;
+	allowList?: unknown;
+	when?: unknown;
+	examples?: unknown;
+	triggers?: unknown;
+	[key: string]: unknown;
 }
 
 export interface AgentDiscoveryResult {
@@ -30,6 +50,44 @@ export interface AgentDiscoveryResult {
 
 function getPackageAgentsDir(): string {
 	return path.join(path.dirname(fileURLToPath(import.meta.url)), "agents");
+}
+
+function toOptionalString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function stripListMarker(value: string): string {
+	return value.trim().replace(/^(?:[-*+]\s+|\d+[.)]\s+)/, "").trim();
+}
+
+function parseCommaList(value: unknown): string[] | undefined {
+	if (Array.isArray(value)) {
+		const items = value.map((item) => toOptionalString(item)).filter((item): item is string => Boolean(item));
+		return items.length > 0 ? items : undefined;
+	}
+	if (typeof value !== "string") return undefined;
+	const items = value
+		.split(",")
+		.map((item) => item.trim())
+		.filter(Boolean);
+	return items.length > 0 ? items : undefined;
+}
+
+function parseExamples(value: unknown): string[] | undefined {
+	if (Array.isArray(value)) {
+		const items = value.map((item) => toOptionalString(item)).filter((item): item is string => Boolean(item));
+		return items.length > 0 ? items : undefined;
+	}
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	if (!trimmed) return undefined;
+	const items = trimmed.includes("\n")
+		? trimmed
+				.split(/\r?\n/)
+				.map(stripListMarker)
+				.filter(Boolean)
+		: [trimmed];
+	return items.length > 0 ? items : undefined;
 }
 
 function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
@@ -58,31 +116,36 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+		let parsed: { frontmatter: AgentFrontmatter; body: string };
+		try {
+			parsed = parseFrontmatter<AgentFrontmatter>(content);
+		} catch {
+			continue;
+		}
+		const { frontmatter, body } = parsed;
+		const name = toOptionalString(frontmatter.name);
+		const description = toOptionalString(frontmatter.description);
 
-		if (!frontmatter.name || !frontmatter.description) {
+		if (!name || !description) {
 			continue;
 		}
 
-		const tools = frontmatter.tools
-			?.split(",")
-			.map((t: string) => t.trim())
-			.filter(Boolean);
+		const tools = parseCommaList(frontmatter.tools);
 		const handoffAllowListRaw =
 			frontmatter.handoffAllowList ?? frontmatter.handoffAllowlist ?? frontmatter["handoff-allow-list"] ?? frontmatter.allowList;
-		const handoffAllowList = handoffAllowListRaw
-			?.split(",")
-			.map((t: string) => t.trim())
-			.filter(Boolean);
+		const handoffAllowList = parseCommaList(handoffAllowListRaw);
 
 		agents.push({
-			name: frontmatter.name,
-			description: frontmatter.description,
-			tools: tools && tools.length > 0 ? tools : undefined,
-			model: frontmatter.model,
-			thinking: frontmatter.thinking,
-			color: frontmatter.color,
-			handoffAllowList: handoffAllowList && handoffAllowList.length > 0 ? handoffAllowList : undefined,
+			name,
+			description,
+			tools,
+			model: toOptionalString(frontmatter.model),
+			thinking: toOptionalString(frontmatter.thinking),
+			color: toOptionalString(frontmatter.color),
+			handoffAllowList,
+			when: toOptionalString(frontmatter.when),
+			examples: parseExamples(frontmatter.examples),
+			triggers: parseCommaList(frontmatter.triggers),
 			systemPrompt: body,
 			source,
 			filePath,

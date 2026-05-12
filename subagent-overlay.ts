@@ -49,6 +49,8 @@ function parseMouseWheelDelta(data: string): number | undefined {
 export class SubagentOverlay implements Component {
 	private selectedIndex = -1;
 	private scrollOffset = 0;
+	private lastTotalLines = 0;
+	private lastBodyHeight = 1;
 	private expanded = false;
 	private stickToBottom = true;
 	private transcriptView = new TranscriptView();
@@ -84,15 +86,24 @@ export class SubagentOverlay implements Component {
 		const header = this.renderHeader(run, runs.length, safeWidth);
 		const footer = this.renderFooter(safeWidth);
 		const bodyHeight = Math.max(1, height - header.length - footer.length);
-		const body = this.transcriptView.renderRun(run, safeWidth, {
-			tui: this.tui,
-			theme: this.theme,
-			expanded: this.expanded,
-		});
-		const maxScroll = Math.max(0, body.length - bodyHeight);
-		if (this.stickToBottom) this.scrollOffset = maxScroll;
-		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
-		const visibleBody = body.slice(this.scrollOffset, this.scrollOffset + bodyHeight);
+		const viewport = this.transcriptView.renderRunViewport(
+			run,
+			safeWidth,
+			{
+				scrollOffset: this.scrollOffset,
+				height: bodyHeight,
+				stickToBottom: this.stickToBottom,
+			},
+			{
+				tui: this.tui,
+				theme: this.theme,
+				expanded: this.expanded,
+			},
+		);
+		this.scrollOffset = viewport.scrollOffset;
+		this.lastTotalLines = viewport.totalLines;
+		this.lastBodyHeight = bodyHeight;
+		const visibleBody = viewport.lines.slice();
 		while (visibleBody.length < bodyHeight) visibleBody.push("");
 		return this.padToHeight([...header, ...visibleBody, ...footer], safeWidth, height);
 	}
@@ -144,6 +155,7 @@ export class SubagentOverlay implements Component {
 			return;
 		}
 		if (matchesKey(data, Key.end)) {
+			this.scrollOffset = this.getMaxScroll();
 			this.stickToBottom = true;
 			this.tui.requestRender();
 		}
@@ -184,9 +196,13 @@ export class SubagentOverlay implements Component {
 	}
 
 	private scrollBy(delta: number): void {
-		this.scrollOffset = Math.max(0, this.scrollOffset + delta);
+		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset + delta, this.getMaxScroll()));
 		this.stickToBottom = false;
 		this.tui.requestRender();
+	}
+
+	private getMaxScroll(): number {
+		return Math.max(0, this.lastTotalLines - this.lastBodyHeight);
 	}
 
 	private enableMouseReporting(): void {

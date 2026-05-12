@@ -9,6 +9,16 @@ export interface StoredTranscriptEvent {
 	[key: string]: unknown;
 }
 
+export interface TranscriptAppendResult {
+	index: number;
+	replaced: boolean;
+}
+
+export interface TranscriptEventMutation extends TranscriptAppendResult {
+	revision: number;
+	sequence: number;
+}
+
 export interface TranscriptStorageRef {
 	kind: "gzip-jsonl-v1";
 	relativePath: string;
@@ -61,6 +71,12 @@ export interface SubagentRunRecord {
 
 	/** Incremented whenever render-relevant run state changes. */
 	revision: number;
+
+	/** Recent live event append/replace mutations, bounded and volatile. */
+	liveEventMutations?: TranscriptEventMutation[];
+
+	/** Monotonic sequence for live event mutation tracking. */
+	liveEventMutationSequence?: number;
 
 	/** Compact replay events safe to persist into session details as fallback. */
 	replayEvents: StoredTranscriptEvent[];
@@ -165,15 +181,19 @@ function findPendingToolUpdateIndex(events: StoredTranscriptEvent[], toolCallId:
 	return -1;
 }
 
-export function appendCoalescedTranscriptEvent(events: StoredTranscriptEvent[], event: StoredTranscriptEvent): void {
+export function appendCoalescedTranscriptEvent(events: StoredTranscriptEvent[], event: StoredTranscriptEvent): TranscriptAppendResult {
 	let replacementIndex = -1;
 	if (event.type === "message_update") {
 		replacementIndex = findPendingMessageUpdateIndex(events, event);
 	} else if (event.type === "tool_execution_update") {
 		replacementIndex = findPendingToolUpdateIndex(events, event.toolCallId);
 	}
-	if (replacementIndex >= 0) events[replacementIndex] = event;
-	else events.push(event);
+	if (replacementIndex >= 0) {
+		events[replacementIndex] = event;
+		return { index: replacementIndex, replaced: true };
+	}
+	events.push(event);
+	return { index: events.length - 1, replaced: false };
 }
 
 export function shouldPersistReplayEvent(event: StoredTranscriptEvent): boolean {

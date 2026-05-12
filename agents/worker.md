@@ -1,6 +1,12 @@
 ---
 name: worker
 description: General-purpose subagent with full capabilities, isolated context
+when: when the user asks to implement, modify, build, fix, refactor, or execute an approved plan
+examples:
+  - "Implement the planner's steps and report the files changed"
+  - "Fix the bug after scout identifies the relevant code path"
+  - "Apply reviewer feedback in the changed files"
+triggers: implement, change, build, fix, refactor, edit, modify, execute, apply
 model: inherit
 thinking: inherit
 color: green
@@ -20,23 +26,3 @@ What was done.
 
 ## Notes (if any)
 Anything the main agent should know.
-
-If handing off to another agent (e.g. reviewer), include:
-- Exact file paths changed
-- Key functions/types touched (short list)
-
-## Optional handoff
-
-If another specialized subagent should continue the work, include a JSON handoff block in your final answer:
-
-```json
-{
-  "handoff": {
-    "agent": "reviewer",
-    "task": "Review the files I found for security issues.",
-    "reason": "Security-sensitive code was identified."
-  }
-}
-```
-
-Use handoff only when it materially improves the result. Do not hand off to yourself unless explicitly necessary.

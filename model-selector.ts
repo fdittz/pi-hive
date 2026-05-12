@@ -6,6 +6,8 @@ import {
 	getAgentModelDisplay,
 	getSubagentModelConfigPath,
 	INHERIT_MODEL,
+	INHERIT_THINKING,
+	THINKING_LEVELS,
 	loadSubagentModelConfig,
 	setAgentModelOverride,
 } from "./model-overrides.js";
@@ -14,9 +16,9 @@ function pad(value: string, width: number): string {
 	return value.length >= width ? value : value + " ".repeat(width - value.length);
 }
 
-function agentOption(agent: AgentConfig, ctx: ExtensionCommandContext): string {
+function agentOption(agent: AgentConfig, ctx: ExtensionCommandContext, parentThinking?: string): string {
 	const config = loadSubagentModelConfig();
-	const current = getAgentModelDisplay(agent, ctx.model, config);
+	const current = getAgentModelDisplay(agent, ctx.model, config, parentThinking);
 	return `${pad(agent.name, 16)} ${pad(agent.source, 8)} current: ${current}`;
 }
 
@@ -32,7 +34,19 @@ function parseModelOption(option: string): string {
 	return option.split(" — ")[0]?.trim() || option.trim();
 }
 
-export async function openSubagentModelSelector(ctx: ExtensionCommandContext, scope: AgentScope = "both"): Promise<void> {
+function thinkingOption(value: string, label: string): string {
+	return `${value} — ${label}`;
+}
+
+function parseThinkingOption(option: string): string {
+	return option.split(" — ")[0]?.trim() || option.trim();
+}
+
+export async function openSubagentModelSelector(
+	ctx: ExtensionCommandContext,
+	scope: AgentScope = "both",
+	parentThinking?: string,
+): Promise<void> {
 	if (!ctx.hasUI) return;
 
 	while (true) {
@@ -43,7 +57,7 @@ export async function openSubagentModelSelector(ctx: ExtensionCommandContext, sc
 			return;
 		}
 
-		const agentOptions = agents.map((agent) => agentOption(agent, ctx));
+		const agentOptions = agents.map((agent) => agentOption(agent, ctx, parentThinking));
 		const selectedAgentOption = await ctx.ui.select(
 			`Select subagent model (${getSubagentModelConfigPath()})`,
 			agentOptions,
@@ -55,12 +69,13 @@ export async function openSubagentModelSelector(ctx: ExtensionCommandContext, sc
 		if (!agent) continue;
 
 		const parent = ctx.model ? formatModelRef(ctx.model) : "default model";
+		const parentThinkingLabel = parentThinking ? `thinking ${parentThinking}` : "default thinking";
 		const availableModels = ctx.modelRegistry
 			.getAvailable()
 			.map((model) => formatModelRef(model))
 			.sort((a, b) => a.localeCompare(b));
 		const modelOptions = [
-			modelOption(INHERIT_MODEL, `inherit current parent model (${parent})`),
+			modelOption(INHERIT_MODEL, `inherit current parent model (${parent}, ${parentThinkingLabel})`),
 			...availableModels.map((modelRef) => modelOption(modelRef, "use this model for the selected subagent")),
 		];
 
@@ -68,11 +83,40 @@ export async function openSubagentModelSelector(ctx: ExtensionCommandContext, sc
 		if (!selectedModelOption) continue;
 
 		const selectedModel = parseModelOption(selectedModelOption);
-		await setAgentModelOverride(agent.name, selectedModel);
+
+		// Ask only for an explicit subagent override. If the user leaves thinking unset,
+		// resolution inherits the parent pi thinking level; agent frontmatter is ignored.
+		const configThinking = await ctx.ui.confirm(
+			`Configure thinking level for ${agent.name}?`,
+			`Leave unchecked to inherit the parent pi thinking level (${parentThinkingLabel}). Agent frontmatter thinking is not used as a subagent fallback.`,
+		);
+
+		let finalSetting = selectedModel;
+		if (configThinking) {
+			const thinkingOptions = [
+				thinkingOption(INHERIT_THINKING, `inherit parent pi thinking (${parentThinkingLabel})`),
+				...THINKING_LEVELS.map((level) => thinkingOption(level, `use ${level} thinking effort for this subagent`)),
+			];
+
+			const selectedThinkingOption = await ctx.ui.select(
+				`Thinking level for ${agent.name} (Resolution order: override → parent pi → default)`,
+				thinkingOptions,
+			);
+			if (selectedThinkingOption) {
+				const selectedThinking = parseThinkingOption(selectedThinkingOption);
+				if (selectedThinking !== INHERIT_THINKING) {
+					finalSetting = selectedModel === INHERIT_MODEL
+						? `${INHERIT_MODEL}:${selectedThinking}`
+						: `${selectedModel}:${selectedThinking}`;
+				}
+			}
+		}
+
+		await setAgentModelOverride(agent.name, finalSetting);
 		ctx.ui.notify(
-			selectedModel === INHERIT_MODEL
-				? `${agent.name} now inherits the parent model.`
-				: `${agent.name} now uses ${selectedModel}.`,
+			finalSetting === INHERIT_MODEL
+				? `${agent.name} now inherits the parent model and thinking level.`
+				: `${agent.name} now uses ${finalSetting}.`,
 			"info",
 		);
 	}
