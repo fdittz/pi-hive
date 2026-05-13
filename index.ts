@@ -1086,7 +1086,7 @@ async function refreshBackgroundJobsWidget(ctx: ExtensionContext): Promise<void>
 	try {
 		if (++backgroundJobsCleanupTick % 120 === 0) await cleanupOldJobs();
 		const jobs = await getBackgroundJobs();
-		const running = jobs.filter((job) => job.status === "running");
+		const running = jobs.filter((job) => job.status === "running" && job.cwd === ctx.cwd);
 		if (running.length === 0) {
 			ctx.ui.setWidget("pi-hive-background-jobs", undefined);
 			return;
@@ -2494,7 +2494,7 @@ export default function (pi: ExtensionAPI) {
 						}
 
 						// Background execution path
-						const jobId = await queueBackgroundJob(params.agent, backgroundTask);
+						const jobId = await queueBackgroundJob(params.agent, backgroundTask, params.cwd || ctx.cwd);
 						const controller = new AbortController();
 						registerBackgroundJobAbortController(jobId, controller);
 
@@ -2533,7 +2533,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					if (params.background === true) {
-						const jobId = await queueBackgroundJob(params.agent, task);
+						const jobId = await queueBackgroundJob(params.agent, task, params.cwd || ctx.cwd);
 						const controller = new AbortController();
 						registerBackgroundJobAbortController(jobId, controller);
 						startBackgroundSubagentRun({

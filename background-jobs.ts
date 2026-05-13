@@ -6,6 +6,7 @@ export interface BackgroundJob {
 	id: string;
 	agent: string;
 	task: string;
+	cwd?: string;
 	status: "running" | "completed" | "failed" | "cancelled";
 	progress: number; // 0-100
 	startedAt: string;
@@ -47,13 +48,14 @@ async function saveJobsFile(jobs: BackgroundJob[]): Promise<void> {
 	});
 }
 
-export async function queueBackgroundJob(agent: string, task: string): Promise<string> {
+export async function queueBackgroundJob(agent: string, task: string, cwd?: string): Promise<string> {
 	const id = generateJobId(agent);
 	const jobs = await loadJobsFile();
 	const newJob: BackgroundJob = {
 		id,
 		agent,
 		task,
+		cwd,
 		status: "running",
 		progress: 0,
 		startedAt: new Date().toISOString(),
