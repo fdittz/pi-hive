@@ -955,6 +955,44 @@ export default function (pi: ExtensionAPI) {
 		});
 	} else {
 		pi.registerTool({
+			name: "delegate",
+			label: "Delegate",
+			description:
+				"Analyze your request and find the best specialized agent to handle it. Returns agent name, confidence score, and suggested task.",
+			parameters: Type.Object({
+				request: Type.String({
+					description: "Your request or task description",
+				}),
+			}),
+			async execute(_toolCallId, params) {
+				const { findBestAgent } = await import("./delegate.js");
+				const match = await findBestAgent(params.request);
+
+				if (!match) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: "No suitable agent found for this request. Available agents: scout, planner, reviewer, worker, debugger",
+							},
+						],
+					};
+				}
+
+				const confidence = (match.score * 100).toFixed(0);
+				const reasoning = match.reasoning || "No explicit metadata matched; selected the top available agent.";
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Best agent: **${match.name}** (confidence: ${confidence}%)\n\nReasoning: ${reasoning}\n\nSuggested task: "${match.suggestedTask}"\n\nYou can now call the subagent tool with agent: "${match.name}" and the suggested task.`,
+						},
+					],
+				};
+			},
+		});
+
+		pi.registerTool({
 			name: "subagent_continue",
 			label: "Continue Subagent",
 			description: "Continue a previous continuable subagent run by short run id, full id, or agent@id label.",

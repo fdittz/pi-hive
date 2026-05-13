@@ -202,6 +202,10 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 	return { agents: Array.from(agentMap.values()), projectAgentsDir };
 }
 
+export async function loadAgents(options?: { cwd?: string; scope?: AgentScope }): Promise<AgentConfig[]> {
+	return discoverAgents(options?.cwd ?? process.cwd(), options?.scope ?? "user").agents;
+}
+
 export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {
 	if (agents.length === 0) return { text: "none", remaining: 0 };
 	const listed = agents.slice(0, maxItems);
