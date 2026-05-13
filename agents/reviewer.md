@@ -6,7 +6,7 @@ examples:
   - "Review the recent diff for bugs and security issues"
   - "Audit the changed authentication code for risky edge cases"
   - "Check whether the implementation matches the plan and flag concerns"
-triggers: review, audit, security, quality, regression, risk, vulnerabilities, correctness, maintainability
+triggers: review, audit, security, quality, regression, risk, vulnerabilities, correctness, maintainability, revisar, auditar, segurança, qualidade, regressão, risco, vulnerabilidades, corretude, manutenibilidade, review, análise, verificação, revisão, auditoria, correção
 tools: read, grep, find, ls, bash, handoff
 model: inherit
 thinking: inherit

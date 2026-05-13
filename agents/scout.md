@@ -6,7 +6,7 @@ examples:
   - "Find where authentication sessions are created and summarize the key files"
   - "Trace the data flow for provider configuration and list the important types"
   - "Inspect tests and implementation around a failing feature before planning fixes"
-triggers: find, locate, search, inspect, explore, map, trace, understand, discover, reconnaissance
+triggers: find, locate, search, inspect, explore, map, trace, understand, discover, reconnaissance, encontrar, localizar, buscar, pesquisar, procurar, inspecionar, explorar, mapear, rastrear, traçar, entender, descobrir, reconhecimento, estrutura, dependência, fluxo, código
 tools: read, grep, find, ls, bash, handoff
 model: inherit
 thinking: inherit

@@ -6,7 +6,7 @@ examples:
   - "Implement the planner's steps and report the files changed"
   - "Fix the bug after scout identifies the relevant code path"
   - "Apply reviewer feedback in the changed files"
-triggers: implement, change, build, fix, refactor, edit, modify, execute, apply
+triggers: implement, change, build, fix, refactor, edit, modify, execute, apply, implementar, mudar, alterar, construir, consertar, corrigir, refatorar, editar, modificar, executar, aplicar, fazer, realizar
 model: inherit
 thinking: inherit
 color: green

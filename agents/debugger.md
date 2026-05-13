@@ -6,7 +6,7 @@ examples:
   - "The handoff JSON is not being extracted from long outputs - find out why"
   - "The overlay freezes when transcript grows large - investigate the root cause"
   - "Users report that agent colors are not showing - diagnose the issue"
-triggers: bug, debug, diagnose, investigate, broken, error, failing, wrong, unexpected, root cause, why, trace error, not working
+triggers: bug, debug, diagnose, investigate, broken, error, failing, wrong, unexpected, root cause, why, trace error, not working, erro, problema, bug, lento, investigar, diagnóstico, falha, não funciona, quebrado, raiz, causa, traçar, depurar
 tools: read, grep, find, ls, bash, handoff
 model: inherit
 thinking: inherit

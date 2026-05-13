@@ -54,6 +54,7 @@ import { appendCoalescedTranscriptEvent, formatRunLabel, shouldPersistReplayEven
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
+const SUBAGENT_TIMEOUT_MS = 5 * 60 * 1000;
 
 function debugLog(message: string): void {
 	if (process.env.PI_HIVE_DEBUG !== "1" && process.env.PI_SUBAGENT_DEBUG !== "1") return;
@@ -422,104 +423,135 @@ async function runSingleAgent(
 
 		args.push(`Task: ${task}`);
 		let wasAborted = false;
+		let wasTimedOut = false;
+		let childProc: ReturnType<typeof spawn> | undefined;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
 		const segmentEvents: StoredTranscriptEvent[] = [];
 
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const childEnv = {
-				...process.env,
-				...buildSubagentHeaderEnv({
-					agent: agentName,
-					runId: run.id,
-					mode: runMeta.mode,
-					source: agent.source,
-					parentToolCallId: runMeta.parentToolCallId,
-				}),
-			};
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: effectiveCwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: childEnv,
-			});
-			let buffer = "";
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				const transcriptEvent = event as StoredTranscriptEvent;
-				appendCoalescedTranscriptEvent(segmentEvents, transcriptEvent);
-				registry.recordEvent(run.id, transcriptEvent);
-				if (shouldPersistReplayEvent(transcriptEvent)) {
-					registry.recordReplayEvent(run.id, transcriptEvent);
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-					}
-					emitUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", () => {
-				resolve(1);
-			});
-
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
+		const exitCode = await Promise.race([
+			new Promise<number>((resolve) => {
+				const invocation = getPiInvocation(args);
+				const childEnv = {
+					...process.env,
+					...buildSubagentHeaderEnv({
+						agent: agentName,
+						runId: run.id,
+						mode: runMeta.mode,
+						source: agent.source,
+						parentToolCallId: runMeta.parentToolCallId,
+					}),
 				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
-		});
+				const proc = spawn(invocation.command, invocation.args, {
+					cwd: effectiveCwd,
+					shell: false,
+					stdio: ["ignore", "pipe", "pipe"],
+					env: childEnv,
+				});
+				childProc = proc;
+				let buffer = "";
+
+				const processLine = (line: string) => {
+					if (!line.trim()) return;
+					let event: any;
+					try {
+						event = JSON.parse(line);
+					} catch {
+						return;
+					}
+
+					const transcriptEvent = event as StoredTranscriptEvent;
+					appendCoalescedTranscriptEvent(segmentEvents, transcriptEvent);
+					registry.recordEvent(run.id, transcriptEvent);
+					if (shouldPersistReplayEvent(transcriptEvent)) {
+						registry.recordReplayEvent(run.id, transcriptEvent);
+					}
+
+					if (event.type === "message_end" && event.message) {
+						const msg = event.message as Message;
+						currentResult.messages.push(msg);
+
+						if (msg.role === "assistant") {
+							currentResult.usage.turns++;
+							const usage = msg.usage;
+							if (usage) {
+								currentResult.usage.input += usage.input || 0;
+								currentResult.usage.output += usage.output || 0;
+								currentResult.usage.cacheRead += usage.cacheRead || 0;
+								currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+								currentResult.usage.cost += usage.cost?.total || 0;
+								currentResult.usage.contextTokens = usage.totalTokens || 0;
+							}
+							if (!currentResult.model && msg.model) currentResult.model = msg.model;
+							if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+							if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+						}
+						emitUpdate();
+					}
+
+					if (event.type === "tool_result_end" && event.message) {
+						currentResult.messages.push(event.message as Message);
+						emitUpdate();
+					}
+				};
+
+				proc.stdout.on("data", (data) => {
+					buffer += data.toString();
+					const lines = buffer.split("\n");
+					buffer = lines.pop() || "";
+					for (const line of lines) processLine(line);
+				});
+
+				proc.stderr.on("data", (data) => {
+					currentResult.stderr += data.toString();
+				});
+
+				proc.on("close", (code) => {
+					if (timeout) {
+						clearTimeout(timeout);
+						timeout = undefined;
+					}
+					if (!wasTimedOut && buffer.trim()) processLine(buffer);
+					resolve(wasTimedOut ? 124 : code ?? 0);
+				});
+
+				proc.on("error", () => {
+					if (timeout) {
+						clearTimeout(timeout);
+						timeout = undefined;
+					}
+					resolve(wasTimedOut ? 124 : 1);
+				});
+
+				if (signal) {
+					const killProc = () => {
+						wasAborted = true;
+						proc.kill("SIGTERM");
+						setTimeout(() => {
+							if (!proc.killed) proc.kill("SIGKILL");
+						}, 5000);
+					};
+					if (signal.aborted) killProc();
+					else signal.addEventListener("abort", killProc, { once: true });
+				}
+			}),
+			new Promise<number>((resolve) => {
+				timeout = setTimeout(() => {
+					wasTimedOut = true;
+					const timeoutSeconds = Math.round(SUBAGENT_TIMEOUT_MS / 1000);
+					const message = `Subagent timed out after ${timeoutSeconds} seconds`;
+					currentResult.stopReason = "error";
+					currentResult.errorMessage = message;
+					currentResult.stderr += currentResult.stderr && !currentResult.stderr.endsWith("\n") ? `\n${message}\n` : `${message}\n`;
+					if (childProc && !childProc.killed) childProc.kill("SIGKILL");
+					resolve(124);
+				}, SUBAGENT_TIMEOUT_MS);
+				(timeout as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+			}),
+		]);
+		if (timeout) {
+			clearTimeout(timeout);
+			timeout = undefined;
+		}
 
 		currentResult.exitCode = exitCode;
 		const finalOutput = getFinalOutput(currentResult.messages);
@@ -761,24 +793,24 @@ async function executeAutoDelegation(
 	userMessage: string,
 ): Promise<void> {
 	const header = `[AUTO-DELEGATED to ${match.name} (${confidence}% confidence)]`;
-	const agentScope: AgentScope = "user";
-	const discovery = discoverAgents(ctx.cwd, agentScope);
-	const agents = discovery.agents;
-	const sessionFile = getSessionFile(ctx);
-	const parentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
-	const parentThinking = pi.getThinkingLevel();
-	const parentToolCallId = `auto-delegate:${Date.now()}`;
-	const makeDetails = (mode: "single" | "chain") =>
-		(results: SingleResult[]): SubagentDetails => ({
-			mode,
-			agentScope,
-			projectAgentsDir: discovery.projectAgentsDir,
-			results: mode === "chain" ? withSequentialChainSteps(results) : results,
-		});
-
-	ctx.ui.notify(header, "info");
 
 	try {
+		const agentScope: AgentScope = "user";
+		const discovery = discoverAgents(ctx.cwd, agentScope);
+		const agents = discovery.agents;
+		const sessionFile = getSessionFile(ctx);
+		const parentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
+		const parentThinking = pi.getThinkingLevel();
+		const parentToolCallId = `auto-delegate:${Date.now()}`;
+		const makeDetails = (mode: "single" | "chain") =>
+			(results: SingleResult[]): SubagentDetails => ({
+				mode,
+				agentScope,
+				projectAgentsDir: discovery.projectAgentsDir,
+				results: mode === "chain" ? withSequentialChainSteps(results) : results,
+			});
+
+		ctx.ui.notify(header, "info");
 		const result = await runSingleAgent(
 			ctx.cwd,
 			agents,
@@ -824,6 +856,8 @@ async function executeAutoDelegation(
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
+		ctx.ui.notify(`Auto-delegation failed: ${message}`, "error");
+		debugLog(`Auto-delegation error: ${message}`);
 		pi.sendMessage({
 			customType: "auto-delegate-result",
 			content: `${header}\n\nOriginal request: ${userMessage}\n\nAuto-delegation failed: ${message}`,
@@ -1174,7 +1208,22 @@ export default function (pi: ExtensionAPI) {
 			const confidence = Math.round(match.score * 100);
 			if (confidence < config.confidenceThreshold) return { action: "continue" };
 
-			await executeAutoDelegation(pi, ctx, match, confidence, userMessage);
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			try {
+				const timeoutMs = 5 * 60 * 1000; // 5 minutos timeout
+				await Promise.race([
+					executeAutoDelegation(pi, ctx, match, confidence, userMessage),
+					new Promise<never>((_, reject) => {
+						timeout = setTimeout(() => reject(new Error("Auto-delegation timeout (5 minutes)")), timeoutMs);
+					}),
+				]);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Auto-delegation failed: ${message}`, "error");
+				debugLog(`Auto-delegation error: ${message}`);
+			} finally {
+				if (timeout) clearTimeout(timeout);
+			}
 			return { action: "handled" };
 		});
 
