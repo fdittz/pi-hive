@@ -28,6 +28,9 @@ export interface AgentConfig {
 	filePath: string;
 }
 
+const MAX_AGENT_TRIGGERS = 32;
+const MAX_AGENT_TRIGGER_LENGTH = 120;
+
 interface AgentFrontmatter {
 	name?: unknown;
 	description?: unknown;
@@ -74,6 +77,23 @@ function parseCommaList(value: unknown): string[] | undefined {
 		.map((item) => item.trim())
 		.filter(Boolean);
 	return items.length > 0 ? items : undefined;
+}
+
+function parseTriggers(value: unknown): string[] | undefined {
+	const raw = parseCommaList(value);
+	if (!raw) return undefined;
+	const seen = new Set<string>();
+	const triggers: string[] = [];
+	for (const item of raw) {
+		if (triggers.length >= MAX_AGENT_TRIGGERS) break;
+		const normalized = item.replace(/\s+/g, " ").trim();
+		if (!normalized) continue;
+		const bounded = normalized.length > MAX_AGENT_TRIGGER_LENGTH ? normalized.slice(0, MAX_AGENT_TRIGGER_LENGTH).trimEnd() : normalized;
+		if (!bounded || seen.has(bounded)) continue;
+		seen.add(bounded);
+		triggers.push(bounded);
+	}
+	return triggers.length > 0 ? triggers : undefined;
 }
 
 function parseExamples(value: unknown): string[] | undefined {
@@ -148,8 +168,8 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			handoffAllowList,
 			when: toOptionalString(frontmatter.when),
 			examples: parseExamples(frontmatter.examples),
-			triggers: parseCommaList(frontmatter.triggers),
-			triggers_en: parseCommaList(frontmatter.triggers_en),
+			triggers: parseTriggers(frontmatter.triggers),
+			triggers_en: parseTriggers(frontmatter.triggers_en),
 			systemPrompt: body,
 			source,
 			filePath,

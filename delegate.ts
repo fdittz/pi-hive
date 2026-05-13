@@ -1,4 +1,4 @@
-import { type AgentConfig, type AgentScope, loadAgents } from "./agents.js";
+import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { applySubagentsLanguageToAgents } from "./subagents-lang.js";
 
 export interface AgentMatch {
@@ -23,7 +23,7 @@ export async function loadCachedAgentsWithEnglishTriggers(options: {
 	scope?: AgentScope;
 	enabled?: boolean;
 } = {}): Promise<{ agents: AgentConfig[]; translated: boolean }> {
-	const agents = await loadAgents({ cwd: options.cwd, scope: options.scope });
+	const agents = discoverAgents(options.cwd ?? process.cwd(), options.scope ?? "user").agents;
 	return applySubagentsLanguageToAgents(agents);
 }
 
@@ -160,7 +160,7 @@ function triggerMatchesRequest(normalizedRequest: string, requestTokens: Set<str
 }
 
 function containsUnsegmentedScript(text: string): boolean {
-	return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text);
+	return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u.test(text);
 }
 
 function tokenHasCloseVariant(trigger: string, requestTokens: Set<string>): boolean {

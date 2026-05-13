@@ -54,9 +54,11 @@ import { buildSubagentHeaderEnv, isSubagentChildProcess, registerSubagentRequest
 import {
 	applySubagentsLanguageToAgents,
 	getEnglishTriggers,
+	getSubagentsLangConfig,
 	hashSubagentsLanguageTriggers,
 	normalizeSubagentsLanguageCode,
 	refreshSubagentsLanguageCache,
+	setSubagentsLang,
 } from "./subagents-lang.js";
 import { loadSubagentConfig } from "./subagent-config.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
@@ -730,18 +732,98 @@ function formatAgentTriggersForMessage(agents: AgentConfig[]): string {
 		.join("\n");
 }
 
+function subagentsLangUsage(): string {
+	return "Usage: /subagents-lang <lang> [--force] [--project] | refresh [--force] [--project] | status | off";
+}
+
+function hasSubagentsLangFlag(parts: string[], names: string[]): boolean {
+	return parts.some((part) => names.includes(part.toLowerCase()));
+}
+
+async function getAgentsForLanguageCache(
+	ctx: ExtensionContext,
+	includeProject: boolean,
+): Promise<{ agents: AgentConfig[]; projectIncluded: boolean; projectAgentsDir: string | null }> {
+	const userDiscovery = discoverAgents(ctx.cwd, "user");
+	if (!includeProject) {
+		return { agents: userDiscovery.agents, projectIncluded: false, projectAgentsDir: null };
+	}
+
+	const projectDiscovery = discoverAgents(ctx.cwd, "both");
+	const projectAgents = projectDiscovery.agents.filter((agent) => agent.source === "project");
+	if (projectAgents.length > 0 && ctx.hasUI) {
+		const ok = await ctx.ui.confirm(
+			"Translate project-local agent triggers?",
+			`Agents: ${projectAgents.map((agent) => agent.name).join(", ")}\nSource: ${projectDiscovery.projectAgentsDir ?? "(unknown)"}\n\nProject agents are repo-controlled. Their trigger text will be sent to the configured model for translation. Only continue for trusted repositories.`,
+		);
+		if (!ok) throw new Error("Canceled: project-local agents not approved for trigger translation.");
+	}
+
+	return {
+		agents: mergeAgentsForLanguageCache(userDiscovery.agents, projectDiscovery.agents),
+		projectIncluded: projectAgents.length > 0,
+		projectAgentsDir: projectDiscovery.projectAgentsDir,
+	};
+}
+
 async function handleSubagentsLangCommand(args: string, ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
 	const parts = args.trim().split(/\s+/).filter(Boolean);
-	const rawLanguage = parts[0] ?? "";
-	const language = parts.length === 1 ? normalizeSubagentsLanguageCode(rawLanguage) : null;
-	if (!language) {
-		ctx.ui.notify("Usage: /subagents-lang <lang>", "warning");
+	const action = (parts[0] ?? "status").toLowerCase();
+
+	if (parts.length === 0 || ["status", "show", "current"].includes(action)) {
+		const config = getSubagentsLangConfig();
+		const languages = Object.keys(config.translations);
+		ctx.ui.notify(config.language ? `Subagent trigger language is ${config.language}.` : "Subagent trigger translation is OFF.", "info");
+		pi.sendMessage({
+			customType: "subagents-lang-result",
+			display: true,
+			content: [
+				"# Subagent trigger language status",
+				"",
+				`Active language: ${config.language ? `\`${config.language}\`` : "off"}`,
+				`Cache: \`${Object.keys(config.translations).length > 0 ? Object.keys(config.translations).join(", ") : "empty"}\``,
+				languages.length > 0
+					? `Cached entries: ${languages.map((lang) => `${lang}=${Object.keys(config.translations[lang] ?? {}).length}`).join(", ")}`
+					: "Cached entries: none",
+			].join("\n"),
+			details: { language: config.language, translations: config.translations },
+		});
 		return;
 	}
 
-	const userDiscovery = discoverAgents(ctx.cwd, "user");
-	const projectDiscovery = discoverAgents(ctx.cwd, "both");
-	const agentsForCache = mergeAgentsForLanguageCache(userDiscovery.agents, projectDiscovery.agents);
+	if (["off", "disable", "disabled", "none", "reset"].includes(action)) {
+		const config = await setSubagentsLang(null);
+		ctx.ui.notify("Subagent trigger translation disabled.", "info");
+		pi.sendMessage({
+			customType: "subagents-lang-result",
+			display: true,
+			content: `# Subagent trigger language disabled\n\nCache entries were retained for future use. Active language: ${config.language ?? "off"}.`,
+			details: { language: config.language },
+		});
+		return;
+	}
+
+	const force = hasSubagentsLangFlag(parts, ["--force", "force"]);
+	const includeProject = hasSubagentsLangFlag(parts, ["--project", "--include-project", "--projects", "--all", "project"]);
+	const language = action === "refresh" ? getSubagentsLangConfig().language : normalizeSubagentsLanguageCode(parts[0]);
+	if (!language) {
+		ctx.ui.notify(subagentsLangUsage(), "warning");
+		return;
+	}
+
+	let agentsForCache: AgentConfig[];
+	let projectIncluded = false;
+	let projectAgentsDir: string | null = null;
+	try {
+		const discovery = await getAgentsForLanguageCache(ctx, includeProject);
+		agentsForCache = discovery.agents;
+		projectIncluded = discovery.projectIncluded;
+		projectAgentsDir = discovery.projectAgentsDir;
+	} catch (error) {
+		ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+		return;
+	}
+
 	if (agentsForCache.length === 0) {
 		ctx.ui.notify("No subagents discovered to translate.", "warning");
 		return;
@@ -749,7 +831,10 @@ async function handleSubagentsLangCommand(args: string, ctx: ExtensionContext, p
 
 	const modelRef = ctx.model ? formatModelRef(ctx.model) : undefined;
 	const thinking = pi.getThinkingLevel();
-	ctx.ui.notify(`Translating subagent triggers for ${language}...`, "info");
+	ctx.ui.notify(
+		`Translating subagent triggers for normalized language ${language}${force ? " (force refresh)" : ""}${projectIncluded ? " including project agents" : ""}...`,
+		"info",
+	);
 
 	try {
 		const result = await refreshSubagentsLanguageCache({
@@ -759,6 +844,7 @@ async function handleSubagentsLangCommand(args: string, ctx: ExtensionContext, p
 			modelRef,
 			thinking,
 			signal: ctx.signal,
+			force,
 		});
 		await loadCachedAgentsWithEnglishTriggers({ cwd: ctx.cwd, scope: "user", enabled: true });
 		const activeAgents = applySubagentsLanguageToAgents(agentsForCache, result.config).agents;
@@ -779,13 +865,15 @@ async function handleSubagentsLangCommand(args: string, ctx: ExtensionContext, p
 				`# Subagent trigger language: ${result.language}`,
 				"",
 				`Cache: \`${result.configPath}\``,
+				`Project agents: ${projectIncluded ? `included (${projectAgentsDir ?? "unknown directory"})` : "not included; pass `--project` to opt in"}`,
+				`Force refresh: ${force ? "yes" : "no"}`,
 				`Translated this run: ${result.translatedAgents} agent(s), ${result.translatedTriggers} trigger(s).`,
 				`Cached: ${result.cachedAgents} agent(s).`,
 				"",
 				"Resulting triggers (`[original_english, ...translated]`):",
 				formatAgentTriggersForMessage(activeAgents),
 			].join("\n"),
-			details: { language: result.language, configPath: result.configPath, agents: triggerDetails },
+			details: { language: result.language, configPath: result.configPath, agents: triggerDetails, projectIncluded, force },
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -1202,7 +1290,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("subagents-lang", {
-		description: "Translate and cache subagent triggers for a language",
+		description: "Translate/cache subagent triggers for a language; supports status, off, refresh, --force, and --project",
 		handler: async (args, ctx) => {
 			await handleSubagentsLangCommand(args, ctx, pi);
 		},
@@ -1248,12 +1336,16 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	const initialSubagentGuidance = generateSubagentGuidance(discoverAgents(process.cwd(), "user").agents);
+	const initialSubagentGuidance = generateSubagentGuidance(
+		applySubagentsLanguageToAgents(discoverAgents(process.cwd(), "user").agents).agents,
+	);
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!event.systemPromptOptions.selectedTools?.includes("subagent")) return;
 		const guidanceScope: AgentScope = shouldIncludeProjectAgentGuidance(event.prompt) ? "both" : "user";
-		const dynamicGuidance = generateSubagentGuidance(discoverAgents(ctx.cwd, guidanceScope).agents);
+		const dynamicGuidance = generateSubagentGuidance(
+			applySubagentsLanguageToAgents(discoverAgents(ctx.cwd, guidanceScope).agents).agents,
+		);
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${dynamicGuidance.promptSection}`,
 		};

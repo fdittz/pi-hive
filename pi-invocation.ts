@@ -2,6 +2,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 export function getPiInvocation(args: string[]): { command: string; args: string[] } {
+	const configuredCommand = process.env.PI_HIVE_PI_COMMAND?.trim();
+	if (configuredCommand) return { command: configuredCommand, args };
+
 	const currentScript = process.argv[1];
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
 	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
