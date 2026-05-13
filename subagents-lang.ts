@@ -61,8 +61,8 @@ const LOCK_STALE_MS = 60_000;
 const LOCK_RETRY_MS = 50;
 const TRANSLATION_TIMEOUT_MS = 2 * 60 * 1000;
 const TRANSLATION_SHUTDOWN_GRACE_MS = 5_000;
-const MAX_TRANSLATION_STDOUT_BYTES = 1024 * 1024;
-const MAX_TRANSLATION_STDERR_BYTES = 128 * 1024;
+const MAX_TRANSLATION_STDOUT_BYTES = 50 * 1024 * 1024; // 50MB for translations with potential LLM reasoning
+const MAX_TRANSLATION_STDERR_BYTES = 10 * 1024 * 1024; // 10MB for stderr
 export const MAX_SUBAGENTS_LANGUAGE_TRIGGER_LENGTH = 120;
 export const MAX_SUBAGENTS_LANGUAGE_TRIGGERS_PER_AGENT = 32;
 export const MAX_SUBAGENTS_LANGUAGE_TRANSLATION_TRIGGERS = 256;
@@ -666,13 +666,23 @@ export async function refreshSubagentsLanguageCache(
 	const pendingEntries: Record<string, SubagentsLangAgentCacheEntry> = {};
 	if (staleAgents.length > 0) {
 		const uniqueTriggers = uniqueNormalizedStrings(staleAgents.flatMap((item) => item.originalEnglish));
-		const translated = await translateTriggersForLanguage(uniqueTriggers, language, {
-			cwd: options.cwd,
-			modelRef: options.modelRef,
-			thinking: options.thinking,
-			signal: options.signal,
-		});
-		const translationByTrigger = new Map(uniqueTriggers.map((trigger, index) => [trigger, translated[index]]));
+		
+		// Batch translation to avoid overwhelming the LLM (max 50 triggers per batch)
+		const BATCH_SIZE = 50;
+		const translationByTrigger = new Map<string, string>();
+		for (let i = 0; i < uniqueTriggers.length; i += BATCH_SIZE) {
+			const batch = uniqueTriggers.slice(i, i + BATCH_SIZE);
+			const translated = await translateTriggersForLanguage(batch, language, {
+				cwd: options.cwd,
+				modelRef: options.modelRef,
+				thinking: options.thinking,
+				signal: options.signal,
+			});
+			for (let j = 0; j < batch.length; j++) {
+				translationByTrigger.set(batch[j], translated[j]);
+			}
+		}
+		
 		const now = new Date().toISOString();
 		for (const item of staleAgents) {
 			const translatedForAgent = uniqueNormalizedStrings(
