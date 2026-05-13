@@ -49,6 +49,10 @@ export async function isAutoDelegateEnabled(): Promise<boolean> {
 	return (await getAutoDelegateConfig()).enabled;
 }
 
+export function shouldUseLanguageAgnosticDelegation(config: AutoDelegateConfig): boolean {
+	return config.enabled;
+}
+
 export async function setAutoDelegateEnabled(enabled: boolean): Promise<void> {
 	await setAutoDelegateConfig({ enabled });
 }

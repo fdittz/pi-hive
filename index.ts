@@ -27,11 +27,16 @@ import {
 	getAutoDelegateConfig,
 	setAutoDelegateConfig,
 	setAutoDelegateEnabled,
+	shouldUseLanguageAgnosticDelegation,
 	type AutoDelegateConfig,
 } from "./auto-delegate.js";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { ChildSessionStorage } from "./child-session-storage.js";
-import { findBestAgent, type AgentMatch } from "./delegate.js";
+import {
+	findBestAgent,
+	loadCachedAgentsWithEnglishTriggers,
+	type AgentMatch,
+} from "./delegate.js";
 import { generateSubagentGuidance } from "./delegation-guidance.js";
 import { getCompatibilityWarning } from "./compatibility.js";
 import {
@@ -717,12 +722,21 @@ function parseAutoDelegateThreshold(value: string | undefined): number | undefin
 }
 
 async function handleAutoDelegateCommand(args: string, ctx: ExtensionContext): Promise<void> {
+	const warmDelegationMetadata = () => {
+		void loadCachedAgentsWithEnglishTriggers({
+			cwd: ctx.cwd,
+			scope: "user",
+			enabled: true,
+		}).catch((error) => debugLog(`Auto-delegate metadata warm failed: ${error instanceof Error ? error.message : String(error)}`));
+	};
+
 	const trimmed = args.trim();
 	if (!trimmed) {
 		const current = await getAutoDelegateConfig();
 		await setAutoDelegateEnabled(!current.enabled);
 		const updated = await getAutoDelegateConfig();
 		ctx.ui.notify(formatAutoDelegateStatus(updated, { offExact: !updated.enabled }), "info");
+		if (updated.enabled) warmDelegationMetadata();
 		return;
 	}
 
@@ -731,6 +745,7 @@ async function handleAutoDelegateCommand(args: string, ctx: ExtensionContext): P
 	if (["on", "enable", "enabled", "true", "yes"].includes(action)) {
 		await setAutoDelegateEnabled(true);
 		ctx.ui.notify(formatAutoDelegateStatus(await getAutoDelegateConfig()), "info");
+		warmDelegationMetadata();
 		return;
 	}
 	if (["off", "disable", "disabled", "false", "no"].includes(action)) {
@@ -1202,7 +1217,11 @@ export default function (pi: ExtensionAPI) {
 			const config = await getAutoDelegateConfig();
 			if (!config.enabled || !config.autoExecute) return { action: "continue" };
 
-			const match = await findBestAgent(userMessage);
+			const match = await findBestAgent(userMessage, {
+				cwd: ctx.cwd,
+				scope: "user",
+				languageAgnostic: shouldUseLanguageAgnosticDelegation(config),
+			});
 			if (!match) return { action: "continue" };
 
 			const confidence = Math.round(match.score * 100);
@@ -1237,8 +1256,13 @@ export default function (pi: ExtensionAPI) {
 					description: "Your request or task description",
 				}),
 			}),
-			async execute(_toolCallId, params) {
-				const match = await findBestAgent(params.request);
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+				const config = await getAutoDelegateConfig();
+				const match = await findBestAgent(params.request, {
+					cwd: ctx.cwd,
+					scope: "user",
+					languageAgnostic: shouldUseLanguageAgnosticDelegation(config),
+				});
 
 				if (!match) {
 					return {

@@ -21,6 +21,7 @@ export interface AgentConfig {
 	when?: string;
 	examples?: string[];
 	triggers?: string[];
+	triggers_en?: string[];
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
