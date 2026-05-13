@@ -156,6 +156,7 @@ export class SubagentOverlay implements Component {
 	private copyNoticeTimer?: ReturnType<typeof setTimeout>;
 	private cancelRequestedRunId?: string;
 	private cancelConfirmationRunId?: string;
+	private notifiedCancelledRunIds = new Set<string>();
 	private unsubscribe?: () => void;
 	private renderTimer?: ReturnType<typeof setTimeout>;
 	private disposed = false;
@@ -166,6 +167,7 @@ export class SubagentOverlay implements Component {
 		private done: () => void,
 		private registry: LiveSubagentRegistry,
 		private initialRunId?: string,
+		private onCancelledRun?: (runId: string) => void,
 	) {
 		this.enableMouseReporting();
 		this.setTextCursor();
@@ -359,7 +361,21 @@ export class SubagentOverlay implements Component {
 
 	private shouldCloseAfterCancel(): boolean {
 		const run = this.getSelectedRun();
-		return Boolean(run && run.id === this.cancelRequestedRunId && run.status === "aborted");
+		if (run && run.id === this.cancelRequestedRunId && run.status === "aborted") {
+			this.notifyCancelledRun(run.id);
+			return true;
+		}
+		return false;
+	}
+
+	private notifyCancelledRun(runId: string): void {
+		if (this.notifiedCancelledRunIds.has(runId)) return;
+		this.notifiedCancelledRunIds.add(runId);
+		try {
+			this.onCancelledRun?.(runId);
+		} catch {
+			/* keep overlay input handling resilient to callback errors */
+		}
 	}
 
 	private cancelSelectedRun(): void {
@@ -386,6 +402,7 @@ export class SubagentOverlay implements Component {
 		this.cancelConfirmationRunId = undefined;
 		if (cancelled) {
 			this.cancelRequestedRunId = run.id;
+			this.notifyCancelledRun(run.id);
 			this.clearSelection();
 			this.stickToBottom = true;
 			this.transcriptView.invalidate();

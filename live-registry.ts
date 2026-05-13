@@ -51,6 +51,7 @@ export class LiveSubagentRegistry {
 	private runs = new Map<string, SubagentRunRecord>();
 	private subscribers = new Set<() => void>();
 	private abortControllers = new Map<string, AbortController>();
+	private cancelledRunIds = new Set<string>();
 
 	private touch(run: SubagentRunRecord): void {
 		run.revision = (run.revision ?? 0) + 1;
@@ -156,6 +157,7 @@ export class LiveSubagentRegistry {
 			run.status = "cancelling";
 			run.stopReason = "aborted";
 			run.cancelRequestedAt = Date.now();
+			this.cancelledRunIds.add(run.id);
 			this.touch(run);
 			this.notify();
 		}
@@ -170,6 +172,7 @@ export class LiveSubagentRegistry {
 		run.status = "running";
 		run.errorMessage = undefined;
 		run.cancelRequestedAt = undefined;
+		this.cancelledRunIds.delete(runId);
 		this.touch(run);
 		this.notify();
 	}
@@ -185,6 +188,7 @@ export class LiveSubagentRegistry {
 	finishRun(runId: string, result: FinishRunInput): void {
 		const run = this.runs.get(runId);
 		if (!run) return;
+		const wasRunningOrCancelling = run.status === "running" || run.status === "cancelling";
 		run.status = result.status;
 		run.exitCode = result.exitCode;
 		run.stopReason = result.stopReason;
@@ -192,6 +196,7 @@ export class LiveSubagentRegistry {
 		run.stderr = result.stderr;
 		run.endedAt = Date.now();
 		if (result.status === "aborted" && !run.cancelRequestedAt) run.cancelRequestedAt = run.endedAt;
+		if (result.status === "aborted" && wasRunningOrCancelling) this.cancelledRunIds.add(run.id);
 		this.abortControllers.delete(runId);
 		this.touch(run);
 		this.notify();
@@ -205,6 +210,10 @@ export class LiveSubagentRegistry {
 		return Array.from(this.runs.values()).sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
 	}
 
+	getCancelledRuns(initialRunIds?: ReadonlySet<string>): SubagentRunRecord[] {
+		return this.getRunsSortedByStartTime().filter((run) => this.cancelledRunIds.has(run.id) && (!initialRunIds || initialRunIds.has(run.id)));
+	}
+
 	findRunsByPrefix(query: string): SubagentRunRecord[] {
 		const trimmed = query.trim();
 		if (!trimmed) return [];
@@ -214,11 +223,13 @@ export class LiveSubagentRegistry {
 	clearRuns(): void {
 		this.runs.clear();
 		this.abortControllers.clear();
+		this.cancelledRunIds.clear();
 		this.notify();
 	}
 
 	async hydrateFromSessionEntries(entries: readonly SessionEntry[], storage: TranscriptStorage): Promise<void> {
 		this.runs.clear();
+		this.cancelledRunIds.clear();
 		for (const entry of entries) {
 			const anyEntry = entry as any;
 			const fallbackStartedAt = safeTimestamp(anyEntry.timestamp, Date.now());

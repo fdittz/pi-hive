@@ -725,7 +725,7 @@ function getSessionFile(ctx: ExtensionContext): string | undefined {
 	return typeof sessionManager.getSessionFile === "function" ? sessionManager.getSessionFile() : undefined;
 }
 
-async function openSubagentsOverlay(ctx: ExtensionContext, runQuery?: string): Promise<void> {
+async function openSubagentsOverlay(ctx: ExtensionContext, pi: ExtensionAPI, runQuery?: string): Promise<void> {
 	if (!ctx.hasUI) return;
 	if (activeOverlayClose) {
 		activeOverlayClose();
@@ -745,6 +745,30 @@ async function openSubagentsOverlay(ctx: ExtensionContext, runQuery?: string): P
 		}
 		initialRunId = matches[0].id;
 	}
+
+	const initiallyRunningRunIds = new Set(
+		registry
+			.getRunsSortedByStartTime()
+			.filter((run) => run.status === "running")
+			.map((run) => run.id),
+	);
+	const reportedCancelledRunIds = new Set<string>();
+	let feedbackQueue = Promise.resolve();
+	const enqueueCancelledRunFeedback = (runId: string) => {
+		if (!initiallyRunningRunIds.has(runId) || reportedCancelledRunIds.has(runId)) return;
+		reportedCancelledRunIds.add(runId);
+		feedbackQueue = feedbackQueue
+			.then(async () => {
+				await cancelJob(runId);
+				ctx.ui.notify(`Cancelled ${runId} - partial results saved.`, "info");
+				sendBackgroundJobsMessage(pi, `# Cancelled\n\nCancelled \`${runId}\` - partial results saved.`, { id: runId });
+				await refreshBackgroundJobsWidget(ctx);
+			})
+			.catch((error) => {
+				debugLog(`Cancelled run feedback failed for ${runId}: ${error instanceof Error ? error.message : String(error)}`);
+			});
+	};
+
 	const warning = getCompatibilityWarning();
 	if (warning) ctx.ui.notify(warning, "warning");
 	try {
@@ -752,7 +776,7 @@ async function openSubagentsOverlay(ctx: ExtensionContext, runQuery?: string): P
 			(tui, theme, _keybindings, done) => {
 				const close = () => done(undefined);
 				activeOverlayClose = close;
-				return new SubagentOverlay(tui, theme, close, registry, initialRunId);
+				return new SubagentOverlay(tui, theme, close, registry, initialRunId, enqueueCancelledRunFeedback);
 			},
 			{
 				overlay: true,
@@ -766,6 +790,10 @@ async function openSubagentsOverlay(ctx: ExtensionContext, runQuery?: string): P
 		);
 	} finally {
 		activeOverlayClose = undefined;
+		for (const run of registry.getCancelledRuns(initiallyRunningRunIds)) {
+			enqueueCancelledRunFeedback(run.id);
+		}
+		await feedbackQueue;
 	}
 }
 
@@ -1764,7 +1792,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("subagents", {
 		description: "Open the live/historical subagent view, optionally focused by run id prefix",
 		handler: async (args, ctx) => {
-			await openSubagentsOverlay(ctx, args);
+			await openSubagentsOverlay(ctx, pi, args);
 		},
 	});
 
@@ -1851,14 +1879,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerShortcut("ctrl+shift+o", {
 		description: "Open/close the live subagent view",
 		handler: async (ctx) => {
-			await openSubagentsOverlay(ctx);
+			await openSubagentsOverlay(ctx, pi);
 		},
 	});
 
 	pi.registerShortcut("alt+o", {
 		description: "Fallback: open/close the live subagent view",
 		handler: async (ctx) => {
-			await openSubagentsOverlay(ctx);
+			await openSubagentsOverlay(ctx, pi);
 		},
 	});
 

@@ -96,7 +96,7 @@ export async function getBackgroundJobs(): Promise<BackgroundJob[]> {
 		await saveJobsFile(kept);
 	}
 	
-	return jobs.filter(j => j.status === "running" || j.status === "completed");
+	return kept;
 }
 
 export async function updateJobProgress(id: string, progress: number): Promise<void> {
