@@ -74,6 +74,14 @@ import {
 	setSubagentsLang,
 } from "./subagents-lang.js";
 import { loadSubagentConfig } from "./subagent-config.js";
+import {
+	getSubagentTimeoutConfigPath,
+	getTimeoutForAgent,
+	loadTimeoutConfig,
+	saveTimeoutConfig,
+	type TimeoutConfig,
+	type TimeoutMs,
+} from "./subagent-timeout.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
 import { getPiInvocation } from "./pi-invocation.js";
 import { TranscriptStorage } from "./transcript-storage.js";
@@ -82,7 +90,6 @@ import { appendCoalescedTranscriptEvent, formatRunLabel, shouldPersistReplayEven
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
-const SUBAGENT_TIMEOUT_MS = 5 * 60 * 1000;
 
 function debugLog(message: string): void {
 	if (process.env.PI_HIVE_DEBUG !== "1" && process.env.PI_SUBAGENT_DEBUG !== "1") return;
@@ -320,6 +327,7 @@ type RunMeta = {
 	sessionFile?: string;
 	parentModel?: { provider: string; id: string };
 	parentThinking?: string;
+	runId?: string;
 	existingRunId?: string;
 	continuation?: boolean;
 	handoffDepth?: number;
@@ -364,6 +372,7 @@ async function runSingleAgent(
 		registry.markRunRunning(run.id);
 	} else {
 		run = registry.startRun({
+			runId: runMeta.runId,
 			parentToolCallId: runMeta.parentToolCallId,
 			mode: runMeta.mode,
 			agent: agentName,
@@ -444,126 +453,130 @@ async function runSingleAgent(
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		const segmentEvents: StoredTranscriptEvent[] = [];
 
-		const exitCode = await Promise.race([
-			new Promise<number>((resolve) => {
-				const invocation = getPiInvocation(args);
-				const childEnv = {
-					...process.env,
-					...buildSubagentHeaderEnv({
-						agent: agentName,
-						runId: run.id,
-						mode: runMeta.mode,
-						source: agent.source,
-						parentToolCallId: runMeta.parentToolCallId,
-					}),
-				};
-				const proc = spawn(invocation.command, invocation.args, {
-					cwd: effectiveCwd,
-					shell: false,
-					stdio: ["ignore", "pipe", "pipe"],
-					env: childEnv,
-				});
-				childProc = proc;
-				let buffer = "";
+		const childExit = new Promise<number>((resolve) => {
+			const invocation = getPiInvocation(args);
+			const childEnv = {
+				...process.env,
+				...buildSubagentHeaderEnv({
+					agent: agentName,
+					runId: run.id,
+					mode: runMeta.mode,
+					source: agent.source,
+					parentToolCallId: runMeta.parentToolCallId,
+				}),
+			};
+			const proc = spawn(invocation.command, invocation.args, {
+				cwd: effectiveCwd,
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+				env: childEnv,
+			});
+			childProc = proc;
+			let buffer = "";
 
-				const processLine = (line: string) => {
-					if (!line.trim()) return;
-					let event: any;
-					try {
-						event = JSON.parse(line);
-					} catch {
-						return;
-					}
-
-					const transcriptEvent = event as StoredTranscriptEvent;
-					appendCoalescedTranscriptEvent(segmentEvents, transcriptEvent);
-					registry.recordEvent(run.id, transcriptEvent);
-					if (shouldPersistReplayEvent(transcriptEvent)) {
-						registry.recordReplayEvent(run.id, transcriptEvent);
-					}
-
-					if (event.type === "message_end" && event.message) {
-						const msg = event.message as Message;
-						currentResult.messages.push(msg);
-
-						if (msg.role === "assistant") {
-							currentResult.usage.turns++;
-							const usage = msg.usage;
-							if (usage) {
-								currentResult.usage.input += usage.input || 0;
-								currentResult.usage.output += usage.output || 0;
-								currentResult.usage.cacheRead += usage.cacheRead || 0;
-								currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-								currentResult.usage.cost += usage.cost?.total || 0;
-								currentResult.usage.contextTokens = usage.totalTokens || 0;
-							}
-							if (!currentResult.model && msg.model) currentResult.model = msg.model;
-							if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-							if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-						}
-						emitUpdate();
-					}
-
-					if (event.type === "tool_result_end" && event.message) {
-						currentResult.messages.push(event.message as Message);
-						emitUpdate();
-					}
-				};
-
-				proc.stdout.on("data", (data) => {
-					buffer += data.toString();
-					const lines = buffer.split("\n");
-					buffer = lines.pop() || "";
-					for (const line of lines) processLine(line);
-				});
-
-				proc.stderr.on("data", (data) => {
-					currentResult.stderr += data.toString();
-				});
-
-				proc.on("close", (code) => {
-					if (timeout) {
-						clearTimeout(timeout);
-						timeout = undefined;
-					}
-					if (!wasTimedOut && buffer.trim()) processLine(buffer);
-					resolve(wasTimedOut ? 124 : code ?? 0);
-				});
-
-				proc.on("error", () => {
-					if (timeout) {
-						clearTimeout(timeout);
-						timeout = undefined;
-					}
-					resolve(wasTimedOut ? 124 : 1);
-				});
-
-				if (signal) {
-					const killProc = () => {
-						wasAborted = true;
-						proc.kill("SIGTERM");
-						setTimeout(() => {
-							if (!proc.killed) proc.kill("SIGKILL");
-						}, 5000);
-					};
-					if (signal.aborted) killProc();
-					else signal.addEventListener("abort", killProc, { once: true });
+			const processLine = (line: string) => {
+				if (!line.trim()) return;
+				let event: any;
+				try {
+					event = JSON.parse(line);
+				} catch {
+					return;
 				}
-			}),
-			new Promise<number>((resolve) => {
-				timeout = setTimeout(() => {
-					wasTimedOut = true;
-					const timeoutSeconds = Math.round(SUBAGENT_TIMEOUT_MS / 1000);
-					const message = `Subagent timed out after ${timeoutSeconds} seconds`;
-					currentResult.stopReason = "error";
-					currentResult.errorMessage = message;
-					currentResult.stderr += currentResult.stderr && !currentResult.stderr.endsWith("\n") ? `\n${message}\n` : `${message}\n`;
-					if (childProc && !childProc.killed) childProc.kill("SIGKILL");
-					resolve(124);
-				}, SUBAGENT_TIMEOUT_MS);
-				(timeout as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
-			}),
-		]);
+
+				const transcriptEvent = event as StoredTranscriptEvent;
+				appendCoalescedTranscriptEvent(segmentEvents, transcriptEvent);
+				registry.recordEvent(run.id, transcriptEvent);
+				if (shouldPersistReplayEvent(transcriptEvent)) {
+					registry.recordReplayEvent(run.id, transcriptEvent);
+				}
+
+				if (event.type === "message_end" && event.message) {
+					const msg = event.message as Message;
+					currentResult.messages.push(msg);
+
+					if (msg.role === "assistant") {
+						currentResult.usage.turns++;
+						const usage = msg.usage;
+						if (usage) {
+							currentResult.usage.input += usage.input || 0;
+							currentResult.usage.output += usage.output || 0;
+							currentResult.usage.cacheRead += usage.cacheRead || 0;
+							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+							currentResult.usage.cost += usage.cost?.total || 0;
+							currentResult.usage.contextTokens = usage.totalTokens || 0;
+						}
+						if (!currentResult.model && msg.model) currentResult.model = msg.model;
+						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+					}
+					emitUpdate();
+				}
+
+				if (event.type === "tool_result_end" && event.message) {
+					currentResult.messages.push(event.message as Message);
+					emitUpdate();
+				}
+			};
+
+			proc.stdout.on("data", (data) => {
+				buffer += data.toString();
+				const lines = buffer.split("\n");
+				buffer = lines.pop() || "";
+				for (const line of lines) processLine(line);
+			});
+
+			proc.stderr.on("data", (data) => {
+				currentResult.stderr += data.toString();
+			});
+
+			proc.on("close", (code) => {
+				if (timeout) {
+					clearTimeout(timeout);
+					timeout = undefined;
+				}
+				if (!wasTimedOut && buffer.trim()) processLine(buffer);
+				resolve(wasTimedOut ? 124 : code ?? 0);
+			});
+
+			proc.on("error", () => {
+				if (timeout) {
+					clearTimeout(timeout);
+					timeout = undefined;
+				}
+				resolve(wasTimedOut ? 124 : 1);
+			});
+
+			if (signal) {
+				const killProc = () => {
+					wasAborted = true;
+					proc.kill("SIGTERM");
+					setTimeout(() => {
+						if (!proc.killed) proc.kill("SIGKILL");
+					}, 5000);
+				};
+				if (signal.aborted) killProc();
+				else signal.addEventListener("abort", killProc, { once: true });
+			}
+		});
+		const timeoutMs = await getTimeoutForAgent(agentName);
+		const exitCode = timeoutMs
+			? await Promise.race([
+					childExit,
+					new Promise<number>((resolve) => {
+						timeout = setTimeout(() => {
+							wasTimedOut = true;
+							const timeoutSeconds = Math.round(timeoutMs / 1000);
+							const message = `Subagent timed out after ${timeoutSeconds} seconds`;
+							currentResult.stopReason = "error";
+							currentResult.errorMessage = message;
+							currentResult.stderr += currentResult.stderr && !currentResult.stderr.endsWith("\n") ? `\n${message}\n` : `${message}\n`;
+							if (childProc && !childProc.killed) childProc.kill("SIGKILL");
+							resolve(124);
+						}, timeoutMs);
+						(timeout as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+					}),
+				])
+			: await childExit;
 		if (timeout) {
 			clearTimeout(timeout);
 			timeout = undefined;
@@ -932,6 +945,7 @@ function startBackgroundSubagentRun(options: {
 					sessionFile: options.sessionFile,
 					parentModel: options.parentModel,
 					parentThinking: options.parentThinking,
+					runId: options.jobId,
 				},
 			);
 			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
@@ -1159,6 +1173,134 @@ async function handleSubagentsLangCommand(args: string, ctx: ExtensionContext, p
 		const message = error instanceof Error ? error.message : String(error);
 		ctx.ui.notify(`Subagent trigger translation failed: ${message}`, "error");
 	}
+}
+
+function subagentTimeoutUsage(): string {
+	return "Usage: /subagent-timeout [status|on|off|--default <ms|null>|<agent> <ms|null>]";
+}
+
+function parseTimeoutMsArgument(value: string | undefined): TimeoutMs | undefined {
+	if (!value) return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (["null", "none", "off", "disable", "disabled"].includes(normalized)) return null;
+	if (!/^\d+$/.test(normalized)) return undefined;
+	const parsed = Number(normalized);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function hasAnyConfiguredTimeout(config: TimeoutConfig): boolean {
+	return config.defaultMs !== null || Object.values(config.agents).some((value) => value !== null);
+}
+
+function formatTimeoutValue(value: TimeoutMs): string {
+	if (value === null) return "null";
+	const seconds = value / 1000;
+	return `${value} ms (${seconds >= 60 ? `${(seconds / 60).toFixed(1)} min` : `${seconds.toFixed(1)} sec`})`;
+}
+
+function getEffectiveTimeoutFromConfig(config: TimeoutConfig, agent: string): TimeoutMs {
+	if (!config.enabled) return null;
+	if (Object.prototype.hasOwnProperty.call(config.agents, agent)) return config.agents[agent] ?? null;
+	return config.defaultMs;
+}
+
+function formatSubagentTimeoutConfig(config: TimeoutConfig): string {
+	const agents = Object.keys(config.agents);
+	return [
+		"# Subagent timeout configuration",
+		"",
+		`Config: \`${getSubagentTimeoutConfigPath()}\``,
+		`Enabled: ${config.enabled ? "yes" : "no"}`,
+		`Default: ${formatTimeoutValue(config.defaultMs)}`,
+		"",
+		"## Agents",
+		...(agents.length > 0
+			? agents.map((agent) => {
+					const configured = formatTimeoutValue(config.agents[agent] ?? null);
+					const effective = config.enabled ? formatTimeoutValue(getEffectiveTimeoutFromConfig(config, agent)) : "disabled";
+					return `- ${agent}: ${configured} (effective: ${effective})`;
+				})
+			: ["- none"]),
+		"",
+		"Examples:",
+		"- `/subagent-timeout scout 300000`",
+		"- `/subagent-timeout scout null`",
+		"- `/subagent-timeout --default null`",
+	].join("\n");
+}
+
+function sendSubagentTimeoutMessage(pi: ExtensionAPI, config: TimeoutConfig): void {
+	pi.sendMessage({
+		customType: "subagent-timeout-result",
+		display: true,
+		content: formatSubagentTimeoutConfig(config),
+		details: { config, configPath: getSubagentTimeoutConfigPath() },
+	});
+}
+
+async function handleSubagentTimeoutCommand(args: string, ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+	const parts = args.trim().split(/\s+/).filter(Boolean);
+	const action = (parts[0] ?? "status").toLowerCase();
+
+	if (parts.length === 0 || ["status", "show", "view", "current"].includes(action)) {
+		const config = await loadTimeoutConfig();
+		sendSubagentTimeoutMessage(pi, config);
+		return;
+	}
+
+	if (["on", "enable", "enabled", "true", "yes"].includes(action)) {
+		const config = await loadTimeoutConfig();
+		config.enabled = true;
+		const saved = await saveTimeoutConfig(config);
+		ctx.ui.notify("Subagent timeouts enabled.", "info");
+		sendSubagentTimeoutMessage(pi, saved);
+		return;
+	}
+
+	if (["off", "disable", "disabled", "false", "no"].includes(action)) {
+		const config = await loadTimeoutConfig();
+		config.enabled = false;
+		const saved = await saveTimeoutConfig(config);
+		ctx.ui.notify("Subagent timeouts disabled.", "info");
+		sendSubagentTimeoutMessage(pi, saved);
+		return;
+	}
+
+	const defaultMatch = parts[0]?.match(/^--default(?:=(.+))?$/);
+	if (defaultMatch || action === "default") {
+		const rawValue = defaultMatch?.[1] ?? parts[1];
+		const timeoutMs = parseTimeoutMsArgument(rawValue);
+		if (timeoutMs === undefined) {
+			ctx.ui.notify(subagentTimeoutUsage(), "warning");
+			return;
+		}
+		const config = await loadTimeoutConfig();
+		config.defaultMs = timeoutMs;
+		if (timeoutMs !== null) config.enabled = true;
+		else if (!hasAnyConfiguredTimeout(config)) config.enabled = false;
+		const saved = await saveTimeoutConfig(config);
+		ctx.ui.notify(`Default subagent timeout set to ${formatTimeoutValue(timeoutMs)}.`, "info");
+		sendSubagentTimeoutMessage(pi, saved);
+		return;
+	}
+
+	if (parts.length === 2) {
+		const timeoutMs = parseTimeoutMsArgument(parts[1]);
+		if (timeoutMs === undefined) {
+			ctx.ui.notify(subagentTimeoutUsage(), "warning");
+			return;
+		}
+		const config = await loadTimeoutConfig();
+		config.agents[parts[0]] = timeoutMs;
+		if (timeoutMs !== null) config.enabled = true;
+		else if (!hasAnyConfiguredTimeout(config)) config.enabled = false;
+		const saved = await saveTimeoutConfig(config);
+		ctx.ui.notify(`Subagent timeout for ${parts[0]} set to ${formatTimeoutValue(timeoutMs)}.`, "info");
+		sendSubagentTimeoutMessage(pi, saved);
+		return;
+	}
+
+	ctx.ui.notify(subagentTimeoutUsage(), "warning");
 }
 
 async function handleAutoDelegateCommand(args: string, ctx: ExtensionContext): Promise<void> {
@@ -1575,6 +1717,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("subagent-timeout", {
+		description: "View or configure subagent timeouts",
+		handler: async (args, ctx) => {
+			await handleSubagentTimeoutCommand(args, ctx, pi);
+		},
+	});
+
 	pi.registerCommand("subagent-handoff", {
 		description: "Configure subagent handoff behavior",
 		handler: async (_args, ctx) => {
@@ -1717,21 +1866,12 @@ export default function (pi: ExtensionAPI) {
 			const confidence = Math.round(match.score * 100);
 			if (confidence < config.confidenceThreshold) return { action: "continue" };
 
-			let timeout: ReturnType<typeof setTimeout> | undefined;
 			try {
-				const timeoutMs = 5 * 60 * 1000; // 5 minutos timeout
-				await Promise.race([
-					executeAutoDelegation(pi, ctx, match, confidence, userMessage),
-					new Promise<never>((_, reject) => {
-						timeout = setTimeout(() => reject(new Error("Auto-delegation timeout (5 minutes)")), timeoutMs);
-					}),
-				]);
+				await executeAutoDelegation(pi, ctx, match, confidence, userMessage);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Auto-delegation failed: ${message}`, "error");
 				debugLog(`Auto-delegation error: ${message}`);
-			} finally {
-				if (timeout) clearTimeout(timeout);
 			}
 			return { action: "handled" };
 		});

@@ -95,6 +95,7 @@ export interface SubagentRunRecord {
 }
 
 export interface StartRunInput {
+	runId?: string;
 	parentToolCallId: string;
 	mode: SubagentRunMode;
 	agent: string;
@@ -218,8 +219,16 @@ export function statusFromExit(exitCode: number | undefined, stopReason?: string
 	return "failed";
 }
 
+function parseBackgroundRunId(runId: string | undefined): { shortId: string } | undefined {
+	const match = runId?.match(/^bg_[^@]+@(.+)$/);
+	if (!match) return undefined;
+	return { shortId: match[1] };
+}
+
 export function getRunUuid(runId: string | undefined): string {
 	if (!runId) return "";
+	const background = parseBackgroundRunId(runId);
+	if (background) return background.shortId;
 	return runId.split(":").pop() || runId;
 }
 
@@ -229,6 +238,8 @@ export function getRunShortId(runId: string | undefined, length = 8): string {
 }
 
 export function formatRunLabel(agent: string, runId: string | undefined, length = 8): string {
+	const background = parseBackgroundRunId(runId);
+	if (background) return runId!;
 	const shortId = getRunShortId(runId, length);
 	return shortId ? `${agent}@${shortId}` : agent;
 }

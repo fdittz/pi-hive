@@ -25,7 +25,8 @@ function getJobsFilePath(): string {
 }
 
 function generateJobId(agent: string): string {
-	return `bg_${agent}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const shortId = Math.random().toString(36).slice(2, 9);
+	return `bg_${agent}@${shortId}`; // Format: bg_scout@abc123 (shared with run ID)
 }
 
 async function loadJobsFile(): Promise<BackgroundJob[]> {
@@ -62,10 +63,9 @@ export async function queueBackgroundJob(agent: string, task: string): Promise<s
 	return id;
 }
 
-export function getBackgroundJob(id: string): BackgroundJob | undefined {
-	// Note: This is synchronous lookup from memory. For now, load from file.
-	// In a real implementation, you might cache this.
-	return undefined; // Will be implemented with file lookup if needed
+export async function getBackgroundJob(id: string): Promise<BackgroundJob | undefined> {
+	const jobs = await loadJobsFile();
+	return jobs.find((job) => job.id === id);
 }
 
 export async function getBackgroundJobs(): Promise<BackgroundJob[]> {
@@ -218,4 +218,12 @@ export async function formatBackgroundJobs(jobs: BackgroundJob[]): Promise<strin
 	];
 	
 	return lines.join("\n");
+}
+
+export function extractShortIdFromJobId(jobId: string): string {
+	// From "bg_scout@abc123" extract "abc123"
+	const atIndex = jobId.lastIndexOf("@");
+	if (atIndex >= 0) return jobId.slice(atIndex + 1);
+	const parts = jobId.split("_");
+	return parts[parts.length - 1];
 }

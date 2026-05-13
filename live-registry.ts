@@ -67,7 +67,7 @@ export class LiveSubagentRegistry {
 	}
 
 	startRun(input: StartRunInput): SubagentRunRecord {
-		const id = `${input.parentToolCallId}:${input.mode}:${input.index ?? input.step ?? 0}:${input.agent}:${randomUUID()}`;
+		const id = input.runId ?? `${input.parentToolCallId}:${input.mode}:${input.index ?? input.step ?? 0}:${input.agent}:${randomUUID()}`;
 		const run: SubagentRunRecord = {
 			id,
 			parentToolCallId: input.parentToolCallId,
