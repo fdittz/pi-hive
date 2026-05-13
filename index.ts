@@ -24,6 +24,19 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { colorAgentText } from "./agent-colors.js";
 import {
+	cancelJob,
+	cleanupOldJobs,
+	completeJob,
+	failJob,
+	getBackgroundJob,
+	getBackgroundJobs,
+	queueBackgroundJob,
+	registerBackgroundJobAbortController,
+	unregisterBackgroundJobAbortController,
+	updateJobProgress,
+	type BackgroundJob,
+} from "./background-jobs.js";
+import {
 	getAutoDelegateConfig,
 	setAutoDelegateConfig,
 	setAutoDelegateEnabled,
@@ -311,6 +324,7 @@ type RunMeta = {
 	continuation?: boolean;
 	handoffDepth?: number;
 	handoff?: HandoffInfo;
+	additionalSystemPrompt?: string;
 };
 
 async function runSingleAgent(
@@ -413,8 +427,11 @@ async function runSingleAgent(
 	};
 
 	try {
-		if (agent.systemPrompt.trim()) {
-			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
+		const systemPrompt = runMeta.additionalSystemPrompt?.trim()
+			? `${agent.systemPrompt}${agent.systemPrompt.trim() ? "\n\n" : ""}${runMeta.additionalSystemPrompt.trim()}`
+			: agent.systemPrompt;
+		if (systemPrompt.trim()) {
+			const tmp = await writePromptToTempFile(agent.name, systemPrompt);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
 			args.push("--append-system-prompt", tmpPromptPath);
@@ -689,6 +706,267 @@ function parseContinueArgs(args: string): { run: string; instruction?: string } 
 	if (!trimmed) return undefined;
 	const [run, ...rest] = trimmed.split(/\s+/);
 	return { run, instruction: rest.join(" ").trim() || undefined };
+}
+
+function parseBackgroundTaskFlag(task: string): string | undefined {
+	const match = task.match(/^\s*--background(?:\s+|$)([\s\S]*)$/);
+	if (!match) return undefined;
+	return match[1].trim();
+}
+
+function truncateBackgroundTask(task: string, maxLength = 30): string {
+	const compact = task.replace(/\s+/g, " ").trim();
+	if (compact.length <= maxLength) return compact;
+	return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function backgroundStatusIcon(status: BackgroundJob["status"]): string {
+	switch (status) {
+		case "running":
+			return "⚙️";
+		case "completed":
+			return "✓";
+		case "failed":
+			return "✗";
+		case "cancelled":
+			return "⏹";
+	}
+}
+
+function formatBackgroundJobSummary(job: BackgroundJob): string {
+	const completed = job.completedAt ? ` → ${job.completedAt}` : "";
+	const terminalNote = job.status === "failed" && job.error ? ` — ${job.error.split("\n")[0]}` : "";
+	return `- ${backgroundStatusIcon(job.status)} \`${job.id}\` **${job.agent}** ${job.status} (${job.progress}%) — ${truncateBackgroundTask(job.task, 80)}\n  ${job.startedAt}${completed}${terminalNote}`;
+}
+
+function formatBackgroundJobsList(jobs: BackgroundJob[]): string {
+	if (jobs.length === 0) return "# Background jobs\n\nNo background jobs found.";
+	return ["# Background jobs", "", ...jobs.map(formatBackgroundJobSummary)].join("\n");
+}
+
+function formatBackgroundJobsStatus(jobs: BackgroundJob[]): string {
+	const counts: Record<BackgroundJob["status"], number> = { running: 0, completed: 0, failed: 0, cancelled: 0 };
+	for (const job of jobs) counts[job.status]++;
+	const running = jobs.filter((job) => job.status === "running");
+	return [
+		"# Background jobs status",
+		"",
+		`- Running: ${counts.running}`,
+		`- Completed: ${counts.completed}`,
+		`- Failed: ${counts.failed}`,
+		`- Cancelled: ${counts.cancelled}`,
+		...(running.length > 0 ? ["", "## Running", ...running.map(formatBackgroundJobSummary)] : []),
+	].join("\n");
+}
+
+function formatBackgroundRunResult(results: SingleResult[]): string {
+	if (results.length === 0) return "(no output)";
+	if (results.length === 1) {
+		const result = results[0];
+		return getFinalOutput(result.messages) || result.errorMessage || result.stderr || "(no output)";
+	}
+	return results
+		.map((result, index) => {
+			const output = getFinalOutput(result.messages) || result.errorMessage || result.stderr || "(no output)";
+			const status = result.exitCode === 0 && result.stopReason !== "error" && result.stopReason !== "aborted" ? "completed" : "failed";
+			return `## ${index + 1}. ${formatRunLabel(result.agent, result.runId)} (${status})\n\n${output}`;
+		})
+		.join("\n\n");
+}
+
+function sendBackgroundJobsMessage(
+	pi: ExtensionAPI,
+	content: string,
+	details: Record<string, unknown>,
+): void {
+	pi.sendMessage({
+		customType: "subagent-jobs-result",
+		display: true,
+		content,
+		details,
+	});
+}
+
+async function handleSubagentJobsCommand(args: string, ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+	const parts = args.trim().split(/\s+/).filter(Boolean);
+	const action = (parts[0] ?? "list").toLowerCase();
+
+	if (parts.length === 0 || action === "list" || action === "all") {
+		const jobs = await getBackgroundJobs();
+		sendBackgroundJobsMessage(pi, formatBackgroundJobsList(jobs), { jobs });
+		return;
+	}
+
+	if (action === "status") {
+		const jobs = await getBackgroundJobs();
+		sendBackgroundJobsMessage(pi, formatBackgroundJobsStatus(jobs), { jobs });
+		return;
+	}
+
+	if (action === "results" || action === "result") {
+		const id = parts[1];
+		if (!id) {
+			ctx.ui.notify("Usage: /subagent-jobs results <id>", "warning");
+			return;
+		}
+		const job = await getBackgroundJob(id);
+		if (!job) {
+			ctx.ui.notify(`Background job not found: ${id}`, "warning");
+			return;
+		}
+		const body = job.status === "completed" ? job.result || "(no result)" : job.status === "failed" ? job.error || "(no error captured)" : job.status === "cancelled" ? "Job was cancelled." : "Job is still running.";
+		sendBackgroundJobsMessage(
+			pi,
+			[`# Background job ${job.id}`, "", formatBackgroundJobSummary(job), "", "## Result", "", body].join("\n"),
+			{ job },
+		);
+		return;
+	}
+
+	if (action === "cancel") {
+		const id = parts[1];
+		if (!id) {
+			ctx.ui.notify("Usage: /subagent-jobs cancel <id>", "warning");
+			return;
+		}
+		const job = await getBackgroundJob(id);
+		if (!job) {
+			ctx.ui.notify(`Background job not found: ${id}`, "warning");
+			return;
+		}
+		if (job.status !== "running") {
+			ctx.ui.notify(`Background job ${id} is already ${job.status}.`, "info");
+			return;
+		}
+		await cancelJob(id);
+		ctx.ui.notify(`Cancelled background job ${id}.`, "info");
+		sendBackgroundJobsMessage(pi, `# Background job cancelled\n\nCancelled \`${id}\`.`, { id });
+		return;
+	}
+
+	ctx.ui.notify("Usage: /subagent-jobs [status|results <id>|cancel <id>]", "warning");
+}
+
+let backgroundJobsWidgetTimer: ReturnType<typeof setInterval> | undefined;
+let backgroundJobsCleanupTick = 0;
+
+async function refreshBackgroundJobsWidget(ctx: ExtensionContext): Promise<void> {
+	try {
+		if (++backgroundJobsCleanupTick % 120 === 0) await cleanupOldJobs();
+		const jobs = await getBackgroundJobs();
+		const running = jobs.filter((job) => job.status === "running");
+		if (running.length === 0) {
+			ctx.ui.setWidget("pi-hive-background-jobs", undefined);
+			return;
+		}
+		const entries = running.map((job) => `${job.agent} (${truncateBackgroundTask(job.task)}, ${job.progress}%)`);
+		ctx.ui.setWidget("pi-hive-background-jobs", [ctx.ui.theme.fg("muted", "⚙️ Running: ") + ctx.ui.theme.fg("accent", entries.join(", "))]);
+	} catch (error) {
+		debugLog(`Background jobs widget refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+function startBackgroundJobsWidget(ctx: ExtensionContext): void {
+	if (!ctx.hasUI) return;
+	if (backgroundJobsWidgetTimer) clearInterval(backgroundJobsWidgetTimer);
+	void refreshBackgroundJobsWidget(ctx);
+	backgroundJobsWidgetTimer = setInterval(() => {
+		void refreshBackgroundJobsWidget(ctx);
+	}, 500);
+	(backgroundJobsWidgetTimer as ReturnType<typeof setInterval> & { unref?: () => void }).unref?.();
+}
+
+function stopBackgroundJobsWidget(): void {
+	if (!backgroundJobsWidgetTimer) return;
+	clearInterval(backgroundJobsWidgetTimer);
+	backgroundJobsWidgetTimer = undefined;
+}
+
+function startBackgroundSubagentRun(options: {
+	jobId: string;
+	ctx: ExtensionContext;
+	agents: AgentConfig[];
+	agent: string;
+	task: string;
+	cwd?: string;
+	toolCallId: string;
+	sessionFile?: string;
+	parentModel?: { provider: string; id: string };
+	parentThinking?: string;
+	makeDetails: (mode: "single" | "chain") => (results: SingleResult[]) => SubagentDetails;
+}): void {
+	const controller = new AbortController();
+	registerBackgroundJobAbortController(options.jobId, controller);
+
+	let progress = 1;
+	const setProgress = (next: number) => {
+		progress = Math.max(progress, Math.min(95, Math.round(next)));
+		void updateJobProgress(options.jobId, progress).catch((error) =>
+			debugLog(`Background job progress update failed: ${error instanceof Error ? error.message : String(error)}`),
+		);
+	};
+	const heartbeat = setInterval(() => setProgress(progress + 1), 1000);
+	(heartbeat as ReturnType<typeof setInterval> & { unref?: () => void }).unref?.();
+	setProgress(1);
+
+	const onBackgroundUpdate: OnUpdateCallback = () => setProgress(progress + 4);
+
+	void (async () => {
+		try {
+			const result = await runSingleAgent(
+				options.ctx.cwd,
+				options.agents,
+				options.agent,
+				options.task,
+				options.cwd,
+				undefined,
+				controller.signal,
+				onBackgroundUpdate,
+				options.makeDetails("single"),
+				{
+					parentToolCallId: `${options.toolCallId}:background:${options.jobId}`,
+					mode: "single",
+					index: 0,
+					sessionFile: options.sessionFile,
+					parentModel: options.parentModel,
+					parentThinking: options.parentThinking,
+				},
+			);
+			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+			if (isError) {
+				const errorMsg = result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+				await failJob(options.jobId, errorMsg);
+				return;
+			}
+			setProgress(80);
+			const handoffResults = await executeHandoffsForResult(
+				options.ctx,
+				options.agents,
+				result,
+				controller.signal,
+				onBackgroundUpdate,
+				options.makeDetails("chain"),
+				{
+					parentToolCallId: `${options.toolCallId}:background:${options.jobId}`,
+					mode: "chain",
+					index: 0,
+					sessionFile: options.sessionFile,
+					parentModel: options.parentModel,
+					parentThinking: options.parentThinking,
+					handoffDepth: 0,
+				},
+			);
+			await completeJob(options.jobId, formatBackgroundRunResult([result, ...handoffResults]));
+		} catch (error) {
+			const job = await getBackgroundJob(options.jobId);
+			if (job?.status !== "cancelled") {
+				await failJob(options.jobId, error instanceof Error ? error.message : String(error));
+			}
+		} finally {
+			clearInterval(heartbeat);
+			unregisterBackgroundJobAbortController(options.jobId);
+		}
+	})();
 }
 
 function shouldIncludeProjectAgentGuidance(prompt: string): boolean {
@@ -968,6 +1246,15 @@ async function executeAutoDelegation(
 	userMessage: string,
 ): Promise<void> {
 	const header = `[AUTO-DELEGATED to ${match.name} (${confidence}% confidence)]`;
+	const backgroundGuidance = `
+Consider whether this task would benefit from running in background:
+- Exploratory investigations (scout)
+- Complex planning (planner)
+- Code reviews (reviewer)
+- Large refactors (worker)
+
+If appropriate, the parent process might suggest --background. Background execution lets users continue working while the task runs asynchronously.
+`;
 
 	try {
 		const agentScope: AgentScope = "user";
@@ -996,7 +1283,7 @@ async function executeAutoDelegation(
 			ctx.signal,
 			undefined,
 			makeDetails("single"),
-			{ parentToolCallId, mode: "single", index: 0, sessionFile, parentModel, parentThinking },
+			{ parentToolCallId, mode: "single", index: 0, sessionFile, parentModel, parentThinking, additionalSystemPrompt: backgroundGuidance },
 		);
 		const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 		const handoffResults = isError
@@ -1016,6 +1303,7 @@ async function executeAutoDelegation(
 						parentModel,
 						parentThinking,
 						handoffDepth: 0,
+						additionalSystemPrompt: backgroundGuidance,
 					},
 				);
 		const allResults = [result, ...handoffResults];
@@ -1141,6 +1429,7 @@ async function executeHandoffsForResult(
 				parentThinking: runMeta.parentThinking,
 				handoffDepth: (runMeta.handoffDepth ?? 0) + 1,
 				handoff: handoffInfo,
+				additionalSystemPrompt: runMeta.additionalSystemPrompt,
 			},
 		);
 		childResults.push(result);

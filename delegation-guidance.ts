@@ -140,6 +140,14 @@ export function generateSubagentGuidance(agents: AgentConfig[]): SubagentGuidanc
 
 	promptGuidelines.push(...maybeKnownChainGuidance(availableAgents));
 
+	// Background execution guidance
+	promptGuidelines.push(
+		"Consider running long-running tasks in background using the --background flag for better user experience.",
+		"Use /subagent --background agent task for exploratory work (scout finding code) or complex planning/reviews that can run while user works on other tasks.",
+		"Background tasks run asynchronously without blocking; user can continue working and check progress with /subagent-jobs status.",
+		"Retrieve background job results later with /subagent-jobs results <id> or cancel with /subagent-jobs cancel <id>.",
+	);
+
 	const promptSection = [
 		"## Dynamic Subagent Guidance",
 		"Agents are discovered dynamically from bundled agents and ~/.pi/agent/agents. Project .pi/agents are included only when project scope is explicitly requested/trusted.",
