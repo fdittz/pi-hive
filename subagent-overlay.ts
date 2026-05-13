@@ -148,6 +148,7 @@ export class SubagentOverlay implements Component {
 		private initialRunId?: string,
 	) {
 		this.enableMouseReporting();
+		this.setTextCursor();
 		this.unsubscribe = registry.subscribe(() => {
 			this.scheduleRender();
 		});
@@ -274,6 +275,7 @@ export class SubagentOverlay implements Component {
 			this.copyNoticeTimer = undefined;
 		}
 		this.disableMouseReporting();
+		this.restoreCursor();
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 	}
@@ -472,6 +474,14 @@ export class SubagentOverlay implements Component {
 
 	private disableMouseReporting(): void {
 		this.tui.terminal.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+	}
+
+	private setTextCursor(): void {
+		process.stdout.write("\x1b[5 q");
+	}
+
+	private restoreCursor(): void {
+		process.stdout.write("\x1b[ q");
 	}
 
 	private renderHeader(run: SubagentRunRecord, total: number, width: number): string[] {
