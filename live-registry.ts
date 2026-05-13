@@ -50,6 +50,7 @@ function resultStartedAt(result: HistoricalResultLike, fallback: number): number
 export class LiveSubagentRegistry {
 	private runs = new Map<string, SubagentRunRecord>();
 	private subscribers = new Set<() => void>();
+	private abortControllers = new Map<string, AbortController>();
 
 	private touch(run: SubagentRunRecord): void {
 		run.revision = (run.revision ?? 0) + 1;
@@ -136,11 +137,39 @@ export class LiveSubagentRegistry {
 		this.notify();
 	}
 
+	attachAbortController(runId: string, controller: AbortController): void {
+		this.abortControllers.set(runId, controller);
+	}
+
+	detachAbortController(runId: string, controller?: AbortController): void {
+		if (controller && this.abortControllers.get(runId) !== controller) return;
+		this.abortControllers.delete(runId);
+	}
+
+	cancelRun(runId: string, reason = "Cancelled from subagent overlay"): boolean {
+		const run = this.runs.get(runId);
+		if (!run || (run.status !== "running" && run.status !== "cancelling")) return false;
+		const controller = this.abortControllers.get(runId);
+		if (!controller) return false;
+
+		if (run.status !== "cancelling") {
+			run.status = "cancelling";
+			run.stopReason = "aborted";
+			run.cancelRequestedAt = Date.now();
+			this.touch(run);
+			this.notify();
+		}
+
+		if (!controller.signal.aborted) controller.abort(reason);
+		return true;
+	}
+
 	markRunRunning(runId: string): void {
 		const run = this.runs.get(runId);
 		if (!run) return;
 		run.status = "running";
 		run.errorMessage = undefined;
+		run.cancelRequestedAt = undefined;
 		this.touch(run);
 		this.notify();
 	}
@@ -162,6 +191,8 @@ export class LiveSubagentRegistry {
 		run.errorMessage = result.errorMessage;
 		run.stderr = result.stderr;
 		run.endedAt = Date.now();
+		if (result.status === "aborted" && !run.cancelRequestedAt) run.cancelRequestedAt = run.endedAt;
+		this.abortControllers.delete(runId);
 		this.touch(run);
 		this.notify();
 	}
@@ -182,6 +213,7 @@ export class LiveSubagentRegistry {
 
 	clearRuns(): void {
 		this.runs.clear();
+		this.abortControllers.clear();
 		this.notify();
 	}
 

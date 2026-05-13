@@ -9,6 +9,8 @@ function statusIcon(status: string): string {
 	switch (status) {
 		case "running":
 			return "⏳";
+		case "cancelling":
+			return "⏹";
 		case "done":
 			return "✓";
 		case "aborted":
@@ -16,6 +18,22 @@ function statusIcon(status: string): string {
 		default:
 			return "✗";
 	}
+}
+
+function formatDuration(ms: number): string {
+	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	if (minutes < 60) return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+	const hours = Math.floor(minutes / 60);
+	const remainingMinutes = minutes % 60;
+	return `${hours}h ${remainingMinutes.toString().padStart(2, "0")}m`;
+}
+
+function elapsedMs(run: SubagentRunRecord, preferCancelTime = false): number {
+	const end = preferCancelTime && run.cancelRequestedAt ? run.cancelRequestedAt : (run.endedAt ?? Date.now());
+	return Math.max(0, end - run.startedAt);
 }
 
 function shortCwd(cwd: string): string {
@@ -136,6 +154,7 @@ export class SubagentOverlay implements Component {
 	private selectionMoved = false;
 	private copyNotice?: { message: string; color: "success" | "warning" | "error" };
 	private copyNoticeTimer?: ReturnType<typeof setTimeout>;
+	private cancelRequestedRunId?: string;
 	private unsubscribe?: () => void;
 	private renderTimer?: ReturnType<typeof setTimeout>;
 	private disposed = false;
@@ -168,7 +187,7 @@ export class SubagentOverlay implements Component {
 		const run = runs[this.selectedIndex];
 
 		const header = this.renderHeader(run, runs.length, safeWidth);
-		const footer = this.renderFooter(safeWidth);
+		const footer = this.renderFooter(run, safeWidth);
 		const bodyHeight = Math.max(1, height - header.length - footer.length);
 		const viewport = this.transcriptView.renderRunViewport(
 			run,
@@ -208,8 +227,19 @@ export class SubagentOverlay implements Component {
 			return;
 		}
 
+		if (this.shouldCloseAfterCancel()) {
+			this.done();
+			return;
+		}
+
 		if (matchesKey(data, "ctrl+c")) {
-			this.copySelection();
+			if (this.selectedText) this.copySelection();
+			else this.cancelSelectedRun();
+			return;
+		}
+
+		if (data === "x" || data === "X") {
+			this.cancelSelectedRun();
 			return;
 		}
 
@@ -308,6 +338,41 @@ export class SubagentOverlay implements Component {
 
 	private getMaxScroll(): number {
 		return Math.max(0, this.lastTotalLines - this.lastBodyHeight);
+	}
+
+	private getSelectedRun(): SubagentRunRecord | undefined {
+		const runs = this.registry.getRunsSortedByStartTime();
+		if (runs.length === 0) return undefined;
+		const index = this.selectedIndex < 0 ? runs.length - 1 : Math.max(0, Math.min(this.selectedIndex, runs.length - 1));
+		return runs[index];
+	}
+
+	private shouldCloseAfterCancel(): boolean {
+		const run = this.getSelectedRun();
+		return Boolean(run && run.id === this.cancelRequestedRunId && run.status === "aborted");
+	}
+
+	private cancelSelectedRun(): void {
+		const run = this.getSelectedRun();
+		if (!run) return;
+		if (run.status === "cancelling") {
+			this.showCopyNotice("Already cancelling...", "warning");
+			return;
+		}
+		if (run.status !== "running") {
+			this.showCopyNotice("Only running agents can be cancelled", "warning");
+			return;
+		}
+
+		const cancelled = this.registry.cancelRun(run.id);
+		if (cancelled) {
+			this.cancelRequestedRunId = run.id;
+			this.clearSelection();
+			this.stickToBottom = true;
+			this.transcriptView.invalidate();
+		}
+		this.showCopyNotice(cancelled ? "Cancelling..." : "Unable to cancel this run", cancelled ? "warning" : "error");
+		this.tui.requestRender();
 	}
 
 	private handleMouseEvent(event: ParsedMouseEvent): void {
@@ -489,20 +554,43 @@ export class SubagentOverlay implements Component {
 		const top = colorAgentText(this.theme, borderColor, "─".repeat(Math.max(0, width)), "borderAccent");
 		const runLabel = formatRunLabel(run.agent, run.id);
 		const agentName = this.theme.bold(colorAgentText(this.theme, run.agentColor, runLabel, "toolTitle"));
-		const title = `${this.theme.bold(this.theme.fg("accent", "Subagents"))} ${this.theme.fg("muted", `${this.selectedIndex + 1}/${total}`)} ${statusIcon(run.status)} ${agentName} ${this.theme.fg("muted", `[${run.mode}]`)} ${run.model ? this.theme.fg("dim", run.model) : ""}`;
-		const ctx = `${this.theme.fg("muted", "id:")} ${this.theme.fg("dim", getRunShortId(run.id))} ${this.theme.fg("muted", "cwd:")} ${this.theme.fg("dim", shortCwd(run.cwd || process.cwd()))}`;
+		const statusText = this.renderStatusText(run);
+		const title = `${this.theme.bold(this.theme.fg("accent", "Subagents"))} ${this.theme.fg("muted", `${this.selectedIndex + 1}/${total}`)} ${statusIcon(run.status)} ${statusText} ${agentName} ${this.theme.fg("muted", `[${run.mode}]`)} ${run.model ? this.theme.fg("dim", run.model) : ""}`;
+		const elapsed = formatDuration(elapsedMs(run, run.status === "aborted" && Boolean(run.cancelRequestedAt)));
+		const ctx = `${this.theme.fg("muted", "id:")} ${this.theme.fg("dim", getRunShortId(run.id))} ${this.theme.fg("muted", "elapsed:")} ${this.theme.fg("dim", elapsed)} ${this.theme.fg("muted", "cwd:")} ${this.theme.fg("dim", shortCwd(run.cwd || process.cwd()))}`;
 		const help = this.theme.fg(
 			"dim",
-			"←/→ agent · ↑/↓ scroll · drag select · Ctrl+C copy · Ctrl+O expand · Alt+O/Esc/q back",
+			"←/→ agent · ↑/↓ scroll · x cancel · drag select · Ctrl+C copy/cancel · Ctrl+O expand · Alt+O/Esc/q back",
 		);
 		return [top, truncateToWidth(title, width), truncateToWidth(ctx, width), truncateToWidth(help, width), top];
 	}
 
-	private renderFooter(width: number): string[] {
+	private renderStatusText(run: SubagentRunRecord): string {
+		switch (run.status) {
+			case "running":
+				return this.theme.fg("warning", "Running");
+			case "cancelling":
+				return this.theme.fg("warning", "Cancelling...");
+			case "done":
+				return this.theme.fg("success", "Done");
+			case "aborted":
+				return this.theme.fg("warning", "Cancelled (partial result)");
+			default:
+				return this.theme.fg("error", "Failed");
+		}
+	}
+
+	private renderFooter(run: SubagentRunRecord, width: number): string[] {
 		const state = this.expanded ? "expanded" : "collapsed";
 		const line = this.theme.fg("borderAccent", "─".repeat(Math.max(0, width)));
 		const notice = this.copyNotice ? ` · ${this.theme.fg(this.copyNotice.color, this.copyNotice.message)}` : "";
-		return [line, truncateToWidth(`${this.theme.fg("dim", `View: ${state}`)}${notice}`, width)];
+		let footer = `${this.theme.fg("dim", `View: ${state}`)}${notice}`;
+		if (run.status === "cancelling") {
+			footer = `${this.theme.fg("warning", `Cancelling... elapsed ${formatDuration(elapsedMs(run))}`)}${notice}`;
+		} else if (run.status === "aborted" && run.id === this.cancelRequestedRunId) {
+			footer = `${this.theme.fg("warning", `Cancelled after ${formatDuration(elapsedMs(run, true))}`)} ${this.theme.fg("dim", "- Press any key to close")}`;
+		}
+		return [line, truncateToWidth(footer, width)];
 	}
 
 	private renderEmpty(width: number, height: number): string[] {

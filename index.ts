@@ -101,6 +101,17 @@ function debugPreview(text: string, maxLength = 320): string {
 	return compact.length > maxLength ? `${compact.slice(0, maxLength)}…` : compact;
 }
 
+function formatElapsedDuration(ms: number): string {
+	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	if (minutes < 60) return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+	const hours = Math.floor(minutes / 60);
+	const remainingMinutes = minutes % 60;
+	return `${hours}h ${remainingMinutes.toString().padStart(2, "0")}m`;
+}
+
 const registry = new LiveSubagentRegistry();
 const transcriptStorage = new TranscriptStorage();
 const childSessionStorage = new ChildSessionStorage();
@@ -386,6 +397,14 @@ async function runSingleAgent(
 		});
 	}
 
+	const runAbortController = new AbortController();
+	const forwardParentAbort = () => {
+		if (!runAbortController.signal.aborted) runAbortController.abort(signal?.reason ?? "Parent subagent request aborted");
+	};
+	registry.attachAbortController(run.id, runAbortController);
+	if (signal?.aborted) forwardParentAbort();
+	else signal?.addEventListener("abort", forwardParentAbort, { once: true });
+
 	let childSessionPath: string | undefined;
 	if (run.childSessionRef) {
 		childSessionPath = childSessionStorage.resolveRef(run.childSessionRef);
@@ -426,10 +445,19 @@ async function runSingleAgent(
 		handoff: runMeta.handoff,
 	};
 
+	const getUpdateText = () => {
+		const output = getFinalOutput(currentResult.messages);
+		if (output) return output;
+		if (currentResult.stopReason === "aborted") return currentResult.errorMessage || "Subagent cancelled before producing final output.";
+		if (currentResult.errorMessage) return currentResult.errorMessage;
+		if (currentResult.stderr.trim()) return currentResult.stderr.trim();
+		return "(running...)";
+	};
+
 	const emitUpdate = () => {
 		if (onUpdate) {
 			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
+				content: [{ type: "text", text: getUpdateText() }],
 				details: makeDetails([currentResult]),
 			});
 		}
@@ -473,6 +501,8 @@ async function runSingleAgent(
 			});
 			childProc = proc;
 			let buffer = "";
+			let closed = false;
+			let abortEscalationTimer: ReturnType<typeof setTimeout> | undefined;
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -529,34 +559,50 @@ async function runSingleAgent(
 				currentResult.stderr += data.toString();
 			});
 
+			const cleanupAbortTimer = () => {
+				if (abortEscalationTimer) {
+					clearTimeout(abortEscalationTimer);
+					abortEscalationTimer = undefined;
+				}
+			};
+
 			proc.on("close", (code) => {
+				closed = true;
+				cleanupAbortTimer();
+				runAbortController.signal.removeEventListener("abort", killProc);
 				if (timeout) {
 					clearTimeout(timeout);
 					timeout = undefined;
 				}
 				if (!wasTimedOut && buffer.trim()) processLine(buffer);
-				resolve(wasTimedOut ? 124 : code ?? 0);
+				resolve(wasTimedOut ? 124 : code ?? (wasAborted ? 130 : 0));
 			});
 
 			proc.on("error", () => {
+				closed = true;
+				cleanupAbortTimer();
+				runAbortController.signal.removeEventListener("abort", killProc);
 				if (timeout) {
 					clearTimeout(timeout);
 					timeout = undefined;
 				}
-				resolve(wasTimedOut ? 124 : 1);
+				resolve(wasTimedOut ? 124 : wasAborted ? 130 : 1);
 			});
 
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
+			const killProc = () => {
+				wasAborted = true;
+				currentResult.stopReason = "aborted";
+				const requestedAt = registry.getRun(run.id)?.cancelRequestedAt ?? Date.now();
+				const elapsed = formatElapsedDuration(requestedAt - run.startedAt);
+				currentResult.errorMessage = currentResult.errorMessage || `Subagent cancelled after ${elapsed}. Partial output retained.`;
+				if (!closed) proc.kill("SIGTERM");
+				abortEscalationTimer = setTimeout(() => {
+					if (!closed) proc.kill("SIGKILL");
+				}, 5000);
+				(abortEscalationTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+			};
+			if (runAbortController.signal.aborted) killProc();
+			else runAbortController.signal.addEventListener("abort", killProc, { once: true });
 		});
 		const timeoutMs = await getTimeoutForAgent(agentName);
 		const exitCode = timeoutMs
@@ -582,7 +628,13 @@ async function runSingleAgent(
 			timeout = undefined;
 		}
 
-		currentResult.exitCode = exitCode;
+		currentResult.exitCode = wasAborted && exitCode === 0 ? 130 : exitCode;
+		if (wasAborted) {
+			currentResult.stopReason = "aborted";
+			const requestedAt = registry.getRun(run.id)?.cancelRequestedAt ?? Date.now();
+			const elapsed = formatElapsedDuration(requestedAt - run.startedAt);
+			currentResult.errorMessage = currentResult.errorMessage || `Subagent cancelled after ${elapsed}. Partial output retained.`;
+		}
 		const finalOutput = getFinalOutput(currentResult.messages);
 		debugLog(
 			`runSingleAgent complete: agent=${agentName}; runId=${run.id}; exitCode=${exitCode}; stopReason=${currentResult.stopReason ?? "none"}; errorMessage=${currentResult.errorMessage ?? "none"}; stderrLength=${currentResult.stderr.length}; messages=${currentResult.messages.length}; finalOutputLength=${finalOutput.length}; hasHandoffKey=${/"(?:handoff|handoffs|delegate|delegates|delegations)"\s*:/.test(finalOutput)}; finalOutputTail=${JSON.stringify(debugPreview(finalOutput.slice(-1200)))}`,
@@ -596,7 +648,7 @@ async function runSingleAgent(
 					: "failed";
 		registry.finishRun(run.id, {
 			status: finalStatus,
-			exitCode,
+			exitCode: currentResult.exitCode,
 			stopReason: currentResult.stopReason,
 			errorMessage: currentResult.errorMessage,
 			stderr: currentResult.stderr,
@@ -613,9 +665,11 @@ async function runSingleAgent(
 		currentResult.transcriptSegments = storedRun?.transcriptSegments;
 		currentResult.childSessionRef = storedRun?.childSessionRef;
 		currentResult.transcriptStorageError = storedRun?.transcriptStorageError;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		emitUpdate();
 		return currentResult;
 	} finally {
+		signal?.removeEventListener("abort", forwardParentAbort);
+		registry.detachAbortController(run.id, runAbortController);
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);
@@ -950,6 +1004,10 @@ function startBackgroundSubagentRun(options: {
 			);
 			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 			if (isError) {
+				if (result.stopReason === "aborted") {
+					await cancelJob(options.jobId);
+					return;
+				}
 				const errorMsg = result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
 				await failJob(options.jobId, errorMsg);
 				return;

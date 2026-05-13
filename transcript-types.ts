@@ -1,6 +1,6 @@
 import type { Message } from "@earendil-works/pi-ai";
 
-export type SubagentRunStatus = "running" | "done" | "failed" | "aborted";
+export type SubagentRunStatus = "running" | "cancelling" | "done" | "failed" | "aborted";
 export type SubagentRunMode = "single" | "parallel" | "chain";
 export type AgentSource = "package" | "user" | "project" | "unknown";
 
@@ -65,6 +65,9 @@ export interface SubagentRunRecord {
 	stopReason?: string;
 	errorMessage?: string;
 	stderr?: string;
+
+	/** When cancellation was requested, used to show elapsed time before cancel. */
+	cancelRequestedAt?: number;
 
 	/** Live event stream, with high-frequency updates coalesced while a run is active. */
 	liveEvents: StoredTranscriptEvent[];
