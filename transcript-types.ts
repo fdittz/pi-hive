@@ -93,6 +93,18 @@ export interface SubagentRunRecord {
 	/** Transcript segments, used when a run is continued after the initial process exits. */
 	transcriptSegments?: TranscriptSegmentRef[];
 
+	/** Number of steering messages accepted by the child RPC session but not yet observed as running. */
+	pendingSteeringMessages?: number;
+
+	/** Number of follow-up messages accepted by the child RPC session but not yet observed as running. */
+	pendingFollowUpMessages?: number;
+
+	/** Total pending messages reported by the child RPC session, when available. */
+	pendingInputMessages?: number;
+
+	/** Last input delivery error shown in the overlay footer. */
+	inputErrorMessage?: string;
+
 	/** Real child pi session used to continue this subagent run. Missing means view-only. */
 	childSessionRef?: ChildSessionRef;
 

@@ -1,4 +1,4 @@
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, getSelectListTheme, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { colorAgentText } from "./agent-colors.js";
 import type { LiveSubagentRegistry } from "./live-registry.js";
@@ -169,6 +169,8 @@ export class SubagentOverlay implements Component {
 	private notifiedCancelledRunIds = new Set<string>();
 	private cancelCloseTimer?: ReturnType<typeof setTimeout>;
 	private cancelCloseTriggered = false;
+	private editorsByRunId = new Map<string, CustomEditor>();
+	private inputHistoryByRunId = new Map<string, string[]>();
 	private unsubscribe?: () => void;
 	private renderTimer?: ReturnType<typeof setTimeout>;
 	private disposed = false;
@@ -176,6 +178,7 @@ export class SubagentOverlay implements Component {
 	constructor(
 		private tui: TUI,
 		private theme: Theme,
+		private keybindings: KeybindingsManager,
 		private done: () => void,
 		private registry: LiveSubagentRegistry,
 		private initialRunId?: string,
@@ -203,7 +206,10 @@ export class SubagentOverlay implements Component {
 		const run = runs[this.selectedIndex];
 
 		const header = this.renderHeader(run, runs.length, safeWidth);
-		const footer = this.renderFooter(run, safeWidth);
+		const rawEditorLines = this.renderInputEditor(run, safeWidth);
+		const maxEditorLines = Math.max(0, height - header.length - 3);
+		const editorLines = rawEditorLines.slice(0, maxEditorLines);
+		const footer = this.renderFooter(run, safeWidth, editorLines);
 		const bodyHeight = Math.max(1, height - header.length - footer.length);
 		const viewport = this.transcriptView.renderRunViewport(
 			run,
@@ -246,8 +252,11 @@ export class SubagentOverlay implements Component {
 		if (this.shouldCloseAfterCancel()) return;
 
 		const run = this.getSelectedRun();
+		const editor = run ? this.getEditorForRun(run) : undefined;
+		const hasInputController = Boolean(run && this.registry.getInputController(run.id));
+		const editorHasText = Boolean(editor && editor.getText().length > 0);
 		const confirmCancelWithCtrlC = matchesKey(data, "ctrl+c") && (!this.selectedText || this.cancelConfirmationRunId === run?.id);
-		const confirmCancelWithX = matchesKey(data, "x") || data === "X";
+		const confirmCancelWithX = !hasInputController && (matchesKey(data, "x") || data === "X");
 		if ((confirmCancelWithX || confirmCancelWithCtrlC) && run && canCancelStatus(run.status)) {
 			this.cancelSelectedRun();
 			return;
@@ -264,7 +273,7 @@ export class SubagentOverlay implements Component {
 			return;
 		}
 
-		if (matchesKey(data, "ctrl+shift+o") || matchesKey(data, "alt+o") || matchesKey(data, Key.escape) || data === "q") {
+		if (matchesKey(data, "ctrl+shift+o") || matchesKey(data, "alt+o") || matchesKey(data, Key.escape) || (!hasInputController && data === "q")) {
 			this.done();
 			return;
 		}
@@ -274,19 +283,23 @@ export class SubagentOverlay implements Component {
 			this.tui.requestRender();
 			return;
 		}
-		if (matchesKey(data, Key.left)) {
+		if (editor && (matchesKey(data, "alt+enter") || matchesKey(data, "alt+return") || data === "\x1b\r" || data === "\x1b\n")) {
+			void this.submitEditorText("followUp", run);
+			return;
+		}
+		if (matchesKey(data, Key.left) && !editorHasText) {
 			this.selectRelative(-1);
 			return;
 		}
-		if (matchesKey(data, Key.right)) {
+		if (matchesKey(data, Key.right) && !editorHasText) {
 			this.selectRelative(1);
 			return;
 		}
-		if (matchesKey(data, Key.up)) {
+		if (matchesKey(data, Key.up) && !this.shouldRouteVerticalToEditor(run, editor)) {
 			this.scrollBy(-1);
 			return;
 		}
-		if (matchesKey(data, Key.down)) {
+		if (matchesKey(data, Key.down) && !this.shouldRouteVerticalToEditor(run, editor)) {
 			this.scrollBy(1);
 			return;
 		}
@@ -298,15 +311,22 @@ export class SubagentOverlay implements Component {
 			this.scrollBy(Math.max(5, this.tui.terminal.rows - 6));
 			return;
 		}
-		if (matchesKey(data, Key.home)) {
+		if (matchesKey(data, Key.home) && !editorHasText) {
 			this.scrollOffset = 0;
 			this.stickToBottom = false;
 			this.tui.requestRender();
 			return;
 		}
-		if (matchesKey(data, Key.end)) {
+		if (matchesKey(data, Key.end) && !editorHasText) {
 			this.scrollOffset = this.getMaxScroll();
 			this.stickToBottom = true;
+			this.tui.requestRender();
+			return;
+		}
+
+		if (editor) {
+			this.clearSelection();
+			editor.handleInput(data);
 			this.tui.requestRender();
 		}
 	}
@@ -333,6 +353,80 @@ export class SubagentOverlay implements Component {
 		this.restoreCursor();
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+	}
+
+	private getEditorForRun(run: SubagentRunRecord): CustomEditor {
+		let editor = this.editorsByRunId.get(run.id);
+		if (!editor) {
+			editor = new CustomEditor(
+				this.tui,
+				{
+					borderColor: (text: string) => colorAgentText(this.theme, run.agentColor, text, "borderAccent"),
+					selectList: getSelectListTheme(),
+				},
+				this.keybindings,
+				{ paddingX: 1 },
+			);
+			editor.onSubmit = (text) => {
+				void this.submitInputText("steer", run, text, editor!);
+			};
+			this.editorsByRunId.set(run.id, editor);
+		}
+		return editor;
+	}
+
+	private renderInputEditor(run: SubagentRunRecord, width: number): string[] {
+		const editor = this.getEditorForRun(run);
+		for (const candidate of this.editorsByRunId.values()) candidate.focused = candidate === editor;
+		editor.disableSubmit = !this.registry.getInputController(run.id);
+		return editor.render(width);
+	}
+
+	private shouldRouteVerticalToEditor(run: SubagentRunRecord | undefined, editor: CustomEditor | undefined): boolean {
+		if (!run || !editor) return false;
+		if (editor.getText().length > 0) return true;
+		return (this.inputHistoryByRunId.get(run.id)?.length ?? 0) > 0;
+	}
+
+	private rememberInput(runId: string, text: string, editor: CustomEditor): void {
+		editor.addToHistory(text);
+		const history = this.inputHistoryByRunId.get(runId) ?? [];
+		history.push(text);
+		if (history.length > 50) history.splice(0, history.length - 50);
+		this.inputHistoryByRunId.set(runId, history);
+	}
+
+	private async submitEditorText(kind: "steer" | "followUp", run: SubagentRunRecord): Promise<void> {
+		const editor = this.getEditorForRun(run);
+		const text = editor.getExpandedText().trim();
+		if (!text) return;
+		editor.setText("");
+		await this.submitInputText(kind, run, text, editor);
+	}
+
+	private async submitInputText(kind: "steer" | "followUp", run: SubagentRunRecord, text: string, editor: CustomEditor): Promise<void> {
+		const trimmed = text.trim();
+		if (!trimmed) return;
+		this.rememberInput(run.id, trimmed, editor);
+		this.clearSelection();
+		this.stickToBottom = true;
+		this.scrollOffset = this.getMaxScroll();
+		this.tui.requestRender();
+
+		const controller = this.registry.getInputController(run.id);
+		if (!controller) {
+			this.showCopyNotice("Input unavailable for this run", "warning");
+			return;
+		}
+
+		try {
+			if (kind === "steer") await controller.steer(trimmed);
+			else await controller.followUp(trimmed);
+			this.showCopyNotice(kind === "steer" ? "Steering sent" : "Follow-up queued", "success");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.showCopyNotice(`Input failed: ${message}`, "error");
+		}
 	}
 
 	private scheduleRender(): void {
@@ -629,7 +723,7 @@ export class SubagentOverlay implements Component {
 		const displayId = run.id.startsWith("bg_") ? run.id : getRunShortId(run.id);
 		const ctx = `${this.theme.fg("muted", "id:")} ${this.theme.fg("dim", displayId)} ${this.theme.fg("muted", "elapsed:")} ${this.theme.fg("dim", elapsed)} ${this.theme.fg("muted", "cwd:")} ${this.theme.fg("dim", shortCwd(run.cwd || process.cwd()))}`;
 		const helpText = isLiveStatus(run.status)
-			? "←/→ agent · ↑/↓ scroll · x cancel · drag select · Ctrl+C copy/cancel · Ctrl+O expand · Alt+O/Esc/q back"
+			? "Enter steer · Alt+Enter follow-up · Shift+Enter newline · PgUp/PgDn scroll · Ctrl+C cancel · Ctrl+O expand · Alt+O/Esc back"
 			: "←/→ agent · ↑/↓ scroll · drag select · Ctrl+C copy · Alt+O/Esc/q back";
 		const help = this.theme.fg("dim", helpText);
 		return [top, truncateToWidth(title, width), truncateToWidth(ctx, width), truncateToWidth(help, width), top];
@@ -653,22 +747,31 @@ export class SubagentOverlay implements Component {
 		}
 	}
 
-	private renderFooter(run: SubagentRunRecord, width: number): string[] {
+	private renderFooter(run: SubagentRunRecord, width: number, editorLines: string[]): string[] {
 		const state = this.expanded ? "expanded" : "collapsed";
 		const line = this.theme.fg("borderAccent", "─".repeat(Math.max(0, width)));
 		const notice = this.copyNotice ? ` · ${this.theme.fg(this.copyNotice.color, this.copyNotice.message)}` : "";
-		let footer = `${this.theme.fg("dim", run.resultOutput !== undefined ? "View: full result" : `View: ${state}`)}${notice}`;
+		const pendingParts: string[] = [];
+		if (run.pendingSteeringMessages) pendingParts.push(`${run.pendingSteeringMessages} steering`);
+		if (run.pendingFollowUpMessages) pendingParts.push(`${run.pendingFollowUpMessages} follow-up`);
+		if (!pendingParts.length && run.pendingInputMessages) pendingParts.push(`${run.pendingInputMessages} queued`);
+		const pending = pendingParts.length ? ` · ${this.theme.fg("warning", `queued: ${pendingParts.join(", ")}`)}` : "";
+		const inputState = this.registry.getInputController(run.id)
+			? this.theme.fg("dim", "Input: Enter steer · Alt+Enter follow-up")
+			: this.theme.fg("dim", "Input: unavailable for finished/historical runs");
+		const inputError = run.inputErrorMessage ? ` · ${this.theme.fg("error", run.inputErrorMessage)}` : "";
+		let footer = `${this.theme.fg("dim", run.resultOutput !== undefined ? "View: full result" : `View: ${state}`)} · ${inputState}${pending}${inputError}${notice}`;
 		if (this.cancelConfirmationRunId === run.id) {
 			footer = this.theme.fg(
 				"warning",
-				"⚠️ Confirm cancel? Press 'x' or Ctrl+C again to cancel (or any other key to dismiss)",
+				"⚠️ Confirm cancel? Press Ctrl+C again to cancel (or any other key to dismiss)",
 			);
 		} else if (run.status === "cancelling") {
 			footer = `${this.theme.fg("warning", `Cancelling... elapsed ${formatDuration(elapsedMs(run))}`)}${notice}`;
 		} else if ((run.status === "aborted" || run.status === "cancelled") && run.id === this.cancelRequestedRunId) {
 			footer = `${this.theme.fg("warning", `Cancelled after ${formatDuration(elapsedMs(run, true))}`)} ${this.theme.fg("dim", "- Press any key to close")}`;
 		}
-		return [line, truncateToWidth(footer, width)];
+		return [line, truncateToWidth(footer, width), ...editorLines];
 	}
 
 	private renderEmpty(width: number, height: number): string[] {

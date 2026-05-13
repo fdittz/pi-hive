@@ -9,10 +9,9 @@
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
  *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
  *
- * Uses JSON mode to capture structured output from subagents.
+ * Uses RPC mode to stream child events and accept live steering/follow-up input.
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -61,7 +60,7 @@ import {
 	openSubagentHandoffConfig,
 	shouldAskApprovalForHandoff,
 } from "./handoff.js";
-import { LiveSubagentRegistry } from "./live-registry.js";
+import { LiveSubagentRegistry, type SubagentInputController } from "./live-registry.js";
 import { formatModelRef, loadSubagentModelConfig, resolveAgentModel } from "./model-overrides.js";
 import { openSubagentModelSelector } from "./model-selector.js";
 import { buildSubagentHeaderEnv, isSubagentChildProcess, registerSubagentRequestHeaders } from "./request-headers.js";
@@ -84,13 +83,14 @@ import {
 	type TimeoutMs,
 } from "./subagent-timeout.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
-import { getPiInvocation } from "./pi-invocation.js";
+import { SubagentRpcClient } from "./subagent-rpc-client.js";
 import { TranscriptStorage } from "./transcript-storage.js";
 import { appendCoalescedTranscriptEvent, formatRunLabel, shouldPersistReplayEvent, type ChildSessionRef, type StoredTranscriptEvent, type SubagentRunMode, type SubagentRunRecord, type TranscriptSegmentRef, type TranscriptStorageRef } from "./transcript-types.js";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
+const AUTO_RETRY_WAIT_TIMEOUT_MS = 30_000;
 
 function debugLog(message: string): void {
 	if (process.env.PI_HIVE_DEBUG !== "1" && process.env.PI_SUBAGENT_DEBUG !== "1") return;
@@ -418,7 +418,7 @@ async function runSingleAgent(
 		}
 	}
 
-	const args: string[] = ["--mode", "json", "-p"];
+	const args: string[] = ["--mode", "rpc"];
 	if (childSessionPath) args.push("--session", childSessionPath);
 	else args.push("--no-session");
 	if (resolvedModel.modelArg) args.push("--model", resolvedModel.modelArg);
@@ -476,90 +476,190 @@ async function runSingleAgent(
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
-		args.push(`Task: ${task}`);
 		let wasAborted = false;
 		let wasTimedOut = false;
-		let childProc: ReturnType<typeof spawn> | undefined;
 		let timeout: ReturnType<typeof setTimeout> | undefined;
+		let abortEscalationTimer: ReturnType<typeof setTimeout> | undefined;
+		let rpcClient: SubagentRpcClient | undefined;
 		const segmentEvents: StoredTranscriptEvent[] = [];
+		const seenMessageKeys = new Set<string>();
+		let pendingSteeringMessages = 0;
+		let pendingFollowUpMessages = 0;
+		let initialPromptStarted = false;
+		let childIsCompacting = false;
+		let childIsRetrying = false;
+		let waitingForCompactionRetry = false;
+		let retryWaitStartedAt: number | undefined;
+		let inputController: SubagentInputController | undefined;
+		let liveInputAttached = false;
 
-		const childExit = new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const childEnv = {
-				...process.env,
-				...buildSubagentHeaderEnv({
-					agent: agentName,
-					runId: run.id,
-					mode: runMeta.mode,
-					source: agent.source,
-					parentToolCallId: runMeta.parentToolCallId,
-				}),
-			};
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: effectiveCwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: childEnv,
+		const attachLiveInputController = () => {
+			if (!inputController || liveInputAttached) return;
+			registry.attachInputController(run.id, inputController);
+			liveInputAttached = true;
+		};
+
+		const detachLiveInputController = () => {
+			if (!inputController) return;
+			registry.detachInputController(run.id, inputController);
+			liveInputAttached = false;
+		};
+
+		const assertAcceptingLiveInput = () => {
+			if (liveInputAttached) return;
+			const message = "Subagent is not currently streaming; live input is unavailable for this run.";
+			updateInputState({ inputErrorMessage: message });
+			throw new Error(message);
+		};
+
+		const messageKey = (message: Message): string => {
+			const maybeId = (message as any).id;
+			if (typeof maybeId === "string" && maybeId) return maybeId;
+			return `${message.role}:${JSON.stringify(message.content)}`;
+		};
+
+		const updateInputState = (extra: { pendingInputMessages?: number; inputErrorMessage?: string } = {}) => {
+			registry.updateInputState(run.id, {
+				pendingSteeringMessages,
+				pendingFollowUpMessages,
+				...extra,
 			});
-			childProc = proc;
-			let buffer = "";
-			let closed = false;
-			let abortEscalationTimer: ReturnType<typeof setTimeout> | undefined;
+		};
 
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
+		const refreshPendingInputState = async () => {
+			if (!rpcClient || rpcClient.isClosed()) return;
+			try {
+				const state = await rpcClient.getState();
+				if (state.pendingMessageCount === 0) {
+					pendingSteeringMessages = 0;
+					pendingFollowUpMessages = 0;
 				}
+				updateInputState({ pendingInputMessages: state.pendingMessageCount, inputErrorMessage: undefined });
+			} catch {
+				/* Best-effort status only. */
+			}
+		};
 
-				const transcriptEvent = event as StoredTranscriptEvent;
-				appendCoalescedTranscriptEvent(segmentEvents, transcriptEvent);
-				registry.recordEvent(run.id, transcriptEvent);
-				if (shouldPersistReplayEvent(transcriptEvent)) {
-					registry.recordReplayEvent(run.id, transcriptEvent);
+		const recordMessage = (message: Message) => {
+			const key = messageKey(message);
+			if (seenMessageKeys.has(key)) return;
+			seenMessageKeys.add(key);
+			currentResult.messages.push(message);
+
+			if (message.role === "assistant") {
+				currentResult.usage.turns++;
+				const usage = message.usage;
+				if (usage) {
+					currentResult.usage.input += usage.input || 0;
+					currentResult.usage.output += usage.output || 0;
+					currentResult.usage.cacheRead += usage.cacheRead || 0;
+					currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+					currentResult.usage.cost += usage.cost?.total || 0;
+					currentResult.usage.contextTokens = usage.totalTokens || 0;
 				}
+				if (!currentResult.model && message.model) currentResult.model = message.model;
+				if (message.stopReason) currentResult.stopReason = message.stopReason;
+				if (message.errorMessage) currentResult.errorMessage = message.errorMessage;
+			}
+		};
 
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
+		const processRpcEvent = (event: any) => {
+			const transcriptEvent = event as StoredTranscriptEvent;
+			appendCoalescedTranscriptEvent(segmentEvents, transcriptEvent);
+			registry.recordEvent(run.id, transcriptEvent);
+			if (shouldPersistReplayEvent(transcriptEvent)) {
+				registry.recordReplayEvent(run.id, transcriptEvent);
+			}
 
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+			if (event.type === "compaction_start") childIsCompacting = true;
+			if (event.type === "compaction_end") {
+				childIsCompacting = false;
+				waitingForCompactionRetry = event.willRetry === true;
+				if (waitingForCompactionRetry) retryWaitStartedAt ??= Date.now();
+			}
+			if (event.type === "auto_retry_start") {
+				childIsRetrying = true;
+				retryWaitStartedAt ??= Date.now();
+			}
+			if (event.type === "auto_retry_end") {
+				childIsRetrying = false;
+				retryWaitStartedAt = undefined;
+			}
+
+			if (event.type === "agent_start") {
+				waitingForCompactionRetry = false;
+				retryWaitStartedAt = undefined;
+				attachLiveInputController();
+				if (!initialPromptStarted) {
+					initialPromptStarted = true;
+				} else if (pendingSteeringMessages > 0) {
+					pendingSteeringMessages--;
+				} else if (pendingFollowUpMessages > 0) {
+					pendingFollowUpMessages--;
+				}
+				updateInputState({ inputErrorMessage: undefined });
+			}
+
+			if (event.type === "message_end" && event.message) {
+				recordMessage(event.message as Message);
+				emitUpdate();
+			}
+
+			if (event.type === "agent_end") {
+				detachLiveInputController();
+				if (Array.isArray(event.messages)) {
+					for (const message of event.messages) recordMessage(message as Message);
+					emitUpdate();
+					void refreshPendingInputState();
+				}
+			}
+		};
+
+		const childEnv = {
+			...process.env,
+			...buildSubagentHeaderEnv({
+				agent: agentName,
+				runId: run.id,
+				mode: runMeta.mode,
+				source: agent.source,
+				parentToolCallId: runMeta.parentToolCallId,
+			}),
+		};
+
+		const childExit = (async (): Promise<number> => {
+			rpcClient = new SubagentRpcClient({ args, cwd: effectiveCwd, env: childEnv });
+			rpcClient.onEvent(processRpcEvent);
+
+			inputController = {
+				steer: async (message: string) => {
+					assertAcceptingLiveInput();
+					pendingSteeringMessages++;
+					updateInputState({ inputErrorMessage: undefined });
+					try {
+						await rpcClient!.steer(message);
+						await refreshPendingInputState();
+					} catch (error) {
+						pendingSteeringMessages = Math.max(0, pendingSteeringMessages - 1);
+						const text = error instanceof Error ? error.message : String(error);
+						updateInputState({ inputErrorMessage: text });
+						throw error;
 					}
-					emitUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
+				},
+				followUp: async (message: string) => {
+					assertAcceptingLiveInput();
+					pendingFollowUpMessages++;
+					updateInputState({ inputErrorMessage: undefined });
+					try {
+						await rpcClient!.followUp(message);
+						await refreshPendingInputState();
+					} catch (error) {
+						pendingFollowUpMessages = Math.max(0, pendingFollowUpMessages - 1);
+						const text = error instanceof Error ? error.message : String(error);
+						updateInputState({ inputErrorMessage: text });
+						throw error;
+					}
+				},
 			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
-			});
 
 			const cleanupAbortTimer = () => {
 				if (abortEscalationTimer) {
@@ -568,44 +668,106 @@ async function runSingleAgent(
 				}
 			};
 
-			proc.on("close", (code) => {
-				closed = true;
-				cleanupAbortTimer();
-				runAbortController.signal.removeEventListener("abort", killProc);
-				if (timeout) {
-					clearTimeout(timeout);
-					timeout = undefined;
-				}
-				if (!wasTimedOut && buffer.trim()) processLine(buffer);
-				resolve(wasTimedOut ? 124 : code ?? (wasAborted ? 130 : 0));
-			});
-
-			proc.on("error", () => {
-				closed = true;
-				cleanupAbortTimer();
-				runAbortController.signal.removeEventListener("abort", killProc);
-				if (timeout) {
-					clearTimeout(timeout);
-					timeout = undefined;
-				}
-				resolve(wasTimedOut ? 124 : wasAborted ? 130 : 1);
-			});
-
-			const killProc = () => {
+			const killClient = () => {
 				wasAborted = true;
 				currentResult.stopReason = "aborted";
 				const requestedAt = registry.getRun(run.id)?.cancelRequestedAt ?? Date.now();
 				const elapsed = formatElapsedDuration(requestedAt - run.startedAt);
 				currentResult.errorMessage = currentResult.errorMessage || `Subagent cancelled after ${elapsed}. Partial output retained.`;
-				if (!closed) proc.kill("SIGTERM");
+				void rpcClient?.abort().catch(() => undefined);
+				rpcClient?.kill("SIGTERM");
 				abortEscalationTimer = setTimeout(() => {
-					if (!closed) proc.kill("SIGKILL");
+					rpcClient?.kill("SIGKILL");
 				}, 5000);
 				(abortEscalationTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
 			};
-			if (runAbortController.signal.aborted) killProc();
-			else runAbortController.signal.addEventListener("abort", killProc, { once: true });
-		});
+
+			const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+			try {
+				await rpcClient.start();
+				if (runAbortController.signal.aborted) killClient();
+				else runAbortController.signal.addEventListener("abort", killClient, { once: true });
+
+				let seenAgentEnds = rpcClient.getAgentEndCount();
+				await rpcClient.prompt(`Task: ${task}`);
+				agentLifecycle: while (true) {
+					await rpcClient.waitForAgentEndAfter(seenAgentEnds, runAbortController.signal);
+					detachLiveInputController();
+					seenAgentEnds = rpcClient.getAgentEndCount();
+
+					let pollDelayMs = 150;
+					while (true) {
+						await wait(pollDelayMs);
+						pollDelayMs = 100;
+
+						let state;
+						try {
+							state = await rpcClient.getState();
+						} catch {
+							state = undefined;
+						}
+						if (!state) break agentLifecycle;
+
+						if (state.pendingMessageCount === 0) {
+							pendingSteeringMessages = 0;
+							pendingFollowUpMessages = 0;
+						}
+						updateInputState({ pendingInputMessages: state.pendingMessageCount, inputErrorMessage: undefined });
+
+						const isRetrying = (state as { isRetrying?: boolean }).isRetrying === true;
+						const retryStillActive = isRetrying || childIsRetrying || waitingForCompactionRetry;
+						if (retryStillActive) {
+							const now = Date.now();
+							retryWaitStartedAt ??= now;
+							if (now - retryWaitStartedAt > AUTO_RETRY_WAIT_TIMEOUT_MS) {
+								// A stuck child retry should not leave the parent waiting forever.
+								childIsRetrying = false;
+								waitingForCompactionRetry = false;
+								debugLog(`Retry wait timed out for ${run.id}; treating child as complete.`);
+								break agentLifecycle;
+							}
+						} else {
+							retryWaitStartedAt = undefined;
+						}
+
+						if (state.isCompacting || childIsCompacting || retryStillActive) {
+							// Compaction and retry can continue after agent_end; keep polling until
+							// the child is truly idle so the final result is not cut off by RPC stop.
+							continue;
+						}
+
+						if (!state.isStreaming && state.pendingMessageCount > 0) {
+							// Stale queued input without an active stream: the child already finished,
+							// so no further agent_end event will arrive for the parent to observe.
+							break agentLifecycle;
+						}
+						if (!state.isStreaming && state.pendingMessageCount === 0) break agentLifecycle;
+
+						// The child is still streaming or delivering queued input; wait for its next agent_end.
+						break;
+					}
+				}
+				return wasAborted ? 130 : 0;
+			} catch (error) {
+				if (wasTimedOut) return 124;
+				if (wasAborted || runAbortController.signal.aborted) return 130;
+				const text = error instanceof Error ? error.message : String(error);
+				currentResult.stderr += currentResult.stderr && !currentResult.stderr.endsWith("\n") ? `\n${text}\n` : `${text}\n`;
+				return rpcClient.getExitCode() ?? 1;
+			} finally {
+				cleanupAbortTimer();
+				runAbortController.signal.removeEventListener("abort", killClient);
+				detachLiveInputController();
+				pendingSteeringMessages = 0;
+				pendingFollowUpMessages = 0;
+				updateInputState({ pendingInputMessages: 0, inputErrorMessage: undefined });
+				const stderr = rpcClient.getStderr();
+				if (stderr && !currentResult.stderr.includes(stderr)) currentResult.stderr += stderr;
+				await rpcClient.stop();
+			}
+		})();
+
 		const timeoutMs = await getTimeoutForAgent(agentName);
 		const exitCode = timeoutMs
 			? await Promise.race([
@@ -618,7 +780,7 @@ async function runSingleAgent(
 							currentResult.stopReason = "error";
 							currentResult.errorMessage = message;
 							currentResult.stderr += currentResult.stderr && !currentResult.stderr.endsWith("\n") ? `\n${message}\n` : `${message}\n`;
-							if (childProc && !childProc.killed) childProc.kill("SIGKILL");
+							rpcClient?.kill("SIGKILL");
 							resolve(124);
 						}, timeoutMs);
 						(timeout as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
@@ -629,6 +791,7 @@ async function runSingleAgent(
 			clearTimeout(timeout);
 			timeout = undefined;
 		}
+		if (wasTimedOut) await childExit.catch(() => 124);
 
 		currentResult.exitCode = wasAborted && exitCode === 0 ? 130 : exitCode;
 		if (wasAborted) {
@@ -778,10 +941,10 @@ async function openSubagentsOverlay(ctx: ExtensionContext, pi: ExtensionAPI, run
 	if (warning) ctx.ui.notify(warning, "warning");
 	try {
 		await ctx.ui.custom<void>(
-			(tui, theme, _keybindings, done) => {
+			(tui, theme, keybindings, done) => {
 				const close = () => done(undefined);
 				activeOverlayClose = close;
-				return new SubagentOverlay(tui, theme, close, registry, initialRunId, enqueueCancelledRunFeedback);
+				return new SubagentOverlay(tui, theme, keybindings, close, registry, initialRunId, enqueueCancelledRunFeedback);
 			},
 			{
 				overlay: true,

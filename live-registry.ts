@@ -60,10 +60,23 @@ export interface BackgroundJobRunInput {
 	parentToolCallId?: string;
 }
 
+export interface SubagentInputController {
+	steer(message: string): Promise<void>;
+	followUp(message: string): Promise<void>;
+}
+
+export interface SubagentInputState {
+	pendingSteeringMessages?: number;
+	pendingFollowUpMessages?: number;
+	pendingInputMessages?: number;
+	inputErrorMessage?: string;
+}
+
 export class LiveSubagentRegistry {
 	private runs = new Map<string, SubagentRunRecord>();
 	private subscribers = new Set<() => void>();
 	private abortControllers = new Map<string, AbortController>();
+	private inputControllers = new Map<string, SubagentInputController>();
 	private cancelledRunIds = new Set<string>();
 
 	private touch(run: SubagentRunRecord): void {
@@ -158,6 +171,30 @@ export class LiveSubagentRegistry {
 	detachAbortController(runId: string, controller?: AbortController): void {
 		if (controller && this.abortControllers.get(runId) !== controller) return;
 		this.abortControllers.delete(runId);
+	}
+
+	attachInputController(runId: string, controller: SubagentInputController): void {
+		this.inputControllers.set(runId, controller);
+	}
+
+	detachInputController(runId: string, controller?: SubagentInputController): void {
+		if (controller && this.inputControllers.get(runId) !== controller) return;
+		this.inputControllers.delete(runId);
+	}
+
+	getInputController(runId: string): SubagentInputController | undefined {
+		return this.inputControllers.get(runId);
+	}
+
+	updateInputState(runId: string, state: SubagentInputState): void {
+		const run = this.runs.get(runId);
+		if (!run) return;
+		if (state.pendingSteeringMessages !== undefined) run.pendingSteeringMessages = Math.max(0, state.pendingSteeringMessages);
+		if (state.pendingFollowUpMessages !== undefined) run.pendingFollowUpMessages = Math.max(0, state.pendingFollowUpMessages);
+		if (state.pendingInputMessages !== undefined) run.pendingInputMessages = Math.max(0, state.pendingInputMessages);
+		if ("inputErrorMessage" in state) run.inputErrorMessage = state.inputErrorMessage;
+		this.touch(run);
+		this.notify();
 	}
 
 	cancelRun(runId: string, reason = "Cancelled from subagent overlay"): boolean {
@@ -290,12 +327,14 @@ export class LiveSubagentRegistry {
 	clearRuns(): void {
 		this.runs.clear();
 		this.abortControllers.clear();
+		this.inputControllers.clear();
 		this.cancelledRunIds.clear();
 		this.notify();
 	}
 
 	async hydrateFromSessionEntries(entries: readonly SessionEntry[], storage: TranscriptStorage): Promise<void> {
 		this.runs.clear();
+		this.inputControllers.clear();
 		this.cancelledRunIds.clear();
 		for (const entry of entries) {
 			const anyEntry = entry as any;
