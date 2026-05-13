@@ -23,8 +23,15 @@ import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme, withFileMut
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { colorAgentText } from "./agent-colors.js";
+import {
+	getAutoDelegateConfig,
+	setAutoDelegateConfig,
+	setAutoDelegateEnabled,
+	type AutoDelegateConfig,
+} from "./auto-delegate.js";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { ChildSessionStorage } from "./child-session-storage.js";
+import { findBestAgent, type AgentMatch } from "./delegate.js";
 import { generateSubagentGuidance } from "./delegation-guidance.js";
 import { getCompatibilityWarning } from "./compatibility.js";
 import {
@@ -663,6 +670,169 @@ function shouldIncludeProjectAgentGuidance(prompt: string): boolean {
 	return /(?:\.pi\/agents|agentScope\s*[:=]\s*["']?(?:both|project)\b|\b(?:use|include|enable|list|show|discover|load)\s+(?:trusted\s+)?(?:project[-\s]?local\s+agents?|project agents?)\b)/i.test(prompt);
 }
 
+function formatAutoDelegateStatus(config: AutoDelegateConfig, options?: { offExact?: boolean }): string {
+	if (config.enabled) return `✅ Auto-delegate is ON (threshold: ${config.confidenceThreshold}%)`;
+	return options?.offExact ? "❌ Auto-delegate is OFF" : `❌ Auto-delegate is OFF (threshold: ${config.confidenceThreshold}%)`;
+}
+
+function parseAutoDelegateThreshold(value: string | undefined): number | undefined {
+	if (!value) return undefined;
+	const normalized = value.trim().replace(/%$/, "");
+	if (!/^\d{1,3}$/.test(normalized)) return undefined;
+	const threshold = Number(normalized);
+	if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) return undefined;
+	return threshold;
+}
+
+async function handleAutoDelegateCommand(args: string, ctx: ExtensionContext): Promise<void> {
+	const trimmed = args.trim();
+	if (!trimmed) {
+		const current = await getAutoDelegateConfig();
+		await setAutoDelegateEnabled(!current.enabled);
+		const updated = await getAutoDelegateConfig();
+		ctx.ui.notify(formatAutoDelegateStatus(updated, { offExact: !updated.enabled }), "info");
+		return;
+	}
+
+	const [rawAction, ...rest] = trimmed.split(/\s+/);
+	const action = rawAction.toLowerCase();
+	if (["on", "enable", "enabled", "true", "yes"].includes(action)) {
+		await setAutoDelegateEnabled(true);
+		ctx.ui.notify(formatAutoDelegateStatus(await getAutoDelegateConfig()), "info");
+		return;
+	}
+	if (["off", "disable", "disabled", "false", "no"].includes(action)) {
+		await setAutoDelegateEnabled(false);
+		ctx.ui.notify("❌ Auto-delegate is OFF", "info");
+		return;
+	}
+	if (action === "status") {
+		ctx.ui.notify(formatAutoDelegateStatus(await getAutoDelegateConfig()), "info");
+		return;
+	}
+	if (action === "threshold") {
+		const threshold = parseAutoDelegateThreshold(rest[0]);
+		if (threshold === undefined) {
+			ctx.ui.notify("Usage: /auto-delegate threshold <0-100>", "warning");
+			return;
+		}
+		await setAutoDelegateConfig({ confidenceThreshold: threshold });
+		const updated = await getAutoDelegateConfig();
+		ctx.ui.notify(
+			updated.enabled
+				? formatAutoDelegateStatus(updated)
+				: `Auto-delegate threshold set to ${updated.confidenceThreshold}% (currently OFF)`,
+			"info",
+		);
+		return;
+	}
+
+	ctx.ui.notify("Usage: /auto-delegate [on|off|status|threshold <0-100>]", "warning");
+}
+
+function parseAutoDelegateDirective(text: string): string | undefined {
+	const trimmed = text.trim();
+	const slashMatch = trimmed.match(/^\/(?:auto-delegate|delegate-auto)\b\s*(.*)$/i);
+	if (slashMatch) return slashMatch[1]?.trim() ?? "";
+	if (!trimmed || trimmed.includes("?")) return undefined;
+
+	const target = String.raw`(?:auto[-\s]?delegat(?:e|ion)|automatic\s+agent\s+delegation)`;
+	if (new RegExp(String.raw`^(?:please\s+)?(?:enable|activate)\s+${target}$`, "i").test(trimmed)) return "on";
+	if (new RegExp(String.raw`^(?:please\s+)?(?:turn|switch)\s+on\s+${target}$`, "i").test(trimmed)) return "on";
+	if (new RegExp(String.raw`^${target}\s+on$`, "i").test(trimmed)) return "on";
+	if (new RegExp(String.raw`^(?:please\s+)?(?:disable|deactivate)\s+${target}$`, "i").test(trimmed)) return "off";
+	if (new RegExp(String.raw`^(?:please\s+)?(?:turn|switch)\s+off\s+${target}$`, "i").test(trimmed)) return "off";
+	if (new RegExp(String.raw`^${target}\s+off$`, "i").test(trimmed)) return "off";
+	if (new RegExp(String.raw`^${target}\s+status$`, "i").test(trimmed)) return "status";
+
+	const thresholdMatch =
+		trimmed.match(new RegExp(String.raw`^(?:please\s+)?(?:set|change)\s+${target}\s+threshold\s+(?:to\s+)?(\d{1,3})%?$`, "i")) ??
+		trimmed.match(new RegExp(String.raw`^${target}\s+threshold\s+(\d{1,3})%?$`, "i"));
+	if (thresholdMatch) return `threshold ${thresholdMatch[1]}`;
+
+	return undefined;
+}
+
+async function executeAutoDelegation(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	match: AgentMatch,
+	confidence: number,
+	userMessage: string,
+): Promise<void> {
+	const header = `[AUTO-DELEGATED to ${match.name} (${confidence}% confidence)]`;
+	const agentScope: AgentScope = "user";
+	const discovery = discoverAgents(ctx.cwd, agentScope);
+	const agents = discovery.agents;
+	const sessionFile = getSessionFile(ctx);
+	const parentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
+	const parentThinking = pi.getThinkingLevel();
+	const parentToolCallId = `auto-delegate:${Date.now()}`;
+	const makeDetails = (mode: "single" | "chain") =>
+		(results: SingleResult[]): SubagentDetails => ({
+			mode,
+			agentScope,
+			projectAgentsDir: discovery.projectAgentsDir,
+			results: mode === "chain" ? withSequentialChainSteps(results) : results,
+		});
+
+	ctx.ui.notify(header, "info");
+
+	try {
+		const result = await runSingleAgent(
+			ctx.cwd,
+			agents,
+			match.name,
+			match.suggestedTask,
+			undefined,
+			undefined,
+			ctx.signal,
+			undefined,
+			makeDetails("single"),
+			{ parentToolCallId, mode: "single", index: 0, sessionFile, parentModel, parentThinking },
+		);
+		const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+		const handoffResults = isError
+			? []
+			: await executeHandoffsForResult(
+					ctx,
+					agents,
+					result,
+					ctx.signal,
+					undefined,
+					makeDetails("chain"),
+					{
+						parentToolCallId,
+						mode: "chain",
+						index: 0,
+						sessionFile,
+						parentModel,
+						parentThinking,
+						handoffDepth: 0,
+					},
+				);
+		const allResults = [result, ...handoffResults];
+		const output = isError
+			? result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)"
+			: getFinalOutput(result.messages) || "(no output)";
+		const details = makeDetails(handoffResults.length > 0 ? "chain" : "single")(allResults);
+		pi.sendMessage({
+			customType: "auto-delegate-result",
+			content: `${header}\n\nOriginal request: ${userMessage}\n\n${output}`,
+			display: true,
+			details: { header, agent: match.name, confidence, originalRequest: userMessage, isError, subagent: details },
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		pi.sendMessage({
+			customType: "auto-delegate-result",
+			content: `${header}\n\nOriginal request: ${userMessage}\n\nAuto-delegation failed: ${message}`,
+			display: true,
+			details: { header, agent: match.name, confidence, originalRequest: userMessage, isError: true },
+		});
+	}
+}
+
 async function executeHandoffsForResult(
 	ctx: ExtensionContext,
 	agents: AgentConfig[],
@@ -860,6 +1030,35 @@ export default function (pi: ExtensionAPI) {
 		registry.clearVolatileSubscribers();
 	});
 
+	pi.registerMessageRenderer("auto-delegate-result", (message, _options, theme) => {
+		const details = message.details as { header?: string; isError?: boolean } | undefined;
+		const text =
+			typeof message.content === "string"
+				? message.content
+				: message.content.map((part) => (part.type === "text" ? part.text : "[image]")).join("\n");
+		const [firstLine, ...rest] = text.split("\n");
+		const header = details?.header ?? firstLine ?? "[AUTO-DELEGATED]";
+		const body = rest.join("\n").trim();
+		const container = new Container();
+		container.addChild(new Text(theme.fg(details?.isError ? "error" : "success", theme.bold(header)), 0, 0));
+		if (body) {
+			container.addChild(new Spacer(1));
+			container.addChild(new Markdown(body, 0, 0, getMarkdownTheme()));
+		}
+		return container;
+	});
+
+	const registerAutoDelegateCommand = (name: string) => {
+		pi.registerCommand(name, {
+			description: "Toggle automatic agent delegation",
+			handler: async (args, ctx) => {
+				await handleAutoDelegateCommand(args, ctx);
+			},
+		});
+	};
+	registerAutoDelegateCommand("auto-delegate");
+	registerAutoDelegateCommand("delegate-auto");
+
 	pi.registerCommand("subagents", {
 		description: "Open the live/historical subagent view, optionally focused by run id prefix",
 		handler: async (args, ctx) => {
@@ -954,6 +1153,31 @@ export default function (pi: ExtensionAPI) {
 			},
 		});
 	} else {
+		pi.on("input", async (event, ctx) => {
+			if (event.source === "extension") return { action: "continue" };
+
+			const directive = parseAutoDelegateDirective(event.text);
+			if (directive !== undefined) {
+				await handleAutoDelegateCommand(directive, ctx);
+				return { action: "handled" };
+			}
+
+			const userMessage = event.text.trim();
+			if (!userMessage || userMessage.startsWith("/") || (event.images?.length ?? 0) > 0) return { action: "continue" };
+
+			const config = await getAutoDelegateConfig();
+			if (!config.enabled || !config.autoExecute) return { action: "continue" };
+
+			const match = await findBestAgent(userMessage);
+			if (!match) return { action: "continue" };
+
+			const confidence = Math.round(match.score * 100);
+			if (confidence < config.confidenceThreshold) return { action: "continue" };
+
+			await executeAutoDelegation(pi, ctx, match, confidence, userMessage);
+			return { action: "handled" };
+		});
+
 		pi.registerTool({
 			name: "delegate",
 			label: "Delegate",
@@ -965,7 +1189,6 @@ export default function (pi: ExtensionAPI) {
 				}),
 			}),
 			async execute(_toolCallId, params) {
-				const { findBestAgent } = await import("./delegate.js");
 				const match = await findBestAgent(params.request);
 
 				if (!match) {
