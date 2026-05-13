@@ -180,8 +180,12 @@ export function unregisterBackgroundJobAbortController(id: string): void {
 	abortControllers.delete(id);
 }
 
-export function formatElapsedMilliseconds(ms: number): string {
-	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+export function getElapsedTime(job: BackgroundJob, now = Date.now()): string {
+	const start = new Date(job.startedAt).getTime();
+	if (!Number.isFinite(start)) return "unknown";
+	const completed = job.completedAt ? new Date(job.completedAt).getTime() : NaN;
+	const end = Number.isFinite(completed) ? completed : now;
+	const totalSeconds = Math.max(0, Math.round((end - start) / 1000));
 	if (totalSeconds < 60) return `${totalSeconds}s`;
 	const minutes = Math.floor(totalSeconds / 60);
 	const seconds = totalSeconds % 60;
@@ -189,14 +193,6 @@ export function formatElapsedMilliseconds(ms: number): string {
 	const hours = Math.floor(minutes / 60);
 	const remainingMinutes = minutes % 60;
 	return `${hours}h ${remainingMinutes}m`;
-}
-
-export function getElapsedTime(job: BackgroundJob, now = Date.now()): string {
-	const start = new Date(job.startedAt).getTime();
-	if (!Number.isFinite(start)) return "unknown";
-	const completed = job.completedAt ? new Date(job.completedAt).getTime() : NaN;
-	const end = Number.isFinite(completed) ? completed : now;
-	return formatElapsedMilliseconds(end - start);
 }
 
 export function formatRunningJobs(jobs: BackgroundJob[]): string {

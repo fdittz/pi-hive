@@ -756,17 +756,12 @@ async function openSubagentsOverlay(ctx: ExtensionContext, pi: ExtensionAPI, run
 	const reportedCancelledRunIds = new Set<string>();
 	let feedbackQueue = Promise.resolve();
 	const enqueueCancelledRunFeedback = (runId: string) => {
-		if (!initiallyRunningRunIds.has(runId) || reportedCancelledRunIds.has(runId)) return;
+		if (reportedCancelledRunIds.has(runId)) return;
 		reportedCancelledRunIds.add(runId);
 		feedbackQueue = feedbackQueue
 			.then(async () => {
 				const run = await waitForRunTerminal(runId);
-				const partialResults = extractLatestRunText(run) || "(no partial output captured)";
-				const jobAfterRun = await getBackgroundJob(runId);
-				if (jobAfterRun?.status === "running" || (jobAfterRun?.status === "cancelled" && !jobAfterRun.result)) {
-					await cancelJob(runId, partialResults);
-				}
-				ctx.ui.notify(`Cancelled ${formatRunLabel(run?.agent ?? "subagent", runId)} - partial results saved.`, "info");
+				ctx.ui.notify(`Cancelled ${formatRunLabel(run?.agent ?? "subagent", runId)}`, "info");
 				await refreshBackgroundJobsWidget(ctx);
 			})
 			.catch((error) => {
@@ -897,44 +892,19 @@ function extractLatestAssistantTextFromEvents(events: readonly StoredTranscriptE
 	return "";
 }
 
-function extractLatestRunText(run: SubagentRunRecord | undefined): string {
-	if (!run) return "";
-	return (
-		extractLatestAssistantTextFromEvents(run.liveEvents) ||
-		extractLatestAssistantTextFromEvents(run.replayEvents) ||
-		run.errorMessage ||
-		run.stderr?.trim() ||
-		""
-	);
-}
-
 function extractCancelledBackgroundPartialResult(result: SingleResult, jobId: string): string {
+	const run = registry.getRun(jobId);
 	return (
 		getFinalOutput(result.messages) ||
 		extractLatestAssistantTextFromEvents(result.replayEvents) ||
-		extractLatestRunText(registry.getRun(jobId)) ||
+		extractLatestAssistantTextFromEvents(run?.liveEvents) ||
+		extractLatestAssistantTextFromEvents(run?.replayEvents) ||
 		result.errorMessage ||
 		result.stderr.trim() ||
+		run?.errorMessage ||
+		run?.stderr?.trim() ||
 		"(no partial output captured)"
 	);
-}
-
-function formatCancelledRunSummary(run: SubagentRunRecord | undefined, runId: string): string {
-	const elapsed = run ? formatElapsedDuration((run.cancelRequestedAt ?? run.endedAt ?? Date.now()) - run.startedAt) : "unknown";
-	const partial = extractLatestRunText(run) || "(no partial output captured)";
-	return [
-		"# Subagent run cancelled",
-		"",
-		`- Job ID: \`${runId}\``,
-		"- Status: cancelled",
-		`- Agent: ${run ? `**${run.agent}**` : "unknown"}`,
-		`- Elapsed: ${elapsed}`,
-		`- Task: ${run?.task ?? "unknown"}`,
-		"",
-		"## Partial Results",
-		"",
-		partial,
-	].join("\n");
 }
 
 const BACKGROUND_JOB_MESSAGE_RESULT_LIMIT = 12000;
@@ -1031,11 +1001,14 @@ async function handleSubagentJobsCommand(args: string, ctx: ExtensionContext, pi
 			ctx.ui.notify(`Background job not found: ${id}`, "warning");
 			return;
 		}
-		const body = job.status === "completed" ? job.result || "(no result)" : job.status === "failed" ? job.error || "(no error captured)" : job.status === "cancelled" ? job.result || "Job was cancelled." : "Job is still running.";
-		const heading = job.status === "cancelled" ? "## Partial Results" : "## Result";
+		if (job.status === "cancelled") {
+			sendBackgroundJobCompletionMessage(pi, job);
+			return;
+		}
+		const body = job.status === "completed" ? job.result || "(no result)" : job.status === "failed" ? job.error || "(no error captured)" : "Job is still running.";
 		sendBackgroundJobsMessage(
 			pi,
-			[`# Background job ${job.id}`, "", formatBackgroundJobSummary(job), "", heading, "", body].join("\n"),
+			[`# Background job ${job.id}`, "", formatBackgroundJobSummary(job), "", "## Result", "", body].join("\n"),
 			{ job },
 		);
 		return;
@@ -1058,7 +1031,6 @@ async function handleSubagentJobsCommand(args: string, ctx: ExtensionContext, pi
 		}
 		await cancelJob(id);
 		ctx.ui.notify(`Cancellation requested for background job ${id}.`, "info");
-		sendBackgroundJobsMessage(pi, `# Background job cancellation requested\n\nCancellation requested for \`${id}\`. A final summary with elapsed time and partial results will be posted when the job stops.`, { id });
 		return;
 	}
 
@@ -1191,7 +1163,14 @@ function startBackgroundSubagentRun(options: {
 			const job = await getBackgroundJob(options.jobId);
 			if (job?.status === "cancelled") {
 				if (!job.result) {
-					await cancelJob(options.jobId, extractLatestRunText(registry.getRun(options.jobId)) || "(no partial output captured)");
+					const run = registry.getRun(options.jobId);
+					const partialResult =
+						extractLatestAssistantTextFromEvents(run?.liveEvents) ||
+						extractLatestAssistantTextFromEvents(run?.replayEvents) ||
+						run?.errorMessage ||
+						run?.stderr?.trim() ||
+						"(no partial output captured)";
+					await cancelJob(options.jobId, partialResult);
 				}
 				const cancelledJob = await getBackgroundJob(options.jobId);
 				if (cancelledJob) sendBackgroundJobCompletionMessage(options.pi, cancelledJob);

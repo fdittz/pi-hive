@@ -157,6 +157,8 @@ export class SubagentOverlay implements Component {
 	private cancelRequestedRunId?: string;
 	private cancelConfirmationRunId?: string;
 	private notifiedCancelledRunIds = new Set<string>();
+	private cancelCloseTimer?: ReturnType<typeof setTimeout>;
+	private cancelCloseTriggered = false;
 	private unsubscribe?: () => void;
 	private renderTimer?: ReturnType<typeof setTimeout>;
 	private disposed = false;
@@ -173,6 +175,7 @@ export class SubagentOverlay implements Component {
 		this.setTextCursor();
 		this.unsubscribe = registry.subscribe(() => {
 			this.scheduleRender();
+			this.maybeCloseAfterCancelledRun();
 		});
 	}
 
@@ -230,10 +233,7 @@ export class SubagentOverlay implements Component {
 			return;
 		}
 
-		if (this.shouldCloseAfterCancel()) {
-			this.done();
-			return;
-		}
+		if (this.shouldCloseAfterCancel()) return;
 
 		const run = this.getSelectedRun();
 		const confirmCancelWithCtrlC = matchesKey(data, "ctrl+c") && (!this.selectedText || this.cancelConfirmationRunId === run?.id);
@@ -315,6 +315,10 @@ export class SubagentOverlay implements Component {
 			clearTimeout(this.copyNoticeTimer);
 			this.copyNoticeTimer = undefined;
 		}
+		if (this.cancelCloseTimer) {
+			clearTimeout(this.cancelCloseTimer);
+			this.cancelCloseTimer = undefined;
+		}
 		this.disableMouseReporting();
 		this.restoreCursor();
 		this.unsubscribe?.();
@@ -360,12 +364,21 @@ export class SubagentOverlay implements Component {
 	}
 
 	private shouldCloseAfterCancel(): boolean {
-		const run = this.getSelectedRun();
-		if (run && run.id === this.cancelRequestedRunId && run.status === "aborted") {
-			this.notifyCancelledRun(run.id);
-			return true;
+		return this.maybeCloseAfterCancelledRun();
+	}
+
+	private maybeCloseAfterCancelledRun(): boolean {
+		if (!this.cancelRequestedRunId || this.cancelCloseTriggered) return false;
+		const run = this.registry.getRun(this.cancelRequestedRunId);
+		if (!run || run.status === "running" || run.status === "cancelling") return false;
+		this.cancelCloseTriggered = true;
+		if (this.cancelCloseTimer) {
+			clearTimeout(this.cancelCloseTimer);
+			this.cancelCloseTimer = undefined;
 		}
-		return false;
+		this.notifyCancelledRun(run.id);
+		this.done();
+		return true;
 	}
 
 	private notifyCancelledRun(runId: string): void {
@@ -402,13 +415,23 @@ export class SubagentOverlay implements Component {
 		this.cancelConfirmationRunId = undefined;
 		if (cancelled) {
 			this.cancelRequestedRunId = run.id;
-			this.notifyCancelledRun(run.id);
+			this.cancelCloseTriggered = false;
+			this.scheduleCloseAfterCancel(run.id);
 			this.clearSelection();
 			this.stickToBottom = true;
 			this.transcriptView.invalidate();
 		}
 		this.showCopyNotice(cancelled ? "Cancelling..." : "Unable to cancel this run", cancelled ? "warning" : "error");
 		this.tui.requestRender();
+	}
+
+	private scheduleCloseAfterCancel(runId: string): void {
+		if (this.cancelCloseTimer) clearTimeout(this.cancelCloseTimer);
+		this.cancelCloseTimer = setTimeout(() => {
+			this.cancelCloseTimer = undefined;
+			if (!this.disposed && this.cancelRequestedRunId === runId) this.maybeCloseAfterCancelledRun();
+		}, 3000);
+		(this.cancelCloseTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
 	}
 
 	private handleMouseEvent(event: ParsedMouseEvent): void {
