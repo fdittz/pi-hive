@@ -1520,9 +1520,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await registry.hydrateFromSessionEntries(ctx.sessionManager.getBranch(), transcriptStorage);
+		startBackgroundJobsWidget(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
+		stopBackgroundJobsWidget();
 		activeOverlayClose?.();
 		activeOverlayClose = undefined;
 		registry.clearVolatileSubscribers();
