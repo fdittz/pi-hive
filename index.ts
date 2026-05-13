@@ -1132,15 +1132,30 @@ function startBackgroundSubagentRun(options: {
 	const controller = options.controller ?? new AbortController();
 	if (!options.controller) registerBackgroundJobAbortController(options.jobId, controller);
 
+	let heartbeatStopped = false;
 	let progress = 1;
+	let progressUpdateQueue: Promise<void> = Promise.resolve();
 	const setProgress = (next: number) => {
-		progress = Math.max(progress, Math.min(95, Math.round(next)));
-		void updateJobProgress(options.jobId, progress).catch((error) =>
-			debugLog(`Background job progress update failed: ${error instanceof Error ? error.message : String(error)}`),
-		);
+		if (heartbeatStopped) return;
+		const nextProgress = Math.max(progress, Math.min(95, Math.round(next)));
+		progress = nextProgress;
+		progressUpdateQueue = progressUpdateQueue
+			.then(() => updateJobProgress(options.jobId, nextProgress))
+			.catch((error) =>
+				debugLog(`Background job progress update failed: ${error instanceof Error ? error.message : String(error)}`),
+			);
 	};
 	const heartbeat = setInterval(() => setProgress(progress + 1), 1000);
 	(heartbeat as ReturnType<typeof setInterval> & { unref?: () => void }).unref?.();
+	// Drain queued heartbeat writes before terminal job updates so stale progress
+	// writes cannot race with completed/failed/cancelled status writes.
+	const stopHeartbeat = async () => {
+		if (!heartbeatStopped) {
+			heartbeatStopped = true;
+			clearInterval(heartbeat);
+		}
+		await progressUpdateQueue;
+	};
 	setProgress(1);
 
 	const onBackgroundUpdate: OnUpdateCallback = () => setProgress(progress + 4);
@@ -1171,6 +1186,7 @@ function startBackgroundSubagentRun(options: {
 			if (isError) {
 				if (result.stopReason === "aborted") {
 					const partialResult = extractCancelledBackgroundPartialResult(result, options.jobId);
+					await stopHeartbeat();
 					await cancelJob(options.jobId, partialResult);
 					const cancelledJob = await getBackgroundJob(options.jobId);
 					if (cancelledJob) {
@@ -1180,6 +1196,7 @@ function startBackgroundSubagentRun(options: {
 					return;
 				}
 				const errorMsg = result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+				await stopHeartbeat();
 				await failJob(options.jobId, errorMsg);
 				const failedJob = await getBackgroundJob(options.jobId);
 				if (failedJob) registerBackgroundJobInRegistry(failedJob, options.cwd ?? options.ctx.cwd);
@@ -1203,6 +1220,7 @@ function startBackgroundSubagentRun(options: {
 					handoffDepth: 0,
 				},
 			);
+			await stopHeartbeat();
 			await completeJob(options.jobId, formatBackgroundRunResult([result, ...handoffResults]));
 			const completedJob = await getBackgroundJob(options.jobId);
 			if (completedJob) {
@@ -1212,6 +1230,7 @@ function startBackgroundSubagentRun(options: {
 		} catch (error) {
 			const job = await getBackgroundJob(options.jobId);
 			if (job?.status === "cancelled") {
+				await stopHeartbeat();
 				if (!job.result) {
 					const run = registry.getRun(options.jobId);
 					const partialResult =
@@ -1220,6 +1239,7 @@ function startBackgroundSubagentRun(options: {
 						run?.errorMessage ||
 						run?.stderr?.trim() ||
 						"(no partial output captured)";
+					await stopHeartbeat();
 					await cancelJob(options.jobId, partialResult);
 				}
 				const cancelledJob = await getBackgroundJob(options.jobId);
@@ -1228,12 +1248,13 @@ function startBackgroundSubagentRun(options: {
 					sendBackgroundJobCompletionMessage(options.pi, cancelledJob);
 				}
 			} else {
+				await stopHeartbeat();
 				await failJob(options.jobId, error instanceof Error ? error.message : String(error));
 				const failedJob = await getBackgroundJob(options.jobId);
 				if (failedJob) registerBackgroundJobInRegistry(failedJob, options.cwd ?? options.ctx.cwd);
 			}
 		} finally {
-			clearInterval(heartbeat);
+			await stopHeartbeat();
 			unregisterBackgroundJobAbortController(options.jobId);
 		}
 	})();
