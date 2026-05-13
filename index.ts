@@ -885,9 +885,8 @@ function textFromMessage(message: Message | undefined): string {
 		.join("\n\n");
 }
 
-function extractLatestRunText(run: SubagentRunRecord | undefined): string {
-	if (!run) return "";
-	const events = run.liveEvents.length > 0 ? run.liveEvents : run.replayEvents;
+function extractLatestAssistantTextFromEvents(events: readonly StoredTranscriptEvent[] | undefined): string {
+	if (!events) return "";
 	for (let i = events.length - 1; i >= 0; i--) {
 		const event = events[i];
 		if (event.type !== "message_update" && event.type !== "message_end" && event.type !== "message_start") continue;
@@ -896,7 +895,29 @@ function extractLatestRunText(run: SubagentRunRecord | undefined): string {
 		const text = textFromMessage(message);
 		if (text) return text;
 	}
-	return run.errorMessage || run.stderr?.trim() || "";
+	return "";
+}
+
+function extractLatestRunText(run: SubagentRunRecord | undefined): string {
+	if (!run) return "";
+	return (
+		extractLatestAssistantTextFromEvents(run.liveEvents) ||
+		extractLatestAssistantTextFromEvents(run.replayEvents) ||
+		run.errorMessage ||
+		run.stderr?.trim() ||
+		""
+	);
+}
+
+function extractCancelledBackgroundPartialResult(result: SingleResult, jobId: string): string {
+	return (
+		getFinalOutput(result.messages) ||
+		extractLatestAssistantTextFromEvents(result.replayEvents) ||
+		extractLatestRunText(registry.getRun(jobId)) ||
+		result.errorMessage ||
+		result.stderr.trim() ||
+		"(no partial output captured)"
+	);
 }
 
 function formatCancelledRunSummary(run: SubagentRunRecord | undefined, runId: string): string {
@@ -906,12 +927,12 @@ function formatCancelledRunSummary(run: SubagentRunRecord | undefined, runId: st
 		"# Subagent run cancelled",
 		"",
 		`- Job ID: \`${runId}\``,
-		"- Status: **cancelled**",
+		"- Status: cancelled",
 		`- Agent: ${run ? `**${run.agent}**` : "unknown"}`,
 		`- Elapsed: ${elapsed}`,
 		`- Task: ${run?.task ?? "unknown"}`,
 		"",
-		"## Partial results",
+		"## Partial Results",
 		"",
 		partial,
 	].join("\n");
@@ -928,15 +949,15 @@ function formatBackgroundJobCompletionMessage(job: BackgroundJob): string {
 	const isCancelled = job.status === "cancelled";
 	const result = job.result || (isCancelled ? "(no partial output captured)" : "(no result captured)");
 	return [
-		`# Background job ${job.status}`,
+		isCancelled ? `# Background job cancelled: ${job.id}` : `# Background job ${job.status}`,
 		"",
 		`- Job ID: \`${job.id}\``,
-		`- Status: **${job.status}**`,
+		`- Status: ${job.status}`,
 		`- Agent: **${job.agent}**`,
 		`- Elapsed: ${getElapsedTime(job)}`,
 		`- Task: ${job.task}`,
 		"",
-		isCancelled ? "## Partial results" : "## Result",
+		isCancelled ? "## Partial Results" : "## Result",
 		"",
 		truncateJobResultForMessage(result),
 	].join("\n");
@@ -1012,9 +1033,10 @@ async function handleSubagentJobsCommand(args: string, ctx: ExtensionContext, pi
 			return;
 		}
 		const body = job.status === "completed" ? job.result || "(no result)" : job.status === "failed" ? job.error || "(no error captured)" : job.status === "cancelled" ? job.result || "Job was cancelled." : "Job is still running.";
+		const heading = job.status === "cancelled" ? "## Partial Results" : "## Result";
 		sendBackgroundJobsMessage(
 			pi,
-			[`# Background job ${job.id}`, "", formatBackgroundJobSummary(job), "", "## Result", "", body].join("\n"),
+			[`# Background job ${job.id}`, "", formatBackgroundJobSummary(job), "", heading, "", body].join("\n"),
 			{ job },
 		);
 		return;
@@ -1135,7 +1157,7 @@ function startBackgroundSubagentRun(options: {
 			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 			if (isError) {
 				if (result.stopReason === "aborted") {
-					const partialResult = getFinalOutput(result.messages) || extractLatestRunText(registry.getRun(options.jobId)) || result.errorMessage || result.stderr || "(no partial output captured)";
+					const partialResult = extractCancelledBackgroundPartialResult(result, options.jobId);
 					await cancelJob(options.jobId, partialResult);
 					const cancelledJob = await getBackgroundJob(options.jobId);
 					if (cancelledJob) sendBackgroundJobCompletionMessage(options.pi, cancelledJob);
@@ -1168,7 +1190,13 @@ function startBackgroundSubagentRun(options: {
 			if (completedJob) sendBackgroundJobCompletionMessage(options.pi, completedJob);
 		} catch (error) {
 			const job = await getBackgroundJob(options.jobId);
-			if (job?.status !== "cancelled") {
+			if (job?.status === "cancelled") {
+				if (!job.result) {
+					await cancelJob(options.jobId, extractLatestRunText(registry.getRun(options.jobId)) || "(no partial output captured)");
+				}
+				const cancelledJob = await getBackgroundJob(options.jobId);
+				if (cancelledJob) sendBackgroundJobCompletionMessage(options.pi, cancelledJob);
+			} else {
 				await failJob(options.jobId, error instanceof Error ? error.message : String(error));
 			}
 		} finally {
