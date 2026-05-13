@@ -30,6 +30,7 @@ import {
 	failJob,
 	getBackgroundJob,
 	getBackgroundJobs,
+	getElapsedTime,
 	queueBackgroundJob,
 	registerBackgroundJobAbortController,
 	unregisterBackgroundJobAbortController,
@@ -85,7 +86,7 @@ import {
 import { SubagentOverlay } from "./subagent-overlay.js";
 import { getPiInvocation } from "./pi-invocation.js";
 import { TranscriptStorage } from "./transcript-storage.js";
-import { appendCoalescedTranscriptEvent, formatRunLabel, shouldPersistReplayEvent, type ChildSessionRef, type StoredTranscriptEvent, type SubagentRunMode, type TranscriptSegmentRef, type TranscriptStorageRef } from "./transcript-types.js";
+import { appendCoalescedTranscriptEvent, formatRunLabel, shouldPersistReplayEvent, type ChildSessionRef, type StoredTranscriptEvent, type SubagentRunMode, type SubagentRunRecord, type TranscriptSegmentRef, type TranscriptStorageRef } from "./transcript-types.js";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -759,9 +760,14 @@ async function openSubagentsOverlay(ctx: ExtensionContext, pi: ExtensionAPI, run
 		reportedCancelledRunIds.add(runId);
 		feedbackQueue = feedbackQueue
 			.then(async () => {
-				await cancelJob(runId);
-				ctx.ui.notify(`Cancelled ${runId} - partial results saved.`, "info");
-				sendBackgroundJobsMessage(pi, `# Cancelled\n\nCancelled \`${runId}\` - partial results saved.`, { id: runId });
+				const existingJob = await getBackgroundJob(runId);
+				if (existingJob?.status === "running") await cancelJob(runId);
+				const run = await waitForRunTerminal(runId);
+				const finalJob = await getBackgroundJob(runId);
+				ctx.ui.notify(`Cancelled ${formatRunLabel(run?.agent ?? "subagent", runId)} - partial results saved.`, "info");
+				if (!finalJob) {
+					sendBackgroundJobsMessage(pi, formatCancelledRunSummary(run, runId), { id: runId, run });
+				}
 				await refreshBackgroundJobsWidget(ctx);
 			})
 			.catch((error) => {
@@ -832,7 +838,7 @@ function backgroundStatusIcon(status: BackgroundJob["status"]): string {
 function formatBackgroundJobSummary(job: BackgroundJob): string {
 	const completed = job.completedAt ? ` → ${job.completedAt}` : "";
 	const terminalNote = job.status === "failed" && job.error ? ` — ${job.error.split("\n")[0]}` : "";
-	return `- ${backgroundStatusIcon(job.status)} \`${job.id}\` **${job.agent}** ${job.status} (${job.progress}%) — ${truncateBackgroundTask(job.task, 80)}\n  ${job.startedAt}${completed}${terminalNote}`;
+	return `- ${backgroundStatusIcon(job.status)} \`${job.id}\` **${job.agent}** ${job.status} (elapsed ${getElapsedTime(job)}) — ${truncateBackgroundTask(job.task, 80)}\n  ${job.startedAt}${completed}${terminalNote}`;
 }
 
 function formatBackgroundJobsList(jobs: BackgroundJob[]): string {
@@ -870,6 +876,72 @@ function formatBackgroundRunResult(results: SingleResult[]): string {
 		.join("\n\n");
 }
 
+function textFromMessage(message: Message | undefined): string {
+	if (!message || !Array.isArray((message as any).content)) return "";
+	return (message as any).content
+		.filter((part: any) => part?.type === "text" && typeof part.text === "string")
+		.map((part: any) => part.text.trim())
+		.filter(Boolean)
+		.join("\n\n");
+}
+
+function extractLatestRunText(run: SubagentRunRecord | undefined): string {
+	if (!run) return "";
+	const events = run.liveEvents.length > 0 ? run.liveEvents : run.replayEvents;
+	for (let i = events.length - 1; i >= 0; i--) {
+		const event = events[i];
+		if (event.type !== "message_update" && event.type !== "message_end" && event.type !== "message_start") continue;
+		const message = event.message as Message | undefined;
+		if ((message as any)?.role !== "assistant") continue;
+		const text = textFromMessage(message);
+		if (text) return text;
+	}
+	return run.errorMessage || run.stderr?.trim() || "";
+}
+
+function formatCancelledRunSummary(run: SubagentRunRecord | undefined, runId: string): string {
+	const elapsed = run ? formatElapsedDuration((run.cancelRequestedAt ?? run.endedAt ?? Date.now()) - run.startedAt) : "unknown";
+	const partial = extractLatestRunText(run) || "(no partial output captured)";
+	return [
+		"# Subagent run cancelled",
+		"",
+		`- Job ID: \`${runId}\``,
+		"- Status: **cancelled**",
+		`- Agent: ${run ? `**${run.agent}**` : "unknown"}`,
+		`- Elapsed: ${elapsed}`,
+		`- Task: ${run?.task ?? "unknown"}`,
+		"",
+		"## Partial results",
+		"",
+		partial,
+	].join("\n");
+}
+
+const BACKGROUND_JOB_MESSAGE_RESULT_LIMIT = 12000;
+
+function truncateJobResultForMessage(result: string): string {
+	if (result.length <= BACKGROUND_JOB_MESSAGE_RESULT_LIMIT) return result;
+	return `${result.slice(0, BACKGROUND_JOB_MESSAGE_RESULT_LIMIT)}\n\n…(truncated; run /subagent-jobs results <id> for the full saved output)`;
+}
+
+function formatBackgroundJobCompletionMessage(job: BackgroundJob): string {
+	const isCancelled = job.status === "cancelled";
+	const result = job.result || (isCancelled ? "(no partial output captured)" : "(no result captured)");
+	return [
+		`# Background job ${job.status}`,
+		"",
+		`- Job ID: \`${job.id}\``,
+		`- Status: **${job.status}**`,
+		`- Agent: **${job.agent}**`,
+		`- Elapsed: ${getElapsedTime(job)}`,
+		`- Task: ${job.task}`,
+		"",
+		isCancelled ? "## Partial results" : "## Result",
+		"",
+		truncateJobResultForMessage(result),
+	].join("\n");
+}
+
 function sendBackgroundJobsMessage(
 	pi: ExtensionAPI,
 	content: string,
@@ -880,6 +952,35 @@ function sendBackgroundJobsMessage(
 		display: true,
 		content,
 		details,
+	});
+}
+
+function sendBackgroundJobCompletionMessage(pi: ExtensionAPI, job: BackgroundJob): void {
+	if (job.status !== "completed" && job.status !== "cancelled") return;
+	sendBackgroundJobsMessage(pi, formatBackgroundJobCompletionMessage(job), { job, status: job.status });
+}
+
+function isRunTerminal(run: SubagentRunRecord | undefined): boolean {
+	return Boolean(run && run.status !== "running" && run.status !== "cancelling");
+}
+
+function waitForRunTerminal(runId: string, timeoutMs = 10000): Promise<SubagentRunRecord | undefined> {
+	const initial = registry.getRun(runId);
+	if (isRunTerminal(initial)) return Promise.resolve(initial);
+	return new Promise((resolve) => {
+		let unsubscribe: (() => void) | undefined;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const done = (run: SubagentRunRecord | undefined) => {
+			if (timeout) clearTimeout(timeout);
+			unsubscribe?.();
+			resolve(run);
+		};
+		timeout = setTimeout(() => done(registry.getRun(runId)), timeoutMs);
+		(timeout as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+		unsubscribe = registry.subscribe(() => {
+			const run = registry.getRun(runId);
+			if (isRunTerminal(run)) done(run);
+		});
 	});
 }
 
@@ -910,7 +1011,7 @@ async function handleSubagentJobsCommand(args: string, ctx: ExtensionContext, pi
 			ctx.ui.notify(`Background job not found: ${id}`, "warning");
 			return;
 		}
-		const body = job.status === "completed" ? job.result || "(no result)" : job.status === "failed" ? job.error || "(no error captured)" : job.status === "cancelled" ? "Job was cancelled." : "Job is still running.";
+		const body = job.status === "completed" ? job.result || "(no result)" : job.status === "failed" ? job.error || "(no error captured)" : job.status === "cancelled" ? job.result || "Job was cancelled." : "Job is still running.";
 		sendBackgroundJobsMessage(
 			pi,
 			[`# Background job ${job.id}`, "", formatBackgroundJobSummary(job), "", "## Result", "", body].join("\n"),
@@ -935,8 +1036,8 @@ async function handleSubagentJobsCommand(args: string, ctx: ExtensionContext, pi
 			return;
 		}
 		await cancelJob(id);
-		ctx.ui.notify(`Cancelled background job ${id}.`, "info");
-		sendBackgroundJobsMessage(pi, `# Background job cancelled\n\nCancelled \`${id}\`.`, { id });
+		ctx.ui.notify(`Cancellation requested for background job ${id}.`, "info");
+		sendBackgroundJobsMessage(pi, `# Background job cancellation requested\n\nCancellation requested for \`${id}\`. A final summary with elapsed time and partial results will be posted when the job stops.`, { id });
 		return;
 	}
 
@@ -955,7 +1056,7 @@ async function refreshBackgroundJobsWidget(ctx: ExtensionContext): Promise<void>
 			ctx.ui.setWidget("pi-hive-background-jobs", undefined);
 			return;
 		}
-		const entries = running.map((job) => `${job.agent} (${truncateBackgroundTask(job.task)}, ${job.progress}%)`);
+		const entries = running.map((job) => `${job.agent} (${truncateBackgroundTask(job.task)}, elapsed ${getElapsedTime(job)})`);
 		ctx.ui.setWidget("pi-hive-background-jobs", [ctx.ui.theme.fg("muted", "⚙️ Running: ") + ctx.ui.theme.fg("accent", entries.join(", "))]);
 	} catch (error) {
 		debugLog(`Background jobs widget refresh failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -981,6 +1082,7 @@ function stopBackgroundJobsWidget(): void {
 function startBackgroundSubagentRun(options: {
 	jobId: string;
 	ctx: ExtensionContext;
+	pi: ExtensionAPI;
 	agents: AgentConfig[];
 	agent: string;
 	task: string;
@@ -1033,7 +1135,10 @@ function startBackgroundSubagentRun(options: {
 			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 			if (isError) {
 				if (result.stopReason === "aborted") {
-					await cancelJob(options.jobId);
+					const partialResult = getFinalOutput(result.messages) || extractLatestRunText(registry.getRun(options.jobId)) || result.errorMessage || result.stderr || "(no partial output captured)";
+					await cancelJob(options.jobId, partialResult);
+					const cancelledJob = await getBackgroundJob(options.jobId);
+					if (cancelledJob) sendBackgroundJobCompletionMessage(options.pi, cancelledJob);
 					return;
 				}
 				const errorMsg = result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
@@ -1059,6 +1164,8 @@ function startBackgroundSubagentRun(options: {
 				},
 			);
 			await completeJob(options.jobId, formatBackgroundRunResult([result, ...handoffResults]));
+			const completedJob = await getBackgroundJob(options.jobId);
+			if (completedJob) sendBackgroundJobCompletionMessage(options.pi, completedJob);
 		} catch (error) {
 			const job = await getBackgroundJob(options.jobId);
 			if (job?.status !== "cancelled") {
@@ -2310,6 +2417,7 @@ export default function (pi: ExtensionAPI) {
 						startBackgroundSubagentRun({
 							jobId,
 							ctx,
+							pi,
 							agents,
 							agent: params.agent,
 							task: backgroundTask,
@@ -2346,6 +2454,7 @@ export default function (pi: ExtensionAPI) {
 						startBackgroundSubagentRun({
 							jobId,
 							ctx,
+							pi,
 							agents,
 							agent: params.agent,
 							task,

@@ -133,12 +133,15 @@ export async function failJob(id: string, error: string): Promise<void> {
 	}
 }
 
-export async function cancelJob(id: string): Promise<void> {
+export async function cancelJob(id: string, result?: string): Promise<void> {
 	const jobs = await loadJobsFile();
 	const job = jobs.find(j => j.id === id);
-	if (job && job.status === "running") {
+	if (!job) return;
+
+	if (job.status === "running") {
 		job.status = "cancelled";
 		job.completedAt = new Date().toISOString();
+		if (result !== undefined) job.result = result;
 		await saveJobsFile(jobs);
 		// Abort the child process
 		const controller = abortControllers.get(id);
@@ -146,6 +149,13 @@ export async function cancelJob(id: string): Promise<void> {
 			controller.abort();
 		}
 		unregisterBackgroundJobAbortController(id);
+		return;
+	}
+
+	if (job.status === "cancelled" && result !== undefined) {
+		job.result = result;
+		job.completedAt = job.completedAt ?? new Date().toISOString();
+		await saveJobsFile(jobs);
 	}
 }
 
@@ -170,13 +180,32 @@ export function unregisterBackgroundJobAbortController(id: string): void {
 	abortControllers.delete(id);
 }
 
+export function formatElapsedMilliseconds(ms: number): string {
+	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	if (minutes < 60) return `${minutes}m ${seconds}s`;
+	const hours = Math.floor(minutes / 60);
+	const remainingMinutes = minutes % 60;
+	return `${hours}h ${remainingMinutes}m`;
+}
+
+export function getElapsedTime(job: BackgroundJob, now = Date.now()): string {
+	const start = new Date(job.startedAt).getTime();
+	if (!Number.isFinite(start)) return "unknown";
+	const completed = job.completedAt ? new Date(job.completedAt).getTime() : NaN;
+	const end = Number.isFinite(completed) ? completed : now;
+	return formatElapsedMilliseconds(end - start);
+}
+
 export function formatRunningJobs(jobs: BackgroundJob[]): string {
 	const running = jobs.filter(j => j.status === "running");
 	if (running.length === 0) return "";
 	
 	const items = running.map(j => {
 		const taskPreview = j.task.length > 25 ? j.task.slice(0, 22) + "..." : j.task;
-		return `${j.agent} (${taskPreview}, ${j.progress}%)`;
+		return `${j.agent} (${taskPreview}, elapsed ${getElapsedTime(j)})`;
 	}).join(", ");
 	
 	return `⚙️  Running: ${items}`;
@@ -205,7 +234,7 @@ export function truncateBackgroundTask(task: string, maxLength: number): string 
 export function formatBackgroundJobLine(job: BackgroundJob): string {
 	const completed = job.completedAt ? ` — Completed at ${new Date(job.completedAt).toLocaleTimeString()}` : "";
 	const terminalNote = job.error ? ` — Error: ${job.error}` : job.result ? ` — Result saved` : "";
-	return `- ${backgroundStatusIcon(job.status)} \`${job.id}\` **${job.agent}** ${job.status} (${job.progress}%) — ${truncateBackgroundTask(job.task, 80)}\n  ${job.startedAt}${completed}${terminalNote}`;
+	return `- ${backgroundStatusIcon(job.status)} \`${job.id}\` **${job.agent}** ${job.status} (elapsed ${getElapsedTime(job)}) — ${truncateBackgroundTask(job.task, 80)}\n  ${job.startedAt}${completed}${terminalNote}`;
 }
 
 export async function formatBackgroundJobs(jobs: BackgroundJob[]): Promise<string> {
