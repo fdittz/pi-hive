@@ -155,6 +155,7 @@ export class SubagentOverlay implements Component {
 	private copyNotice?: { message: string; color: "success" | "warning" | "error" };
 	private copyNoticeTimer?: ReturnType<typeof setTimeout>;
 	private cancelRequestedRunId?: string;
+	private cancelConfirmationRunId?: string;
 	private unsubscribe?: () => void;
 	private renderTimer?: ReturnType<typeof setTimeout>;
 	private disposed = false;
@@ -232,14 +233,22 @@ export class SubagentOverlay implements Component {
 			return;
 		}
 
-		if (matchesKey(data, "ctrl+c")) {
-			if (this.selectedText) this.copySelection();
-			else this.cancelSelectedRun();
+		const run = this.getSelectedRun();
+		const confirmCancelWithCtrlC = matchesKey(data, "ctrl+c") && (!this.selectedText || this.cancelConfirmationRunId === run?.id);
+		const confirmCancelWithX = matchesKey(data, "x") || data === "X";
+		if (confirmCancelWithX || confirmCancelWithCtrlC) {
+			this.cancelSelectedRun();
 			return;
 		}
 
-		if (data === "x" || data === "X") {
-			this.cancelSelectedRun();
+		if (this.cancelConfirmationRunId) {
+			this.cancelConfirmationRunId = undefined;
+			this.scheduleRender();
+			return;
+		}
+
+		if (matchesKey(data, "ctrl+c")) {
+			if (this.selectedText) this.copySelection();
 			return;
 		}
 
@@ -325,6 +334,7 @@ export class SubagentOverlay implements Component {
 		this.selectedIndex = (this.selectedIndex + delta + runs.length) % runs.length;
 		this.scrollOffset = 0;
 		this.stickToBottom = true;
+		this.cancelConfirmationRunId = undefined;
 		this.clearSelection();
 		this.transcriptView.invalidate();
 		this.tui.requestRender();
@@ -356,15 +366,24 @@ export class SubagentOverlay implements Component {
 		const run = this.getSelectedRun();
 		if (!run) return;
 		if (run.status === "cancelling") {
+			this.cancelConfirmationRunId = undefined;
 			this.showCopyNotice("Already cancelling...", "warning");
 			return;
 		}
 		if (run.status !== "running") {
+			this.cancelConfirmationRunId = undefined;
 			this.showCopyNotice("Only running agents can be cancelled", "warning");
 			return;
 		}
 
+		if (this.cancelConfirmationRunId !== run.id) {
+			this.cancelConfirmationRunId = run.id;
+			this.scheduleRender();
+			return;
+		}
+
 		const cancelled = this.registry.cancelRun(run.id);
+		this.cancelConfirmationRunId = undefined;
 		if (cancelled) {
 			this.cancelRequestedRunId = run.id;
 			this.clearSelection();
@@ -585,7 +604,12 @@ export class SubagentOverlay implements Component {
 		const line = this.theme.fg("borderAccent", "─".repeat(Math.max(0, width)));
 		const notice = this.copyNotice ? ` · ${this.theme.fg(this.copyNotice.color, this.copyNotice.message)}` : "";
 		let footer = `${this.theme.fg("dim", `View: ${state}`)}${notice}`;
-		if (run.status === "cancelling") {
+		if (this.cancelConfirmationRunId === run.id) {
+			footer = this.theme.fg(
+				"warning",
+				"⚠️ Confirm cancel? Press 'x' or Ctrl+C again to cancel (or any other key to dismiss)",
+			);
+		} else if (run.status === "cancelling") {
 			footer = `${this.theme.fg("warning", `Cancelling... elapsed ${formatDuration(elapsedMs(run))}`)}${notice}`;
 		} else if (run.status === "aborted" && run.id === this.cancelRequestedRunId) {
 			footer = `${this.theme.fg("warning", `Cancelled after ${formatDuration(elapsedMs(run, true))}`)} ${this.theme.fg("dim", "- Press any key to close")}`;
