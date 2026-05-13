@@ -1,4 +1,5 @@
 import { type AgentConfig, type AgentScope, loadAgents } from "./agents.js";
+import { applySubagentsLanguageToAgents } from "./subagents-lang.js";
 
 export interface AgentMatch {
 	name: string;
@@ -12,10 +13,10 @@ function uniqueStrings(values: string[]): string[] {
 }
 
 /**
- * Kept for API compatibility with the previous language-agnostic implementation.
- * Runtime LLM translation was removed because the pi ExtensionAPI does not expose
- * a stable `invoke` method. Delegation now relies on multilingual triggers in the
- * agent metadata plus normalization/fuzzy matching in scoreAgents().
+ * Loads agents with any cached `/subagents-lang` trigger translations applied.
+ * The `enabled` option is retained for backward compatibility; configured
+ * language triggers are loaded independently so manual `delegate` and automatic
+ * delegation use the same metadata.
  */
 export async function loadCachedAgentsWithEnglishTriggers(options: {
 	cwd?: string;
@@ -23,7 +24,7 @@ export async function loadCachedAgentsWithEnglishTriggers(options: {
 	enabled?: boolean;
 } = {}): Promise<{ agents: AgentConfig[]; translated: boolean }> {
 	const agents = await loadAgents({ cwd: options.cwd, scope: options.scope });
-	return { agents, translated: false };
+	return applySubagentsLanguageToAgents(agents);
 }
 
 export function scoreAgents(
@@ -149,9 +150,17 @@ function triggerMatchesRequest(normalizedRequest: string, requestTokens: Set<str
 		return normalizedRequest.includes(normalizedTrigger);
 	}
 
+	if (containsUnsegmentedScript(normalizedTrigger)) {
+		return normalizedRequest.includes(normalizedTrigger);
+	}
+
 	if (requestTokens.has(normalizedTrigger)) return true;
 
 	return tokenHasCloseVariant(normalizedTrigger, requestTokens);
+}
+
+function containsUnsegmentedScript(text: string): boolean {
+	return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text);
 }
 
 function tokenHasCloseVariant(trigger: string, requestTokens: Set<string>): boolean {

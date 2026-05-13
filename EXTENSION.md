@@ -69,7 +69,8 @@ A local project/repository copy is:
 - Render large overlays efficiently with viewport rendering and per-component cache invalidation.
 - Configure per-subagent model and thinking selection with `/subagent-model`.
 - Generate dynamic agent guidance from discovered agents using `promptSnippet`/`promptGuidelines`.
-- Use agent metadata fields (`when`, `examples`, `triggers`) to improve suggestions.
+- Use agent metadata fields (`when`, `examples`, `triggers`, `triggers_en`) to improve suggestions.
+- Translate and cache English trigger terms with `/subagents-lang <lang>` for non-English delegation matching.
 - Navigate historical subagent runs from the current main session.
 - Persist completed subagent transcripts as compressed `.jsonl.gz` sidecar files.
 - Rehydrate persisted subagent transcripts when the main pi session is resumed.
@@ -162,6 +163,33 @@ handoffAllowList: reviewer, planner
 ```
 
 Supported aliases are `handoffAllowList`, `handoffAllowlist`, `handoff-allow-list`, and `allowList`.
+
+### `/subagents-lang`
+
+Translate and cache subagent trigger terms for a target language:
+
+```text
+/subagents-lang pt
+/subagents-lang ja
+/subagents-lang pt-BR
+```
+
+The command discovers the normal user-scope agents used by auto-delegation and the current project scope (`agentScope: "both"`), translates each agent's English trigger source once, and stores the result in:
+
+```text
+~/.pi/agent/subagents-lang.json
+```
+
+Bundled agents provide `triggers_en` so only English terms are translated. Older user/project agents without `triggers_en` fall back to `triggers`. Cache entries are keyed by language and agent source/name (for example `package:scout` or `project:worker`) and include a SHA-256 hash of the English trigger list. If the English list changes, the next command run retranslates that agent.
+
+During delegation scoring, pi-hive applies the active language cache before matching. Each active agent receives:
+
+```ts
+triggers: [original_english, ...translated]
+triggers_en: original_english
+```
+
+The command prints the resulting trigger arrays so users can verify exactly what will be matched. Japanese/Chinese trigger matching also supports substring checks for Han, Hiragana, and Katakana terms, since whitespace tokenization is insufficient for those scripts.
 
 ### Request headers
 
@@ -488,6 +516,7 @@ Registers:
 - `/subagents` command
 - `/subagent-model` command
 - `/subagent-handoff` command
+- `/subagents-lang` command
 - `Ctrl+Shift+O` shortcut
 - `Alt+O` shortcut
 - session hydration/shutdown hooks
@@ -502,7 +531,7 @@ Captures JSON events from child pi processes and stores run metadata.
 agents.ts
 ```
 
-Loads bundled, user-level, and optionally project-level agent definitions, including presentation metadata such as `color:` and selection metadata such as `when`, `examples`, and `triggers`.
+Loads bundled, user-level, and optionally project-level agent definitions, including presentation metadata such as `color:` and selection metadata such as `when`, `examples`, `triggers`, and `triggers_en`.
 
 ### Dynamic guidance
 
@@ -520,12 +549,14 @@ agent-colors.ts
 
 Resolves `color:` frontmatter values to ANSI/theme styling for the live viewer and tool result rendering.
 
-### Unified config and model overrides
+### Unified config, model overrides, and translated triggers
 
 ```text
 subagent-config.ts
 model-overrides.ts
 model-selector.ts
+subagents-lang.ts
+pi-invocation.ts
 request-headers.ts
 ```
 
@@ -536,6 +567,10 @@ request-headers.ts
 `model-selector.ts` implements the `/subagent-model` interactive loop.
 
 `request-headers.ts` applies `requestHeaders` templates inside child subagent processes.
+
+`pi-invocation.ts` centralizes spawning the current `pi` executable or script.
+
+`subagents-lang.ts` owns `~/.pi/agent/subagents-lang.json`, refreshes trigger translations by spawning `pi --no-extensions --mode json -p --no-session`, and applies cached `[original_english, ...translated]` trigger arrays during delegation scoring.
 
 Resolution order when an agent is launched as a subagent:
 

@@ -7,6 +7,7 @@ examples:
   - "Trace the data flow for provider configuration and list the important types"
   - "Inspect tests and implementation around a failing feature before planning fixes"
 triggers: find, locate, search, inspect, explore, map, trace, understand, discover, reconnaissance, encontrar, localizar, buscar, pesquisar, procurar, inspecionar, explorar, mapear, rastrear, traçar, entender, descobrir, reconhecimento, estrutura, dependência, fluxo, código
+triggers_en: find, locate, search, inspect, explore, map, trace, understand, discover, reconnaissance
 tools: read, grep, find, ls, bash, handoff
 model: inherit
 thinking: inherit

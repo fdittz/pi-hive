@@ -1,0 +1,426 @@
+import { spawn } from "node:child_process";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import type { AgentConfig, AgentSource } from "./agents.js";
+import { getPiInvocation } from "./pi-invocation.js";
+
+export interface SubagentsLangAgentCacheEntry {
+	name: string;
+	source: AgentSource;
+	triggerHash: string;
+	originalEnglish: string[];
+	translated: string[];
+	updatedAt: string;
+}
+
+export interface SubagentsLangConfig {
+	version: 1;
+	language: string | null;
+	translations: Record<string, Record<string, SubagentsLangAgentCacheEntry>>;
+}
+
+export interface ApplySubagentsLanguageResult {
+	agents: AgentConfig[];
+	translated: boolean;
+}
+
+export interface RefreshSubagentsLanguageOptions {
+	agents: AgentConfig[];
+	language: string;
+	cwd: string;
+	modelRef?: string;
+	thinking?: string;
+	signal?: AbortSignal;
+}
+
+export interface RefreshSubagentsLanguageResult {
+	language: string;
+	staleAgents: number;
+	translatedAgents: number;
+	translatedTriggers: number;
+	cachedAgents: number;
+	configPath: string;
+	config: SubagentsLangConfig;
+}
+
+export interface TranslateTriggersOptions {
+	cwd?: string;
+	modelRef?: string;
+	thinking?: string;
+	signal?: AbortSignal;
+}
+
+const CONFIG_VERSION = 1;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function uniqueNormalizedStrings(values: unknown): string[] {
+	const input = Array.isArray(values) ? values : [];
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const value of input) {
+		if (typeof value !== "string") continue;
+		const normalized = value.replace(/\s+/g, " ").trim();
+		if (!normalized || seen.has(normalized)) continue;
+		seen.add(normalized);
+		result.push(normalized);
+	}
+	return result;
+}
+
+function normalizeSource(value: unknown): AgentSource | undefined {
+	return value === "package" || value === "user" || value === "project" ? value : undefined;
+}
+
+function normalizeCacheEntry(value: unknown): SubagentsLangAgentCacheEntry | undefined {
+	if (!isRecord(value)) return undefined;
+	const name = typeof value.name === "string" && value.name.trim() ? value.name.trim() : undefined;
+	const source = normalizeSource(value.source);
+	const triggerHash = typeof value.triggerHash === "string" && value.triggerHash.trim() ? value.triggerHash.trim() : undefined;
+	if (!name || !source || !triggerHash) return undefined;
+	const normalized: SubagentsLangAgentCacheEntry = {
+		name,
+		source,
+		triggerHash,
+		originalEnglish: uniqueNormalizedStrings(value.originalEnglish),
+		translated: uniqueNormalizedStrings(value.translated),
+		updatedAt: typeof value.updatedAt === "string" && value.updatedAt.trim() ? value.updatedAt.trim() : new Date(0).toISOString(),
+	};
+	return normalized;
+}
+
+function normalizeTranslations(value: unknown): Record<string, Record<string, SubagentsLangAgentCacheEntry>> {
+	if (!isRecord(value)) return {};
+	const translations: Record<string, Record<string, SubagentsLangAgentCacheEntry>> = {};
+	for (const [rawLang, rawEntries] of Object.entries(value)) {
+		const language = normalizeSubagentsLanguageCode(rawLang);
+		if (!language || !isRecord(rawEntries)) continue;
+		const entries: Record<string, SubagentsLangAgentCacheEntry> = {};
+		for (const rawEntry of Object.values(rawEntries)) {
+			const entry = normalizeCacheEntry(rawEntry);
+			if (!entry) continue;
+			entries[getSubagentsLanguageAgentKey(entry)] = entry;
+		}
+		translations[language] = Object.fromEntries(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b)));
+	}
+	return Object.fromEntries(Object.entries(translations).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function normalizeConfig(value: unknown): SubagentsLangConfig {
+	const root = isRecord(value) ? value : {};
+	const language = typeof root.language === "string" ? normalizeSubagentsLanguageCode(root.language) : null;
+	return {
+		version: CONFIG_VERSION,
+		language,
+		translations: normalizeTranslations(root.translations),
+	};
+}
+
+export function getSubagentsLangConfigPath(): string {
+	return path.join(getAgentDir(), "subagents-lang.json");
+}
+
+export function loadSubagentsLangConfig(): SubagentsLangConfig {
+	try {
+		return normalizeConfig(JSON.parse(fs.readFileSync(getSubagentsLangConfigPath(), "utf8")));
+	} catch {
+		return { version: CONFIG_VERSION, language: null, translations: {} };
+	}
+}
+
+export function getSubagentsLangConfig(): SubagentsLangConfig {
+	return loadSubagentsLangConfig();
+}
+
+export async function saveSubagentsLangConfig(config: SubagentsLangConfig): Promise<void> {
+	const configPath = getSubagentsLangConfigPath();
+	const normalized = normalizeConfig(config);
+	await withFileMutationQueue(configPath, async () => {
+		await fs.promises.mkdir(path.dirname(configPath), { recursive: true });
+		await fs.promises.writeFile(configPath, `${JSON.stringify(normalized, null, "\t")}\n`, "utf8");
+	});
+}
+
+export async function setSubagentsLang(lang: string | null): Promise<SubagentsLangConfig> {
+	const config = loadSubagentsLangConfig();
+	config.language = lang === null ? null : normalizeSubagentsLanguageCode(lang);
+	if (lang !== null && !config.language) throw new Error(`Invalid subagent trigger language: ${lang}`);
+	await saveSubagentsLangConfig(config);
+	return loadSubagentsLangConfig();
+}
+
+export function normalizeSubagentsLanguageCode(value: string | null | undefined): string | null {
+	const trimmed = value?.trim().replace(/_/g, "-");
+	if (!trimmed) return null;
+	try {
+		return Intl.getCanonicalLocales(trimmed)[0] ?? null;
+	} catch {
+		if (!/^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8}){0,3}$/.test(trimmed)) return null;
+		const [language, ...rest] = trimmed.split("-");
+		return [
+			language.toLowerCase(),
+			...rest.map((part) => (part.length === 2 && /^[a-zA-Z]+$/.test(part) ? part.toUpperCase() : part)),
+		].join("-");
+	}
+}
+
+export function getEnglishTriggers(agent: AgentConfig): string[] {
+	return uniqueNormalizedStrings(agent.triggers_en ?? agent.triggers ?? []);
+}
+
+export function hashSubagentsLanguageTriggers(triggers: string[]): string {
+	return crypto.createHash("sha256").update(JSON.stringify(uniqueNormalizedStrings(triggers))).digest("hex");
+}
+
+export function getSubagentsLanguageAgentKey(agent: Pick<AgentConfig, "name" | "source">): string {
+	return `${agent.source}:${agent.name}`;
+}
+
+function getFreshCacheEntry(
+	config: SubagentsLangConfig,
+	language: string,
+	agent: AgentConfig,
+	originalEnglish = getEnglishTriggers(agent),
+): SubagentsLangAgentCacheEntry | undefined {
+	const entry = config.translations[language]?.[getSubagentsLanguageAgentKey(agent)];
+	if (!entry) return undefined;
+	const triggerHash = hashSubagentsLanguageTriggers(originalEnglish);
+	if (entry.triggerHash !== triggerHash) return undefined;
+	return {
+		...entry,
+		originalEnglish: uniqueNormalizedStrings(entry.originalEnglish),
+		translated: uniqueNormalizedStrings(entry.translated),
+	};
+}
+
+export function getTranslatedTriggers(agent: AgentConfig, lang: string): string[] {
+	const language = normalizeSubagentsLanguageCode(lang);
+	const originalEnglish = getEnglishTriggers(agent);
+	if (!language) return originalEnglish;
+	const entry = getFreshCacheEntry(loadSubagentsLangConfig(), language, agent, originalEnglish);
+	return uniqueNormalizedStrings([...originalEnglish, ...(entry?.translated ?? [])]);
+}
+
+export function applySubagentsLanguageToAgents(
+	agents: AgentConfig[],
+	config = loadSubagentsLangConfig(),
+): ApplySubagentsLanguageResult {
+	const language = config.language ? normalizeSubagentsLanguageCode(config.language) : null;
+	if (!language) return { agents, translated: false };
+
+	let translated = false;
+	const extended = agents.map((agent) => {
+		const originalEnglish = getEnglishTriggers(agent);
+		const entry = getFreshCacheEntry(config, language, agent, originalEnglish);
+		if (entry && entry.translated.length > 0) translated = true;
+		return {
+			...agent,
+			triggers: uniqueNormalizedStrings([...originalEnglish, ...(entry?.translated ?? [])]),
+			triggers_en: originalEnglish,
+		};
+	});
+
+	return { agents: extended, translated };
+}
+
+function buildTranslationPrompt(triggers: string[], language: string): string {
+	return [
+		`Translate these English subagent trigger keywords/phrases into language code "${language}".`,
+		"These triggers are used to classify developer requests for specialist agents such as scout, planner, worker, reviewer, and debugger.",
+		"Return concise trigger terms that a user would naturally type in that language. Preserve the input order and return exactly one translation for each input item.",
+		"Return strict JSON only, with no markdown or commentary, in this exact shape:",
+		'{ "translations": ["...same length/order as input..."] }',
+		"Input triggers:",
+		JSON.stringify(triggers),
+	].join("\n");
+}
+
+function extractAssistantTextFromPiJson(stdout: string): string {
+	const texts: string[] = [];
+	for (const line of stdout.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		let event: any;
+		try {
+			event = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		const message = event?.message;
+		if (event?.type !== "message_end" || message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+		const parts = message.content
+			.filter((part: any) => part?.type === "text" && typeof part.text === "string")
+			.map((part: any) => part.text);
+		if (parts.length > 0) texts.push(parts.join("\n"));
+	}
+	return texts[texts.length - 1]?.trim() ?? stdout.trim();
+}
+
+function parseTranslationsJson(text: string, expectedLength: number): string[] {
+	const trimmed = text.trim();
+	const candidates = [
+		trimmed,
+		trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim(),
+		trimmed.match(/\{[\s\S]*\}/)?.[0] ?? "",
+	].filter(Boolean);
+
+	let parsed: unknown;
+	let lastError: unknown;
+	for (const candidate of candidates) {
+		try {
+			parsed = JSON.parse(candidate);
+			lastError = undefined;
+			break;
+		} catch (error) {
+			lastError = error;
+		}
+	}
+	if (lastError) throw new Error(`Translation model did not return valid JSON: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+	if (!isRecord(parsed) || !Array.isArray(parsed.translations)) {
+		throw new Error('Translation model returned invalid JSON: expected { "translations": string[] }.');
+	}
+	if (parsed.translations.length !== expectedLength) {
+		throw new Error(`Translation model returned ${parsed.translations.length} translations; expected ${expectedLength}.`);
+	}
+	const translations = parsed.translations.map((value) => (typeof value === "string" ? value.replace(/\s+/g, " ").trim() : ""));
+	if (translations.some((value) => value.length === 0)) {
+		throw new Error("Translation model returned an empty or non-string trigger translation.");
+	}
+	return translations;
+}
+
+async function invokePiForTranslation(prompt: string, options: TranslateTriggersOptions): Promise<string> {
+	const args = ["--no-extensions", "--mode", "json", "-p", "--no-session"];
+	if (options.modelRef) args.push("--model", options.modelRef);
+	if (options.thinking) args.push("--thinking", options.thinking);
+	args.push(prompt);
+	const invocation = getPiInvocation(args);
+
+	return new Promise<string>((resolve, reject) => {
+		const proc = spawn(invocation.command, invocation.args, {
+			cwd: options.cwd ?? process.cwd(),
+			shell: false,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: process.env,
+		});
+		let stdout = "";
+		let stderr = "";
+		let settled = false;
+
+		const abort = () => {
+			if (settled) return;
+			settled = true;
+			proc.kill("SIGTERM");
+			reject(new Error("Subagent trigger translation was aborted."));
+		};
+
+		if (options.signal) {
+			if (options.signal.aborted) {
+				abort();
+				return;
+			}
+			options.signal.addEventListener("abort", abort, { once: true });
+		}
+
+		proc.stdout.on("data", (data) => {
+			stdout += data.toString();
+		});
+		proc.stderr.on("data", (data) => {
+			stderr += data.toString();
+		});
+		proc.on("error", (error) => {
+			if (settled) return;
+			settled = true;
+			options.signal?.removeEventListener("abort", abort);
+			reject(error);
+		});
+		proc.on("close", (code) => {
+			if (settled) return;
+			settled = true;
+			options.signal?.removeEventListener("abort", abort);
+			if (code !== 0) {
+				reject(new Error(`Translation pi process exited with code ${code}: ${stderr.trim() || stdout.trim() || "no output"}`));
+				return;
+			}
+			resolve(extractAssistantTextFromPiJson(stdout));
+		});
+	});
+}
+
+export async function translateTriggersForLanguage(
+	triggers: string[],
+	lang: string,
+	options: TranslateTriggersOptions = {},
+): Promise<string[]> {
+	const language = normalizeSubagentsLanguageCode(lang);
+	if (!language) throw new Error(`Invalid subagent trigger language: ${lang}`);
+	const uniqueTriggers = uniqueNormalizedStrings(triggers);
+	if (uniqueTriggers.length === 0) return [];
+	const text = await invokePiForTranslation(buildTranslationPrompt(uniqueTriggers, language), options);
+	return parseTranslationsJson(text, uniqueTriggers.length);
+}
+
+export async function refreshSubagentsLanguageCache(
+	options: RefreshSubagentsLanguageOptions,
+): Promise<RefreshSubagentsLanguageResult> {
+	const language = normalizeSubagentsLanguageCode(options.language);
+	if (!language) throw new Error(`Invalid subagent trigger language: ${options.language}`);
+
+	const config = loadSubagentsLangConfig();
+	const staleAgents: Array<{ agent: AgentConfig; originalEnglish: string[]; triggerHash: string }> = [];
+	for (const agent of options.agents) {
+		const originalEnglish = getEnglishTriggers(agent);
+		if (originalEnglish.length === 0) continue;
+		const triggerHash = hashSubagentsLanguageTriggers(originalEnglish);
+		const existing = config.translations[language]?.[getSubagentsLanguageAgentKey(agent)];
+		if (!existing || existing.triggerHash !== triggerHash) {
+			staleAgents.push({ agent, originalEnglish, triggerHash });
+		}
+	}
+
+	let translatedTriggerCount = 0;
+	if (staleAgents.length > 0) {
+		const uniqueTriggers = uniqueNormalizedStrings(staleAgents.flatMap((item) => item.originalEnglish));
+		const translated = await translateTriggersForLanguage(uniqueTriggers, language, {
+			cwd: options.cwd,
+			modelRef: options.modelRef,
+			thinking: options.thinking,
+			signal: options.signal,
+		});
+		const translationByTrigger = new Map(uniqueTriggers.map((trigger, index) => [trigger, translated[index]]));
+		const now = new Date().toISOString();
+		const languageEntries = { ...(config.translations[language] ?? {}) };
+		for (const item of staleAgents) {
+			const translatedForAgent = uniqueNormalizedStrings(
+				item.originalEnglish.map((trigger) => translationByTrigger.get(trigger) ?? ""),
+			);
+			translatedTriggerCount += translatedForAgent.length;
+			languageEntries[getSubagentsLanguageAgentKey(item.agent)] = {
+				name: item.agent.name,
+				source: item.agent.source,
+				triggerHash: item.triggerHash,
+				originalEnglish: item.originalEnglish,
+				translated: translatedForAgent,
+				updatedAt: now,
+			};
+		}
+		config.translations[language] = languageEntries;
+	}
+
+	config.language = language;
+	await saveSubagentsLangConfig(config);
+	const saved = loadSubagentsLangConfig();
+	const cachedAgents = Object.keys(saved.translations[language] ?? {}).length;
+	return {
+		language,
+		staleAgents: staleAgents.length,
+		translatedAgents: staleAgents.length,
+		translatedTriggers: translatedTriggerCount,
+		cachedAgents,
+		configPath: getSubagentsLangConfigPath(),
+		config: saved,
+	};
+}

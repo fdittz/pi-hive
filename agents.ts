@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { applySubagentsLanguageToAgents } from "./subagents-lang.js";
 
 export type AgentScope = "user" | "project" | "both";
 export type AgentSource = "package" | "user" | "project";
@@ -41,6 +42,7 @@ interface AgentFrontmatter {
 	when?: unknown;
 	examples?: unknown;
 	triggers?: unknown;
+	triggers_en?: unknown;
 	[key: string]: unknown;
 }
 
@@ -147,6 +149,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			when: toOptionalString(frontmatter.when),
 			examples: parseExamples(frontmatter.examples),
 			triggers: parseCommaList(frontmatter.triggers),
+			triggers_en: parseCommaList(frontmatter.triggers_en),
 			systemPrompt: body,
 			source,
 			filePath,
@@ -204,7 +207,8 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 }
 
 export async function loadAgents(options?: { cwd?: string; scope?: AgentScope }): Promise<AgentConfig[]> {
-	return discoverAgents(options?.cwd ?? process.cwd(), options?.scope ?? "user").agents;
+	const agents = discoverAgents(options?.cwd ?? process.cwd(), options?.scope ?? "user").agents;
+	return applySubagentsLanguageToAgents(agents).agents;
 }
 
 export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {

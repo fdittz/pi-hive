@@ -17,7 +17,8 @@ For complete local extension documentation, see [`EXTENSION.md`](./EXTENSION.md)
 - **Model and thinking selection**: Use `/subagent-model` to configure each subagent's model plus optional thinking level
 - **Handoff tool**: Child subagents get a real `handoff` tool to request follow-up work; handoffs run automatically by default
 - **Dynamic agent guidance**: Discovered agents are summarized into `promptSnippet`/`promptGuidelines` so pi can suggest the right specialist
-- **Agent metadata**: Frontmatter supports `when`, `examples`, and `triggers` for better discovery and guidance
+- **Agent metadata**: Frontmatter supports `when`, `examples`, `triggers`, and `triggers_en` for better discovery and guidance
+- **Translated trigger cache**: Use `/subagents-lang <lang>` to translate English agent triggers once, cache them, and improve delegation matching for non-English requests
 - **Nested subagent prevention**: Child processes cannot call `subagent` or `subagent_continue`; they use `handoff` instead
 - **Debugger agent**: Bundled `debugger` diagnoses root causes and delegates fixes without editing files
 - **Persistent transcripts**: Completed subagent JSON streams are saved as compressed `.jsonl.gz` sidecars and reload with the main session
@@ -37,7 +38,9 @@ pi-hive/
 ├── live-registry.ts      # In-memory and hydrated run registry
 ├── model-overrides.ts    # Per-agent model/thinking override resolution
 ├── model-selector.ts     # /subagent-model interactive selector
+├── pi-invocation.ts      # Shared helper for spawning the current pi executable
 ├── subagent-config.ts    # Unified ~/.pi/agent/subagent.json config
+├── subagents-lang.ts     # Cached translated trigger config for delegation matching
 ├── subagent-overlay.ts   # Fullscreen live view overlay with viewport rendering
 ├── transcript-adapter.ts # JSON event stream -> cached native pi components
 ├── transcript-storage.ts # Gzipped JSONL transcript sidecar storage
@@ -180,6 +183,12 @@ Example:
 
 The old `~/.pi/agent/subagent-models.json` file is read as a migration fallback for model overrides, but new writes go to `subagent.json`.
 
+Translated subagent trigger caches are intentionally stored separately in:
+
+```text
+~/.pi/agent/subagents-lang.json
+```
+
 ### Subagent request headers
 
 `requestHeaders` injects custom HTTP headers into provider/model requests made by child subagent `pi` processes. It does **not** intercept arbitrary network traffic from shell commands such as `curl`, `gh`, `npm`, or Python scripts.
@@ -274,6 +283,21 @@ This opens an interactive loop:
 ```text
 ~/.pi/agent/subagent.json
 ```
+
+### Translate subagent triggers
+
+```text
+/subagents-lang pt
+/subagents-lang ja
+```
+
+`/subagents-lang <lang>` translates each agent's English triggers once with the current pi model, writes the cache to `~/.pi/agent/subagents-lang.json`, and enables that language for delegation matching. Cached agents use triggers in this shape:
+
+```text
+[original_english, ...translated_words]
+```
+
+Bundled agents declare `triggers_en` so translation uses only the English source terms even though their legacy multilingual `triggers` remain for backward compatibility. User and project agents without `triggers_en` fall back to their current `triggers` list as the English source. Re-running the same language reuses the cache unless an agent's English trigger list changes.
 
 ### Configure handoff behavior
 

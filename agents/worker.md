@@ -7,6 +7,7 @@ examples:
   - "Fix the bug after scout identifies the relevant code path"
   - "Apply reviewer feedback in the changed files"
 triggers: implement, change, build, fix, refactor, edit, modify, execute, apply, implementar, mudar, alterar, construir, consertar, corrigir, refatorar, editar, modificar, executar, aplicar, fazer, realizar
+triggers_en: implement, change, build, fix, refactor, edit, modify, execute, apply
 model: inherit
 thinking: inherit
 color: green

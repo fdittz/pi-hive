@@ -7,6 +7,7 @@ examples:
   - "Plan the smallest safe refactor after reviewing relevant files"
   - "Identify files to modify and testing steps for a requested feature"
 triggers: plan, design, approach, steps, roadmap, tasks, strategy, implementation plan, planejar, design, abordagem, passos, etapas, roadmap, roteiro, tarefas, estratégia, implementação, projeto, refatoração, plano, plano de implementação
+triggers_en: plan, design, approach, steps, roadmap, tasks, strategy, implementation plan
 tools: read, grep, find, ls, handoff
 model: inherit
 thinking: inherit

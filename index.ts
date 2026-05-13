@@ -48,11 +48,19 @@ import {
 	shouldAskApprovalForHandoff,
 } from "./handoff.js";
 import { LiveSubagentRegistry } from "./live-registry.js";
-import { loadSubagentModelConfig, resolveAgentModel } from "./model-overrides.js";
+import { formatModelRef, loadSubagentModelConfig, resolveAgentModel } from "./model-overrides.js";
 import { openSubagentModelSelector } from "./model-selector.js";
 import { buildSubagentHeaderEnv, isSubagentChildProcess, registerSubagentRequestHeaders } from "./request-headers.js";
+import {
+	applySubagentsLanguageToAgents,
+	getEnglishTriggers,
+	hashSubagentsLanguageTriggers,
+	normalizeSubagentsLanguageCode,
+	refreshSubagentsLanguageCache,
+} from "./subagents-lang.js";
 import { loadSubagentConfig } from "./subagent-config.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
+import { getPiInvocation } from "./pi-invocation.js";
 import { TranscriptStorage } from "./transcript-storage.js";
 import { appendCoalescedTranscriptEvent, formatRunLabel, shouldPersistReplayEvent, type ChildSessionRef, type StoredTranscriptEvent, type SubagentRunMode, type TranscriptSegmentRef, type TranscriptStorageRef } from "./transcript-types.js";
 
@@ -286,22 +294,6 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
 	});
 	return { dir: tmpDir, filePath };
-}
-
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
-	}
-
-	return { command: "pi", args };
 }
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
@@ -721,6 +713,86 @@ function parseAutoDelegateThreshold(value: string | undefined): number | undefin
 	return threshold;
 }
 
+function mergeAgentsForLanguageCache(...agentSets: AgentConfig[][]): AgentConfig[] {
+	const merged = new Map<string, AgentConfig>();
+	for (const agent of agentSets.flat()) {
+		const triggerHash = hashSubagentsLanguageTriggers(getEnglishTriggers(agent));
+		const key = `${agent.source}:${agent.name}:${triggerHash}`;
+		if (!merged.has(key)) merged.set(key, agent);
+	}
+	return Array.from(merged.values());
+}
+
+function formatAgentTriggersForMessage(agents: AgentConfig[]): string {
+	if (agents.length === 0) return "- No agents discovered.";
+	return agents
+		.map((agent) => `- ${agent.name} (${agent.source}): ${JSON.stringify(agent.triggers ?? [])}`)
+		.join("\n");
+}
+
+async function handleSubagentsLangCommand(args: string, ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+	const parts = args.trim().split(/\s+/).filter(Boolean);
+	const rawLanguage = parts[0] ?? "";
+	const language = parts.length === 1 ? normalizeSubagentsLanguageCode(rawLanguage) : null;
+	if (!language) {
+		ctx.ui.notify("Usage: /subagents-lang <lang>", "warning");
+		return;
+	}
+
+	const userDiscovery = discoverAgents(ctx.cwd, "user");
+	const projectDiscovery = discoverAgents(ctx.cwd, "both");
+	const agentsForCache = mergeAgentsForLanguageCache(userDiscovery.agents, projectDiscovery.agents);
+	if (agentsForCache.length === 0) {
+		ctx.ui.notify("No subagents discovered to translate.", "warning");
+		return;
+	}
+
+	const modelRef = ctx.model ? formatModelRef(ctx.model) : undefined;
+	const thinking = pi.getThinkingLevel();
+	ctx.ui.notify(`Translating subagent triggers for ${language}...`, "info");
+
+	try {
+		const result = await refreshSubagentsLanguageCache({
+			agents: agentsForCache,
+			language,
+			cwd: ctx.cwd,
+			modelRef,
+			thinking,
+			signal: ctx.signal,
+		});
+		await loadCachedAgentsWithEnglishTriggers({ cwd: ctx.cwd, scope: "user", enabled: true });
+		const activeAgents = applySubagentsLanguageToAgents(agentsForCache, result.config).agents;
+		const triggerDetails = activeAgents.map((agent) => ({
+			name: agent.name,
+			source: agent.source,
+			triggers: agent.triggers ?? [],
+			triggers_en: agent.triggers_en ?? [],
+		}));
+		ctx.ui.notify(
+			`Subagent trigger language set to ${result.language}: translated ${result.translatedAgents} agent(s), ${result.translatedTriggers} trigger(s); ${result.cachedAgents} cached agent(s).`,
+			"info",
+		);
+		pi.sendMessage({
+			customType: "subagents-lang-result",
+			display: true,
+			content: [
+				`# Subagent trigger language: ${result.language}`,
+				"",
+				`Cache: \`${result.configPath}\``,
+				`Translated this run: ${result.translatedAgents} agent(s), ${result.translatedTriggers} trigger(s).`,
+				`Cached: ${result.cachedAgents} agent(s).`,
+				"",
+				"Resulting triggers (`[original_english, ...translated]`):",
+				formatAgentTriggersForMessage(activeAgents),
+			].join("\n"),
+			details: { language: result.language, configPath: result.configPath, agents: triggerDetails },
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		ctx.ui.notify(`Subagent trigger translation failed: ${message}`, "error");
+	}
+}
+
 async function handleAutoDelegateCommand(args: string, ctx: ExtensionContext): Promise<void> {
 	const warmDelegationMetadata = () => {
 		void loadCachedAgentsWithEnglishTriggers({
@@ -1126,6 +1198,13 @@ export default function (pi: ExtensionAPI) {
 		description: "Configure subagent handoff behavior",
 		handler: async (_args, ctx) => {
 			await openSubagentHandoffConfig(ctx);
+		},
+	});
+
+	pi.registerCommand("subagents-lang", {
+		description: "Translate and cache subagent triggers for a language",
+		handler: async (args, ctx) => {
+			await handleSubagentsLangCommand(args, ctx, pi);
 		},
 	});
 

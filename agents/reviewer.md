@@ -7,6 +7,7 @@ examples:
   - "Audit the changed authentication code for risky edge cases"
   - "Check whether the implementation matches the plan and flag concerns"
 triggers: review, audit, security, quality, regression, risk, vulnerabilities, correctness, maintainability, revisar, auditar, segurança, qualidade, regressão, risco, vulnerabilidades, corretude, manutenibilidade, review, análise, verificação, revisão, auditoria, correção
+triggers_en: review, audit, security, quality, regression, risk, vulnerabilities, correctness, maintainability
 tools: read, grep, find, ls, bash, handoff
 model: inherit
 thinking: inherit
