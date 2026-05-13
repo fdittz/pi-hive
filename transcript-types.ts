@@ -1,6 +1,6 @@
 import type { Message } from "@earendil-works/pi-ai";
 
-export type SubagentRunStatus = "running" | "cancelling" | "done" | "failed" | "aborted";
+export type SubagentRunStatus = "running" | "cancelling" | "done" | "completed" | "failed" | "aborted" | "cancelled";
 export type SubagentRunMode = "single" | "parallel" | "chain";
 export type AgentSource = "package" | "user" | "project" | "unknown";
 
@@ -83,6 +83,9 @@ export interface SubagentRunRecord {
 
 	/** Compact replay events safe to persist into session details as fallback. */
 	replayEvents: StoredTranscriptEvent[];
+
+	/** Full result text for synthetic/background terminal runs. */
+	resultOutput?: string;
 
 	/** Full transcript sidecar reference, available after a run finishes and storage succeeds. */
 	transcriptRef?: TranscriptStorageRef;

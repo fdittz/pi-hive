@@ -70,6 +70,7 @@ export class TranscriptView {
 	): TranscriptViewportResult {
 		const safeWidth = Math.max(1, Math.floor(width));
 		const safeHeight = Math.max(0, Math.floor(viewport.height));
+		if (run.resultOutput !== undefined) return this.renderResultOutputViewport(run, safeWidth, viewport);
 		const selected = this.selectEvents(run);
 		const adapterKey = this.buildAdapterKey(run, options);
 		let state = this.ensureState(run, selected, adapterKey, options);
@@ -360,6 +361,26 @@ export class TranscriptView {
 		const maxScroll = Math.max(0, totalLines - height);
 		if (viewport.stickToBottom) return maxScroll;
 		return Math.max(0, Math.min(Math.floor(viewport.scrollOffset), maxScroll));
+	}
+
+	private renderResultOutputViewport(
+		run: SubagentRunRecord,
+		width: number,
+		viewport: TranscriptViewport,
+	): TranscriptViewportResult {
+		this.state = undefined;
+		this.cachedRenderKey = undefined;
+		this.cachedViewport = undefined;
+		const safeHeight = Math.max(0, Math.floor(viewport.height));
+		const output = run.resultOutput?.trimEnd() || "(no result captured)";
+		const lines = this.wrapPlainLines(output.split(/\r?\n/), width);
+		const totalLines = lines.length;
+		const scrollOffset = this.resolveScrollOffset({ ...viewport, stickToBottom: false }, totalLines, safeHeight);
+		return {
+			lines: safeHeight > 0 ? lines.slice(scrollOffset, scrollOffset + safeHeight) : [],
+			totalLines,
+			scrollOffset,
+		};
 	}
 
 	private renderPlainViewport(

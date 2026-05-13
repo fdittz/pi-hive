@@ -12,8 +12,10 @@ function statusIcon(status: string): string {
 		case "cancelling":
 			return "⏹";
 		case "done":
+		case "completed":
 			return "✓";
 		case "aborted":
+		case "cancelled":
 			return "⏹";
 		default:
 			return "✗";
@@ -34,6 +36,14 @@ function formatDuration(ms: number): string {
 function elapsedMs(run: SubagentRunRecord, preferCancelTime = false): number {
 	const end = preferCancelTime && run.cancelRequestedAt ? run.cancelRequestedAt : (run.endedAt ?? Date.now());
 	return Math.max(0, end - run.startedAt);
+}
+
+function isLiveStatus(status: string): boolean {
+	return status === "running" || status === "cancelling";
+}
+
+function canCancelStatus(status: string): boolean {
+	return status === "running" || status === "cancelling";
 }
 
 function shortCwd(cwd: string): string {
@@ -201,7 +211,7 @@ export class SubagentOverlay implements Component {
 			{
 				scrollOffset: this.scrollOffset,
 				height: bodyHeight,
-				stickToBottom: this.stickToBottom,
+				stickToBottom: isLiveStatus(run.status) && this.stickToBottom,
 			},
 			{
 				tui: this.tui,
@@ -238,7 +248,7 @@ export class SubagentOverlay implements Component {
 		const run = this.getSelectedRun();
 		const confirmCancelWithCtrlC = matchesKey(data, "ctrl+c") && (!this.selectedText || this.cancelConfirmationRunId === run?.id);
 		const confirmCancelWithX = matchesKey(data, "x") || data === "X";
-		if (confirmCancelWithX || confirmCancelWithCtrlC) {
+		if ((confirmCancelWithX || confirmCancelWithCtrlC) && run && canCancelStatus(run.status)) {
 			this.cancelSelectedRun();
 			return;
 		}
@@ -615,12 +625,13 @@ export class SubagentOverlay implements Component {
 		const agentName = this.theme.bold(colorAgentText(this.theme, run.agentColor, runLabel, "toolTitle"));
 		const statusText = this.renderStatusText(run);
 		const title = `${this.theme.bold(this.theme.fg("accent", "Subagents"))} ${this.theme.fg("muted", `${this.selectedIndex + 1}/${total}`)} ${statusIcon(run.status)} ${statusText} ${agentName} ${this.theme.fg("muted", `[${run.mode}]`)} ${run.model ? this.theme.fg("dim", run.model) : ""}`;
-		const elapsed = formatDuration(elapsedMs(run, run.status === "aborted" && Boolean(run.cancelRequestedAt)));
-		const ctx = `${this.theme.fg("muted", "id:")} ${this.theme.fg("dim", getRunShortId(run.id))} ${this.theme.fg("muted", "elapsed:")} ${this.theme.fg("dim", elapsed)} ${this.theme.fg("muted", "cwd:")} ${this.theme.fg("dim", shortCwd(run.cwd || process.cwd()))}`;
-		const help = this.theme.fg(
-			"dim",
-			"←/→ agent · ↑/↓ scroll · x cancel · drag select · Ctrl+C copy/cancel · Ctrl+O expand · Alt+O/Esc/q back",
-		);
+		const elapsed = formatDuration(elapsedMs(run, (run.status === "aborted" || run.status === "cancelled") && Boolean(run.cancelRequestedAt)));
+		const displayId = run.id.startsWith("bg_") ? run.id : getRunShortId(run.id);
+		const ctx = `${this.theme.fg("muted", "id:")} ${this.theme.fg("dim", displayId)} ${this.theme.fg("muted", "elapsed:")} ${this.theme.fg("dim", elapsed)} ${this.theme.fg("muted", "cwd:")} ${this.theme.fg("dim", shortCwd(run.cwd || process.cwd()))}`;
+		const helpText = isLiveStatus(run.status)
+			? "←/→ agent · ↑/↓ scroll · x cancel · drag select · Ctrl+C copy/cancel · Ctrl+O expand · Alt+O/Esc/q back"
+			: "←/→ agent · ↑/↓ scroll · drag select · Ctrl+C copy · Alt+O/Esc/q back";
+		const help = this.theme.fg("dim", helpText);
 		return [top, truncateToWidth(title, width), truncateToWidth(ctx, width), truncateToWidth(help, width), top];
 	}
 
@@ -632,7 +643,10 @@ export class SubagentOverlay implements Component {
 				return this.theme.fg("warning", "Cancelling...");
 			case "done":
 				return this.theme.fg("success", "Done");
+			case "completed":
+				return this.theme.fg("success", "Completed");
 			case "aborted":
+			case "cancelled":
 				return this.theme.fg("warning", "Cancelled (partial result)");
 			default:
 				return this.theme.fg("error", "Failed");
@@ -643,7 +657,7 @@ export class SubagentOverlay implements Component {
 		const state = this.expanded ? "expanded" : "collapsed";
 		const line = this.theme.fg("borderAccent", "─".repeat(Math.max(0, width)));
 		const notice = this.copyNotice ? ` · ${this.theme.fg(this.copyNotice.color, this.copyNotice.message)}` : "";
-		let footer = `${this.theme.fg("dim", `View: ${state}`)}${notice}`;
+		let footer = `${this.theme.fg("dim", run.resultOutput !== undefined ? "View: full result" : `View: ${state}`)}${notice}`;
 		if (this.cancelConfirmationRunId === run.id) {
 			footer = this.theme.fg(
 				"warning",
@@ -651,7 +665,7 @@ export class SubagentOverlay implements Component {
 			);
 		} else if (run.status === "cancelling") {
 			footer = `${this.theme.fg("warning", `Cancelling... elapsed ${formatDuration(elapsedMs(run))}`)}${notice}`;
-		} else if (run.status === "aborted" && run.id === this.cancelRequestedRunId) {
+		} else if ((run.status === "aborted" || run.status === "cancelled") && run.id === this.cancelRequestedRunId) {
 			footer = `${this.theme.fg("warning", `Cancelled after ${formatDuration(elapsedMs(run, true))}`)} ${this.theme.fg("dim", "- Press any key to close")}`;
 		}
 		return [line, truncateToWidth(footer, width)];

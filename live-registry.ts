@@ -47,6 +47,19 @@ function resultStartedAt(result: HistoricalResultLike, fallback: number): number
 	return safeTimestamp(firstMessage?.timestamp, fallback);
 }
 
+export interface BackgroundJobRunInput {
+	id: string;
+	agent: string;
+	task: string;
+	status: "running" | "completed" | "failed" | "cancelled";
+	startedAt: string | number;
+	completedAt?: string | number;
+	result?: string;
+	error?: string;
+	cwd?: string;
+	parentToolCallId?: string;
+}
+
 export class LiveSubagentRegistry {
 	private runs = new Map<string, SubagentRunRecord>();
 	private subscribers = new Set<() => void>();
@@ -195,11 +208,61 @@ export class LiveSubagentRegistry {
 		run.errorMessage = result.errorMessage;
 		run.stderr = result.stderr;
 		run.endedAt = Date.now();
-		if (result.status === "aborted" && !run.cancelRequestedAt) run.cancelRequestedAt = run.endedAt;
-		if (result.status === "aborted" && wasRunningOrCancelling) this.cancelledRunIds.add(run.id);
+		if ((result.status === "aborted" || result.status === "cancelled") && !run.cancelRequestedAt) run.cancelRequestedAt = run.endedAt;
+		if ((result.status === "aborted" || result.status === "cancelled") && wasRunningOrCancelling) this.cancelledRunIds.add(run.id);
 		this.abortControllers.delete(runId);
 		this.touch(run);
 		this.notify();
+	}
+
+	recordBackgroundJobResult(input: BackgroundJobRunInput): SubagentRunRecord {
+		const existing = this.runs.get(input.id);
+		const startedAt = safeTimestamp(input.startedAt, existing?.startedAt ?? Date.now());
+		const terminal = input.status !== "running";
+		const completedAt = input.completedAt ? safeTimestamp(input.completedAt, Date.now()) : undefined;
+		const endedAt = terminal ? (completedAt ?? existing?.endedAt ?? Date.now()) : existing?.endedAt;
+		const status = input.status === "completed" ? "completed" : input.status === "cancelled" ? "cancelled" : input.status === "failed" ? "failed" : "running";
+		const resultOutput =
+			input.status === "failed"
+				? (input.error ?? existing?.resultOutput ?? "(no error captured)")
+				: input.status === "cancelled"
+					? (input.result ?? existing?.resultOutput ?? "(no partial output captured)")
+					: input.status === "completed"
+						? (input.result ?? existing?.resultOutput ?? "(no result captured)")
+						: existing?.resultOutput;
+		const run: SubagentRunRecord = existing ?? {
+			id: input.id,
+			parentToolCallId: input.parentToolCallId ?? input.id,
+			mode: "single",
+			agent: input.agent,
+			agentSource: "unknown",
+			task: input.task,
+			cwd: input.cwd ?? process.cwd(),
+			status,
+			startedAt,
+			liveEvents: [],
+			revision: 0,
+			liveEventMutations: [],
+			liveEventMutationSequence: 0,
+			replayEvents: [],
+		};
+		run.agent = input.agent || run.agent;
+		run.task = input.task || run.task;
+		run.cwd = input.cwd ?? run.cwd;
+		run.parentToolCallId = input.parentToolCallId ?? run.parentToolCallId;
+		run.status = status;
+		run.startedAt = startedAt;
+		run.endedAt = endedAt;
+		run.exitCode = input.status === "completed" ? 0 : input.status === "failed" ? 1 : input.status === "cancelled" ? 130 : run.exitCode;
+		run.stopReason = input.status === "cancelled" ? "aborted" : input.status === "failed" ? "error" : run.stopReason;
+		run.errorMessage = input.status === "failed" ? input.error : run.errorMessage;
+		run.resultOutput = resultOutput;
+		if (input.status === "cancelled") this.cancelledRunIds.add(run.id);
+		this.runs.set(run.id, run);
+		this.abortControllers.delete(run.id);
+		this.touch(run);
+		this.notify();
+		return run;
 	}
 
 	getRun(runId: string): SubagentRunRecord | undefined {
@@ -214,10 +277,14 @@ export class LiveSubagentRegistry {
 		return this.getRunsSortedByStartTime().filter((run) => this.cancelledRunIds.has(run.id) && (!initialRunIds || initialRunIds.has(run.id)));
 	}
 
-	findRunsByPrefix(query: string): SubagentRunRecord[] {
+	getRunsByPrefix(query: string): SubagentRunRecord[] {
 		const trimmed = query.trim();
 		if (!trimmed) return [];
 		return this.getRunsSortedByStartTime().filter((run) => runMatchesPrefix(run, trimmed));
+	}
+
+	findRunsByPrefix(query: string): SubagentRunRecord[] {
+		return this.getRunsByPrefix(query);
 	}
 
 	clearRuns(): void {
@@ -236,6 +303,13 @@ export class LiveSubagentRegistry {
 
 			if (anyEntry.type === "custom" && anyEntry.customType === "subagent-run-update" && anyEntry.data?.result) {
 				await this.hydrateResult(anyEntry.data.result as HistoricalResultLike, "single", anyEntry.id || "custom", fallbackStartedAt, 0, storage);
+				continue;
+			}
+
+			const customType = anyEntry.customType ?? anyEntry.message?.customType;
+			const customData = anyEntry.data ?? anyEntry.message?.details;
+			if (customType === "subagent-jobs-result" && customData?.job?.id) {
+				this.recordBackgroundJobResult(customData.job as BackgroundJobRunInput);
 				continue;
 			}
 
