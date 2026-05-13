@@ -637,7 +637,8 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
-	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
+	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode). Prefix with --background to run asynchronously." })),
+	background: Type.Optional(Type.Boolean({ description: "Run single-mode agent asynchronously and return a background job id immediately." })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
@@ -893,10 +894,11 @@ function startBackgroundSubagentRun(options: {
 	sessionFile?: string;
 	parentModel?: { provider: string; id: string };
 	parentThinking?: string;
+	controller?: AbortController;
 	makeDetails: (mode: "single" | "chain") => (results: SingleResult[]) => SubagentDetails;
 }): void {
-	const controller = new AbortController();
-	registerBackgroundJobAbortController(options.jobId, controller);
+	const controller = options.controller ?? new AbortController();
+	if (!options.controller) registerBackgroundJobAbortController(options.jobId, controller);
 
 	let progress = 1;
 	const setProgress = (next: number) => {
@@ -1580,6 +1582,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("subagent-jobs", {
+		description: "List, inspect, or cancel background subagent jobs",
+		handler: async (args, ctx) => {
+			await handleSubagentJobsCommand(args, ctx, pi);
+		},
+	});
+
 	pi.registerCommand("subagents-lang", {
 		description: "Translate/cache subagent triggers for a language; supports status, off, refresh, --force, and --project",
 		handler: async (args, ctx) => {
@@ -1616,13 +1625,17 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("subagent", {
 		description: "Run a subagent task",
 		handler: async (args, ctx) => {
-			if (!args.trim()) {
+			const trimmed = args.trim();
+			if (!trimmed) {
 				ctx.ui.notify("Usage: /subagent [--background] agent task", "warning");
 				return;
 			}
+			const backgroundMatch = trimmed.match(/^--background\s+(\S+)\s+([\s\S]+)$/);
 			// Delegate to the LLM by sending a special message that will invoke the tool
 			pi.sendMessage({
-				content: `Please run this subagent task: ${args}`,
+				content: backgroundMatch
+					? `Please invoke the subagent tool with agent ${JSON.stringify(backgroundMatch[1])}, task ${JSON.stringify(backgroundMatch[2].trim())}, and background true.`
+					: `Please run this subagent task: ${trimmed}`,
 				display: true,
 			});
 		},
@@ -2052,11 +2065,84 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (params.agent && params.task) {
+					const backgroundTask = parseBackgroundTaskFlag(params.task);
+					if (backgroundTask !== undefined) {
+						if (!backgroundTask.trim()) {
+							return {
+								content: [{ type: "text", text: "Invalid parameters. Task cannot be empty." }],
+								details: makeDetails("single")([]),
+								isError: true,
+							};
+						}
+
+						// Background execution path
+						const jobId = await queueBackgroundJob(params.agent, backgroundTask);
+						const controller = new AbortController();
+						registerBackgroundJobAbortController(jobId, controller);
+
+						// Spawn background WITHOUT await
+						startBackgroundSubagentRun({
+							jobId,
+							ctx,
+							agents,
+							agent: params.agent,
+							task: backgroundTask,
+							cwd: params.cwd,
+							toolCallId,
+							sessionFile,
+							parentModel,
+							parentThinking,
+							controller,
+							makeDetails: (mode) => (results) => makeDetails(mode)(results),
+						});
+						void refreshBackgroundJobsWidget(ctx);
+
+						return {
+							content: [{ type: "text", text: `Job queued: ${jobId}\n\nMonitor with /subagent-jobs status` }],
+							details: makeDetails("single")([]),
+						};
+					}
+
+					const task = params.task;
+
+					if (!task.trim()) {
+						return {
+							content: [{ type: "text", text: "Invalid parameters. Task cannot be empty." }],
+							details: makeDetails("single")([]),
+							isError: true,
+						};
+					}
+
+					if (params.background === true) {
+						const jobId = await queueBackgroundJob(params.agent, task);
+						const controller = new AbortController();
+						registerBackgroundJobAbortController(jobId, controller);
+						startBackgroundSubagentRun({
+							jobId,
+							ctx,
+							agents,
+							agent: params.agent,
+							task,
+							cwd: params.cwd,
+							toolCallId,
+							sessionFile,
+							parentModel,
+							parentThinking,
+							controller,
+							makeDetails: (mode) => (results) => makeDetails(mode)(results),
+						});
+						void refreshBackgroundJobsWidget(ctx);
+						return {
+							content: [{ type: "text", text: `Job queued: ${jobId}\n\nMonitor with /subagent-jobs status` }],
+							details: makeDetails("single")([]),
+						};
+					}
+
 					const result = await runSingleAgent(
 						ctx.cwd,
 						agents,
 						params.agent,
-						params.task,
+						task,
 						params.cwd,
 						undefined,
 						signal,
