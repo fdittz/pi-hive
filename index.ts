@@ -1613,6 +1613,21 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("subagent", {
+		description: "Run a subagent task",
+		handler: async (args, ctx) => {
+			if (!args.trim()) {
+				ctx.ui.notify("Usage: /subagent [--background] agent task", "warning");
+				return;
+			}
+			// Delegate to the LLM by sending a special message that will invoke the tool
+			pi.sendMessage({
+				content: `Please run this subagent task: ${args}`,
+				display: true,
+			});
+		},
+	});
+
 	pi.registerShortcut("ctrl+shift+o", {
 		description: "Open/close the live subagent view",
 		handler: async (ctx) => {
