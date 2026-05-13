@@ -7,7 +7,11 @@ interface TimeoutConfig {
 	agents: Record<string, number | null>;
 }
 
-const CONFIG_PATH = path.join(process.env.HOME || "~", ".pi/agent/subagent-timeout.json");
+function getSubagentTimeoutConfigPath(): string {
+	return path.join(process.env.HOME || "~", ".pi/agent/subagent-timeout.json");
+}
+
+const CONFIG_PATH = getSubagentTimeoutConfigPath();
 
 const DEFAULT_CONFIG: TimeoutConfig = {
 	enabled: false,
@@ -58,6 +62,12 @@ export async function setAgentTimeout(agent: string, timeoutMs: number | null): 
 	await saveTimeoutConfig(config);
 }
 
+export function getEffectiveTimeoutFromConfig(config: TimeoutConfig, agent: string): number | null {
+	const agentTimeout = config.agents[agent];
+	if (agentTimeout !== undefined) return agentTimeout;
+	return config.defaultMs;
+}
+
 export async function formatTimeoutConfig(): Promise<string> {
 	const config = await loadTimeoutConfig();
 	const lines: string[] = [];
@@ -89,3 +99,5 @@ export async function formatTimeoutConfig(): Promise<string> {
 
 	return lines.join("\n");
 }
+
+export { getSubagentTimeoutConfigPath };
