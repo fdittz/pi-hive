@@ -760,12 +760,17 @@ async function openSubagentsOverlay(ctx: ExtensionContext, pi: ExtensionAPI, run
 		reportedCancelledRunIds.add(runId);
 		feedbackQueue = feedbackQueue
 			.then(async () => {
-				const existingJob = await getBackgroundJob(runId);
-				if (existingJob?.status === "running") await cancelJob(runId);
 				const run = await waitForRunTerminal(runId);
+				const partialResults = extractLatestRunText(run) || "(no partial output captured)";
+				const jobAfterRun = await getBackgroundJob(runId);
+				if (jobAfterRun?.status === "running" || (jobAfterRun?.status === "cancelled" && !jobAfterRun.result)) {
+					await cancelJob(runId, partialResults);
+				}
 				const finalJob = await getBackgroundJob(runId);
 				ctx.ui.notify(`Cancelled ${formatRunLabel(run?.agent ?? "subagent", runId)} - partial results saved.`, "info");
-				if (!finalJob) {
+				if (finalJob) {
+					sendBackgroundJobCompletionMessage(pi, finalJob);
+				} else {
 					sendBackgroundJobsMessage(pi, formatCancelledRunSummary(run, runId), { id: runId, run });
 				}
 				await refreshBackgroundJobsWidget(ctx);
