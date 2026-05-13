@@ -107,13 +107,20 @@ export function generateSubagentGuidance(agents: AgentConfig[]): SubagentGuidanc
 	const promptSnippet = [
 		"Delegate tasks to specialized subagents with isolated context.",
 		`Available agents: ${agentList}${remainingText}`,
-		'Modes: single, parallel tasks, or chain with {previous}.',
+		'Modes: single, parallel tasks, or chain with {previous}. Add --background flag to run asynchronously: /subagent --background agent task',
 	].join(" ");
 
 	const promptGuidelines: string[] = [
+		"When user asks to 'find', 'search', 'investigate', 'analyze', or 'explore' code/files, use subagent with agent 'scout'.",
+		"When user asks to 'plan', 'design', 'create a strategy', or 'create a roadmap', use subagent with agent 'planner'.",
+		"When user asks to 'review', 'audit', 'check for bugs', or 'security review', use subagent with agent 'reviewer'.",
+		"When user asks to 'implement', 'fix', 'build', 'refactor', or 'modify', use subagent with agent 'worker'.",
+		"When user asks to 'debug', 'investigate why', 'diagnose', or 'find the root cause', use subagent with agent 'debugger'.",
+		"When user mentions 'background', 'async', 'in parallel', 'without blocking', or 'while I work', add --background flag: /subagent --background agent task",
 		"Use subagent when an available specialized agent can do focused discovery, planning, implementation, review, or domain-specific work in an isolated context.",
 		'Use subagent agentScope "both" (or "project") when the user explicitly asks to use trusted project-local agents from .pi/agents; default agentScope "user" excludes project-local agents.',
 		"Use subagent parallel tasks only for independent work; use chain when one agent's output should feed the next step.",
+		"Background tasks run asynchronously without blocking; user can check progress with /subagent-jobs status and retrieve results with /subagent-jobs results <id>.",
 	];
 
 	for (const agent of availableAgents) {
@@ -137,8 +144,18 @@ export function generateSubagentGuidance(agents: AgentConfig[]): SubagentGuidanc
 	if (remaining > 0) {
 		promptGuidelines.push(`Subagent guidance omitted ${remaining} additional agent(s) to keep the prompt compact; rely on tool errors or user-provided names if needed.`);
 	}
+	
+	promptGuidelines.push(
+		"When user messages suggest delegation (finding, planning, reviewing, implementing, debugging), invoke subagent tool automatically without asking.",
+	);
 
 	promptGuidelines.push(...maybeKnownChainGuidance(availableAgents));
+	
+	// Reinforce agent selection based on user intent patterns
+	promptGuidelines.push(
+		"Detect user intent: if they mention finding/searching → scout; planning/designing → planner; reviewing/auditing → reviewer; implementing/fixing → worker; debugging/diagnosing → debugger.",
+		"For exploratory or long-running tasks, proactively suggest background execution with --background flag so user can continue working.",
+	);
 
 	// Background execution guidance
 	promptGuidelines.push(
@@ -154,6 +171,17 @@ export function generateSubagentGuidance(agents: AgentConfig[]): SubagentGuidanc
 		"",
 		availableAgents.length > 0 ? availableAgents.map(formatPromptSectionAgent).join("\n") : "- No agents discovered.",
 		remaining > 0 ? `- ${remaining} additional agent(s) omitted to keep guidance compact.` : "",
+		"",
+		"### When to Use Each Agent:",
+		"- **scout**: Finding code, searching, investigating structure, tracing dependencies, exploring codebase",
+		"- **planner**: Creating plans, designing solutions, mapping implementation strategy",
+		"- **reviewer**: Code review, security audit, quality analysis, regression risk assessment",
+		"- **worker**: Implementation, fixes, refactoring, building, modifying code",
+		"- **debugger**: Debugging, root cause analysis, diagnosing issues, tracing errors",
+		"",
+		"### Background Execution:",
+		"Add `--background` flag to run tasks asynchronously without blocking: `/subagent --background scout Find auth code`",
+		"Monitor with `/subagent-jobs status` and retrieve results with `/subagent-jobs results <id>`",
 		"",
 		'Use `agentScope: "both"` (or `"project"`) only when the user explicitly wants trusted project-local agents from `.pi/agents`; the default `"user"` scope only includes bundled/user agents.',
 		"Use chain mode when output should flow between agents, and parallel mode only for independent tasks.",
