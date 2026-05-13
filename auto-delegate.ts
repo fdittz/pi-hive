@@ -9,7 +9,7 @@ export interface AutoDelegateConfig {
 }
 
 const DEFAULT_CONFIG: AutoDelegateConfig = {
-	enabled: false,
+	enabled: true,
 	confidenceThreshold: 70,
 	autoExecute: true,
 };
