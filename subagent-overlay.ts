@@ -1,7 +1,8 @@
-import { CustomEditor, getSelectListTheme, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, FooterComponent, getSelectListTheme, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { colorAgentText } from "./agent-colors.js";
 import type { LiveSubagentRegistry } from "./live-registry.js";
+import { createFooterDataAdapter, createFooterSessionAdapter, type SubagentOverlayHostContext } from "./subagent-overlay-context.js";
 import { TranscriptView } from "./transcript-view.js";
 import { formatRunLabel, getRunShortId, type SubagentRunRecord } from "./transcript-types.js";
 
@@ -50,6 +51,21 @@ function shortCwd(cwd: string): string {
 	const home = process.env.HOME;
 	if (home && cwd.startsWith(home)) return `~${cwd.slice(home.length)}`;
 	return cwd;
+}
+
+function formatKeyText(key: string): string {
+	return key
+		.split("+")
+		.map((part) => {
+			if (part === "ctrl") return "Ctrl";
+			if (part === "alt") return "Alt";
+			if (part === "shift") return "Shift";
+			if (part === "super") return "Super";
+			if (part === "pageUp") return "PgUp";
+			if (part === "pageDown") return "PgDn";
+			return part.length === 1 ? part.toUpperCase() : `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`;
+		})
+		.join("+");
 }
 
 type MouseEventKind = "down" | "drag" | "up" | "wheel";
@@ -156,6 +172,7 @@ export class SubagentOverlay implements Component {
 	private expanded = false;
 	private stickToBottom = true;
 	private transcriptView = new TranscriptView();
+	private footer: FooterComponent;
 	private selectedText?: SelectionRange;
 	private selectionStart?: SelectionPoint;
 	private selectionEnd?: SelectionPoint;
@@ -181,9 +198,11 @@ export class SubagentOverlay implements Component {
 		private keybindings: KeybindingsManager,
 		private done: () => void,
 		private registry: LiveSubagentRegistry,
+		private host: SubagentOverlayHostContext,
 		private initialRunId?: string,
 		private onCancelledRun?: (runId: string) => void,
 	) {
+		this.footer = new FooterComponent(createFooterSessionAdapter(this.host), createFooterDataAdapter(this.host));
 		this.enableMouseReporting();
 		this.setTextCursor();
 		this.unsubscribe = registry.subscribe(() => {
@@ -206,11 +225,12 @@ export class SubagentOverlay implements Component {
 		const run = runs[this.selectedIndex];
 
 		const header = this.renderHeader(run, runs.length, safeWidth);
-		const rawEditorLines = this.renderInputEditor(run, safeWidth);
-		const maxEditorLines = Math.max(0, height - header.length - 3);
-		const editorLines = rawEditorLines.slice(0, maxEditorLines);
-		const footer = this.renderFooter(run, safeWidth, editorLines);
-		const bodyHeight = Math.max(1, height - header.length - footer.length);
+		const statusLines = this.renderStatusLine(run, safeWidth);
+		const footer = this.renderFooter(safeWidth);
+		const rawInputLines = this.renderInputEditor(run, safeWidth);
+		const maxInputLines = Math.max(0, height - header.length - statusLines.length - footer.length - 1);
+		const inputLines = rawInputLines.slice(0, maxInputLines);
+		const bodyHeight = Math.max(1, height - header.length - statusLines.length - inputLines.length - footer.length);
 		const viewport = this.transcriptView.renderRunViewport(
 			run,
 			safeWidth,
@@ -233,7 +253,7 @@ export class SubagentOverlay implements Component {
 		this.lastBodyLines = viewport.lines.slice(0, bodyHeight);
 		const visibleBody = this.renderSelection(viewport.lines.slice());
 		while (visibleBody.length < bodyHeight) visibleBody.push("");
-		return this.padToHeight([...header, ...visibleBody, ...footer], safeWidth, height);
+		return this.padToHeight([...header, ...visibleBody, ...statusLines, ...inputLines, ...footer], safeWidth, height);
 	}
 
 	handleInput(data: string): void {
@@ -252,7 +272,7 @@ export class SubagentOverlay implements Component {
 		if (this.shouldCloseAfterCancel()) return;
 
 		const run = this.getSelectedRun();
-		const editor = run ? this.getEditorForRun(run) : undefined;
+		const editor = run && isLiveStatus(run.status) ? this.getEditorForRun(run) : undefined;
 		const hasInputController = Boolean(run && this.registry.getInputController(run.id));
 		const editorHasText = Boolean(editor && editor.getText().length > 0);
 		const confirmCancelWithCtrlC = matchesKey(data, "ctrl+c") && (!this.selectedText || this.cancelConfirmationRunId === run?.id);
@@ -283,8 +303,16 @@ export class SubagentOverlay implements Component {
 			this.tui.requestRender();
 			return;
 		}
-		if (editor && (matchesKey(data, "alt+enter") || matchesKey(data, "alt+return") || data === "\x1b\r" || data === "\x1b\n")) {
+		if (editor && this.matchesFollowUp(data)) {
 			void this.submitEditorText("followUp", run);
+			return;
+		}
+		if (editor && this.matchesMessageSubmit(data) && !editor.isShowingAutocomplete()) {
+			void this.submitEditorText("steer", run);
+			return;
+		}
+		if (this.matchesDequeue(data)) {
+			this.showCopyNotice("Dequeue not yet supported (requires pi RPC upgrade)", "warning");
 			return;
 		}
 		if (matchesKey(data, Key.left) && !editorHasText) {
@@ -333,6 +361,7 @@ export class SubagentOverlay implements Component {
 
 	invalidate(): void {
 		this.transcriptView.invalidate();
+		this.footer.invalidate();
 	}
 
 	dispose(): void {
@@ -351,6 +380,7 @@ export class SubagentOverlay implements Component {
 		}
 		this.disableMouseReporting();
 		this.restoreCursor();
+		this.footer.dispose();
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 	}
@@ -376,10 +406,37 @@ export class SubagentOverlay implements Component {
 	}
 
 	private renderInputEditor(run: SubagentRunRecord, width: number): string[] {
+		if (!isLiveStatus(run.status)) {
+			for (const candidate of this.editorsByRunId.values()) candidate.focused = false;
+			return [];
+		}
 		const editor = this.getEditorForRun(run);
 		for (const candidate of this.editorsByRunId.values()) candidate.focused = candidate === editor;
 		editor.disableSubmit = !this.registry.getInputController(run.id);
 		return editor.render(width);
+	}
+
+	private matchesFollowUp(data: string): boolean {
+		return this.keybindings.matches(data, "app.message.followUp");
+	}
+
+	private matchesMessageSubmit(data: string): boolean {
+		return this.matchesOptionalAppKey(data, "app.message.submit") || matchesKey(data, Key.enter) || matchesKey(data, Key.return);
+	}
+
+	private matchesDequeue(data: string): boolean {
+		return this.keybindings.matches(data, "app.message.dequeue") || matchesKey(data, Key.alt("up"));
+	}
+
+	private matchesOptionalAppKey(data: string, keybinding: string): boolean {
+		const matches = this.keybindings.matches as (data: string, keybinding: string) => boolean;
+		return matches.call(this.keybindings, data, keybinding);
+	}
+
+	private keyText(keybinding: string, fallback: string): string {
+		const getKeys = this.keybindings.getKeys as (keybinding: string) => string[];
+		const [first] = getKeys.call(this.keybindings, keybinding);
+		return first ? formatKeyText(first) : fallback;
 	}
 
 	private shouldRouteVerticalToEditor(run: SubagentRunRecord | undefined, editor: CustomEditor | undefined): boolean {
@@ -722,8 +779,11 @@ export class SubagentOverlay implements Component {
 		const elapsed = formatDuration(elapsedMs(run, (run.status === "aborted" || run.status === "cancelled") && Boolean(run.cancelRequestedAt)));
 		const displayId = run.id.startsWith("bg_") ? run.id : getRunShortId(run.id);
 		const ctx = `${this.theme.fg("muted", "id:")} ${this.theme.fg("dim", displayId)} ${this.theme.fg("muted", "elapsed:")} ${this.theme.fg("dim", elapsed)} ${this.theme.fg("muted", "cwd:")} ${this.theme.fg("dim", shortCwd(run.cwd || process.cwd()))}`;
+		const submitKey = this.keyText("app.message.submit", this.keyText("tui.input.submit", "Enter"));
+		const followUpKey = this.keyText("app.message.followUp", "Alt+Enter");
+		const newLineKey = this.keyText("tui.input.newLine", "Shift+Enter");
 		const helpText = isLiveStatus(run.status)
-			? "Enter steer · Alt+Enter follow-up · Shift+Enter newline · PgUp/PgDn scroll · Ctrl+C cancel · Ctrl+O expand · Alt+O/Esc back"
+			? `${submitKey} steer · ${followUpKey} follow-up · ${newLineKey} newline · PgUp/PgDn scroll · Ctrl+C cancel · Ctrl+O expand · Alt+O/Esc back`
 			: "←/→ agent · ↑/↓ scroll · drag select · Ctrl+C copy · Alt+O/Esc/q back";
 		const help = this.theme.fg("dim", helpText);
 		return [top, truncateToWidth(title, width), truncateToWidth(ctx, width), truncateToWidth(help, width), top];
@@ -747,35 +807,41 @@ export class SubagentOverlay implements Component {
 		}
 	}
 
-	private renderFooter(run: SubagentRunRecord, width: number, editorLines: string[]): string[] {
+	private renderStatusLine(run: SubagentRunRecord, width: number): string[] {
 		const state = this.expanded ? "expanded" : "collapsed";
-		const line = this.theme.fg("borderAccent", "─".repeat(Math.max(0, width)));
 		const notice = this.copyNotice ? ` · ${this.theme.fg(this.copyNotice.color, this.copyNotice.message)}` : "";
 		const pendingParts: string[] = [];
 		if (run.pendingSteeringMessages) pendingParts.push(`${run.pendingSteeringMessages} steering`);
 		if (run.pendingFollowUpMessages) pendingParts.push(`${run.pendingFollowUpMessages} follow-up`);
 		if (!pendingParts.length && run.pendingInputMessages) pendingParts.push(`${run.pendingInputMessages} queued`);
 		const pending = pendingParts.length ? ` · ${this.theme.fg("warning", `queued: ${pendingParts.join(", ")}`)}` : "";
-		const inputState = this.registry.getInputController(run.id)
-			? this.theme.fg("dim", "Input: Enter steer · Alt+Enter follow-up")
-			: this.theme.fg("dim", "Input: unavailable for finished/historical runs");
+		const submitKey = this.keyText("app.message.submit", this.keyText("tui.input.submit", "Enter"));
+		const followUpKey = this.keyText("app.message.followUp", "Alt+Enter");
+		const inputState = isLiveStatus(run.status)
+			? this.theme.fg("dim", `Input: ${submitKey} steer · ${followUpKey} follow-up`)
+			: this.theme.fg("dim", "Input hidden for terminal run");
 		const inputError = run.inputErrorMessage ? ` · ${this.theme.fg("error", run.inputErrorMessage)}` : "";
-		let footer = `${this.theme.fg("dim", run.resultOutput !== undefined ? "View: full result" : `View: ${state}`)} · ${inputState}${pending}${inputError}${notice}`;
+		let status = `${this.theme.fg("dim", run.resultOutput !== undefined ? "View: full result" : `View: ${state}`)} · ${inputState}${pending}${inputError}${notice}`;
 		if (this.cancelConfirmationRunId === run.id) {
-			footer = this.theme.fg(
+			status = this.theme.fg(
 				"warning",
 				"⚠️ Confirm cancel? Press Ctrl+C again to cancel (or any other key to dismiss)",
 			);
 		} else if (run.status === "cancelling") {
-			footer = `${this.theme.fg("warning", `Cancelling... elapsed ${formatDuration(elapsedMs(run))}`)}${notice}`;
+			status = `${this.theme.fg("warning", `Cancelling... elapsed ${formatDuration(elapsedMs(run))}`)}${notice}`;
 		} else if ((run.status === "aborted" || run.status === "cancelled") && run.id === this.cancelRequestedRunId) {
-			footer = `${this.theme.fg("warning", `Cancelled after ${formatDuration(elapsedMs(run, true))}`)} ${this.theme.fg("dim", "- Press any key to close")}`;
+			status = `${this.theme.fg("warning", `Cancelled after ${formatDuration(elapsedMs(run, true))}`)} ${this.theme.fg("dim", "- Press any key to close")}`;
 		}
-		return [line, truncateToWidth(footer, width), ...editorLines];
+		return [truncateToWidth(status, width)];
+	}
+
+	private renderFooter(width: number): string[] {
+		return this.footer.render(width);
 	}
 
 	private renderEmpty(width: number, height: number): string[] {
 		const line = this.theme.fg("borderAccent", "─".repeat(Math.max(0, width)));
+		const footer = this.renderFooter(width);
 		const lines = [
 			line,
 			truncateToWidth(this.theme.bold(this.theme.fg("accent", "Subagents")), width),
@@ -783,7 +849,8 @@ export class SubagentOverlay implements Component {
 			truncateToWidth(this.theme.fg("dim", "Esc, Alt+O, or q to return."), width),
 			line,
 		];
-		return this.padToHeight(lines, width, height);
+		const filler = Array.from({ length: Math.max(0, height - lines.length - footer.length) }, () => "");
+		return this.padToHeight([...lines, ...filler, ...footer], width, height);
 	}
 
 	private padToHeight(lines: string[], width: number, height: number): string[] {

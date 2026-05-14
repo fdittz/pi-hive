@@ -83,6 +83,7 @@ import {
 	type TimeoutMs,
 } from "./subagent-timeout.js";
 import { SubagentOverlay } from "./subagent-overlay.js";
+import type { SubagentOverlayHostContext } from "./subagent-overlay-context.js";
 import { SubagentRpcClient } from "./subagent-rpc-client.js";
 import { TranscriptStorage } from "./transcript-storage.js";
 import { appendCoalescedTranscriptEvent, formatRunLabel, shouldPersistReplayEvent, type ChildSessionRef, type StoredTranscriptEvent, type SubagentRunMode, type SubagentRunRecord, type TranscriptSegmentRef, type TranscriptStorageRef } from "./transcript-types.js";
@@ -939,12 +940,13 @@ async function openSubagentsOverlay(ctx: ExtensionContext, pi: ExtensionAPI, run
 
 	const warning = getCompatibilityWarning();
 	if (warning) ctx.ui.notify(warning, "warning");
+	const overlayHost: SubagentOverlayHostContext = { ctx, pi };
 	try {
 		await ctx.ui.custom<void>(
 			(tui, theme, keybindings, done) => {
 				const close = () => done(undefined);
 				activeOverlayClose = close;
-				return new SubagentOverlay(tui, theme, keybindings, close, registry, initialRunId, enqueueCancelledRunFeedback);
+				return new SubagentOverlay(tui, theme, keybindings, close, registry, overlayHost, initialRunId, enqueueCancelledRunFeedback);
 			},
 			{
 				overlay: true,

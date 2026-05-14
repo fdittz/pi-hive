@@ -63,6 +63,8 @@ export interface BackgroundJobRunInput {
 export interface SubagentInputController {
 	steer(message: string): Promise<void>;
 	followUp(message: string): Promise<void>;
+	/** Placeholder for future pi RPC dequeue support. */
+	dequeue?(): Promise<void>;
 }
 
 export interface SubagentInputState {
