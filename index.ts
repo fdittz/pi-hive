@@ -60,7 +60,7 @@ import {
 	openSubagentHandoffConfig,
 	shouldAskApprovalForHandoff,
 } from "./handoff.js";
-import { LiveSubagentRegistry, type SubagentInputController } from "./live-registry.js";
+import { LiveSubagentRegistry, type SubagentDequeueResult, type SubagentInputController } from "./live-registry.js";
 import { formatModelRef, loadSubagentModelConfig, resolveAgentModel } from "./model-overrides.js";
 import { openSubagentModelSelector } from "./model-selector.js";
 import { buildSubagentHeaderEnv, isSubagentChildProcess, registerSubagentRequestHeaders } from "./request-headers.js";
@@ -675,6 +675,24 @@ async function runSingleAgent(
 						await refreshPendingInputState();
 					} catch (error) {
 						pendingFollowUpMessageTexts = removeLastPendingMessageText(pendingFollowUpMessageTexts, message);
+						const text = error instanceof Error ? error.message : String(error);
+						updateInputState({ inputErrorMessage: text });
+						throw error;
+					}
+				},
+				dequeue: async (): Promise<SubagentDequeueResult> => {
+					assertAcceptingLiveInput();
+					const snapshot: SubagentDequeueResult = {
+						steering: [...pendingSteeringMessageTexts],
+						followUp: [...pendingFollowUpMessageTexts],
+					};
+					try {
+						const result = await rpcClient!.clearQueue(snapshot);
+						pendingSteeringMessageTexts = [];
+						pendingFollowUpMessageTexts = [];
+						updateInputState({ pendingInputMessages: 0, inputErrorMessage: undefined });
+						return result;
+					} catch (error) {
 						const text = error instanceof Error ? error.message : String(error);
 						updateInputState({ inputErrorMessage: text });
 						throw error;

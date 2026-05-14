@@ -315,7 +315,7 @@ export class SubagentOverlay implements Component {
 			return;
 		}
 		if (this.matchesDequeue(data)) {
-			this.showCopyNotice("Dequeue not yet supported (requires pi RPC upgrade)", "warning");
+			if (run) void this.dequeueInput(run);
 			return;
 		}
 		if (matchesKey(data, Key.left) && !editorHasText) {
@@ -486,6 +486,40 @@ export class SubagentOverlay implements Component {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			this.showCopyNotice(`Input failed: ${message}`, "error");
+		}
+	}
+
+	private async dequeueInput(run: SubagentRunRecord): Promise<void> {
+		const controller = this.registry.getInputController(run.id);
+		if (!controller?.dequeue) {
+			this.showCopyNotice("Input unavailable for this run", "warning");
+			return;
+		}
+
+		try {
+			const result = await controller.dequeue();
+			const queuedMessages = [...result.steering, ...result.followUp].filter((message) => message.trim().length > 0);
+			if (queuedMessages.length === 0) {
+				this.showCopyNotice("No queued messages to restore", "warning");
+				return;
+			}
+
+			const editor = this.getEditorForRun(run);
+			const queuedText = queuedMessages.join("\n\n");
+			const currentText = editor.getText();
+			const combinedText = [queuedText, currentText].filter((text) => text.trim()).join("\n\n");
+			editor.setText(combinedText);
+			this.clearSelection();
+			this.stickToBottom = true;
+
+			if (result.usedLocalFallback) {
+				this.showCopyNotice(`Restored ${queuedMessages.length} - Using local queue (child Pi RPC doesn't support dequeue yet)`, "warning");
+			} else {
+				this.showCopyNotice(`Restored ${queuedMessages.length} queued message${queuedMessages.length > 1 ? "s" : ""} to editor`, "success");
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.showCopyNotice(`Dequeue failed: ${message}`, "error");
 		}
 	}
 

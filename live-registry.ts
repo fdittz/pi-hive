@@ -60,11 +60,17 @@ export interface BackgroundJobRunInput {
 	parentToolCallId?: string;
 }
 
+export interface SubagentDequeueResult {
+	steering: string[];
+	followUp: string[];
+	usedLocalFallback?: boolean;
+	errorMessage?: string;
+}
+
 export interface SubagentInputController {
 	steer(message: string): Promise<void>;
 	followUp(message: string): Promise<void>;
-	/** Placeholder for future pi RPC dequeue support. */
-	dequeue?(): Promise<void>;
+	dequeue?(): Promise<SubagentDequeueResult>;
 }
 
 export interface SubagentInputState {

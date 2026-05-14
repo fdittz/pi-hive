@@ -1,11 +1,15 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import type { RpcCommand, RpcResponse, RpcSessionState } from "@earendil-works/pi-coding-agent";
+import type { SubagentDequeueResult } from "./live-registry.js";
 import { getPiInvocation } from "./pi-invocation.js";
 
 export type SubagentRpcEvent = Record<string, any>;
 
+type RpcCommandLike = RpcCommand | ({ id?: string; type: string } & Record<string, unknown>);
+
 type PendingRequest = {
+	command: string;
 	resolve: (response: RpcResponse) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
@@ -22,8 +26,23 @@ function serializeJsonLine(value: unknown): string {
 	return `${JSON.stringify(value)}\n`;
 }
 
-function commandName(command: RpcCommand): string {
+function commandName(command: RpcCommandLike): string {
 	return command.type;
+}
+
+function toStringArray(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return value.filter((item): item is string => typeof item === "string");
+}
+
+function fallbackDequeueResult(fallback: SubagentDequeueResult, error: unknown): SubagentDequeueResult {
+	const errorMessage = error instanceof Error ? error.message : String(error);
+	return {
+		steering: [...fallback.steering],
+		followUp: [...fallback.followUp],
+		usedLocalFallback: true,
+		errorMessage,
+	};
 }
 
 function isRpcResponse(value: any): value is RpcResponse {
@@ -121,6 +140,21 @@ export class SubagentRpcClient {
 
 	async followUp(message: string): Promise<void> {
 		assertRpcSuccess(await this.send({ type: "follow_up", message }));
+	}
+
+	async clearQueue(fallback: SubagentDequeueResult): Promise<SubagentDequeueResult> {
+		try {
+			const response = await this.send({ type: "clear_queue" }, 1500);
+			if (!response.success) throw new Error(response.error);
+			const data = (response as { data?: unknown }).data as Partial<SubagentDequeueResult> | undefined;
+			return {
+				steering: toStringArray(data?.steering),
+				followUp: toStringArray(data?.followUp),
+				usedLocalFallback: false,
+			};
+		} catch (error) {
+			return fallbackDequeueResult(fallback, error);
+		}
 	}
 
 	async abort(): Promise<void> {
@@ -222,6 +256,17 @@ export class SubagentRpcClient {
 			return;
 		}
 
+		if (isRpcResponse(data) && !data.id) {
+			const [candidate] = Array.from(this.pendingRequests.entries()).filter(([, pending]) => pending.command === data.command);
+			if (candidate) {
+				const [id, pending] = candidate;
+				this.pendingRequests.delete(id);
+				clearTimeout(pending.timer);
+				pending.resolve(data);
+				return;
+			}
+		}
+
 		if (isExtensionUiRequest(data)) {
 			this.respondToExtensionUiRequest(data);
 			return;
@@ -245,17 +290,17 @@ export class SubagentRpcClient {
 		this.writeRaw({ type: "extension_ui_response", id: request.id, cancelled: true });
 	}
 
-	private async send(command: RpcCommand): Promise<RpcResponse> {
+	private async send(command: RpcCommandLike, timeoutMs = this.options.commandTimeoutMs ?? 30000): Promise<RpcResponse> {
 		if (!this.proc?.stdin || this.closed) throw new Error("Subagent RPC client is not running");
 		const id = `subagent_rpc_${++this.nextRequestId}`;
-		const fullCommand = { ...command, id } as RpcCommand;
+		const fullCommand = { ...command, id };
 		return new Promise<RpcResponse>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pendingRequests.delete(id);
 				reject(new Error(`Timeout waiting for RPC response to ${commandName(command)}. ${this.stderr}`.trim()));
-			}, this.options.commandTimeoutMs ?? 30000);
+			}, timeoutMs);
 			(timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
-			this.pendingRequests.set(id, { resolve, reject, timer });
+			this.pendingRequests.set(id, { command: commandName(command), resolve, reject, timer });
 			this.proc!.stdin.write(serializeJsonLine(fullCommand), (error) => {
 				if (!error) return;
 				this.pendingRequests.delete(id);
