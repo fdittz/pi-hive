@@ -93,6 +93,12 @@ export interface SubagentRunRecord {
 	/** Transcript segments, used when a run is continued after the initial process exits. */
 	transcriptSegments?: TranscriptSegmentRef[];
 
+	/** Texts of steering messages accepted by the child RPC session but not yet observed as running. */
+	pendingSteeringMessageTexts?: string[];
+
+	/** Texts of follow-up messages accepted by the child RPC session but not yet observed as running. */
+	pendingFollowUpMessageTexts?: string[];
+
 	/** Number of steering messages accepted by the child RPC session but not yet observed as running. */
 	pendingSteeringMessages?: number;
 

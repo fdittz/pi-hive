@@ -68,6 +68,8 @@ export interface SubagentInputController {
 }
 
 export interface SubagentInputState {
+	pendingSteeringMessageTexts?: string[];
+	pendingFollowUpMessageTexts?: string[];
 	pendingSteeringMessages?: number;
 	pendingFollowUpMessages?: number;
 	pendingInputMessages?: number;
@@ -191,9 +193,31 @@ export class LiveSubagentRegistry {
 	updateInputState(runId: string, state: SubagentInputState): void {
 		const run = this.runs.get(runId);
 		if (!run) return;
-		if (state.pendingSteeringMessages !== undefined) run.pendingSteeringMessages = Math.max(0, state.pendingSteeringMessages);
-		if (state.pendingFollowUpMessages !== undefined) run.pendingFollowUpMessages = Math.max(0, state.pendingFollowUpMessages);
-		if (state.pendingInputMessages !== undefined) run.pendingInputMessages = Math.max(0, state.pendingInputMessages);
+
+		const steeringTextsUpdated = state.pendingSteeringMessageTexts !== undefined;
+		const followUpTextsUpdated = state.pendingFollowUpMessageTexts !== undefined;
+
+		if (steeringTextsUpdated) {
+			run.pendingSteeringMessageTexts = [...state.pendingSteeringMessageTexts!];
+			run.pendingSteeringMessages = run.pendingSteeringMessageTexts.length;
+		} else if (state.pendingSteeringMessages !== undefined) {
+			run.pendingSteeringMessages = Math.max(0, state.pendingSteeringMessages);
+			if (run.pendingSteeringMessages === 0) run.pendingSteeringMessageTexts = [];
+		}
+
+		if (followUpTextsUpdated) {
+			run.pendingFollowUpMessageTexts = [...state.pendingFollowUpMessageTexts!];
+			run.pendingFollowUpMessages = run.pendingFollowUpMessageTexts.length;
+		} else if (state.pendingFollowUpMessages !== undefined) {
+			run.pendingFollowUpMessages = Math.max(0, state.pendingFollowUpMessages);
+			if (run.pendingFollowUpMessages === 0) run.pendingFollowUpMessageTexts = [];
+		}
+
+		if (state.pendingInputMessages !== undefined) {
+			run.pendingInputMessages = Math.max(0, state.pendingInputMessages);
+		} else if (steeringTextsUpdated || followUpTextsUpdated) {
+			run.pendingInputMessages = (run.pendingSteeringMessages ?? 0) + (run.pendingFollowUpMessages ?? 0);
+		}
 		if ("inputErrorMessage" in state) run.inputErrorMessage = state.inputErrorMessage;
 		this.touch(run);
 		this.notify();

@@ -484,8 +484,8 @@ async function runSingleAgent(
 		let rpcClient: SubagentRpcClient | undefined;
 		const segmentEvents: StoredTranscriptEvent[] = [];
 		const seenMessageKeys = new Set<string>();
-		let pendingSteeringMessages = 0;
-		let pendingFollowUpMessages = 0;
+		let pendingSteeringMessageTexts: string[] = [];
+		let pendingFollowUpMessageTexts: string[] = [];
 		let initialPromptStarted = false;
 		let childIsCompacting = false;
 		let childIsRetrying = false;
@@ -519,12 +519,26 @@ async function runSingleAgent(
 			return `${message.role}:${JSON.stringify(message.content)}`;
 		};
 
+		const pendingInputMessageCount = () => pendingSteeringMessageTexts.length + pendingFollowUpMessageTexts.length;
+
 		const updateInputState = (extra: { pendingInputMessages?: number; inputErrorMessage?: string } = {}) => {
 			registry.updateInputState(run.id, {
-				pendingSteeringMessages,
-				pendingFollowUpMessages,
+				pendingSteeringMessageTexts,
+				pendingFollowUpMessageTexts,
+				pendingInputMessages: pendingInputMessageCount(),
 				...extra,
 			});
+		};
+
+		const toMessageTextArray = (value: unknown): string[] => {
+			if (!Array.isArray(value)) return [];
+			return value.filter((item): item is string => typeof item === "string");
+		};
+
+		const removeLastPendingMessageText = (items: string[], text: string): string[] => {
+			const index = items.lastIndexOf(text);
+			if (index < 0) return items;
+			return [...items.slice(0, index), ...items.slice(index + 1)];
 		};
 
 		const refreshPendingInputState = async () => {
@@ -532,8 +546,8 @@ async function runSingleAgent(
 			try {
 				const state = await rpcClient.getState();
 				if (state.pendingMessageCount === 0) {
-					pendingSteeringMessages = 0;
-					pendingFollowUpMessages = 0;
+					pendingSteeringMessageTexts = [];
+					pendingFollowUpMessageTexts = [];
 				}
 				updateInputState({ pendingInputMessages: state.pendingMessageCount, inputErrorMessage: undefined });
 			} catch {
@@ -593,12 +607,18 @@ async function runSingleAgent(
 				attachLiveInputController();
 				if (!initialPromptStarted) {
 					initialPromptStarted = true;
-				} else if (pendingSteeringMessages > 0) {
-					pendingSteeringMessages--;
-				} else if (pendingFollowUpMessages > 0) {
-					pendingFollowUpMessages--;
+				} else if (pendingSteeringMessageTexts.length > 0) {
+					pendingSteeringMessageTexts = pendingSteeringMessageTexts.slice(1);
+				} else if (pendingFollowUpMessageTexts.length > 0) {
+					pendingFollowUpMessageTexts = pendingFollowUpMessageTexts.slice(1);
 				}
 				updateInputState({ inputErrorMessage: undefined });
+			}
+
+			if (event.type === "queue_update") {
+				pendingSteeringMessageTexts = toMessageTextArray(event.steering);
+				pendingFollowUpMessageTexts = toMessageTextArray(event.followUp);
+				updateInputState({ pendingInputMessages: pendingInputMessageCount(), inputErrorMessage: undefined });
 			}
 
 			if (event.type === "message_end" && event.message) {
@@ -634,13 +654,13 @@ async function runSingleAgent(
 			inputController = {
 				steer: async (message: string) => {
 					assertAcceptingLiveInput();
-					pendingSteeringMessages++;
+					pendingSteeringMessageTexts = [...pendingSteeringMessageTexts, message];
 					updateInputState({ inputErrorMessage: undefined });
 					try {
 						await rpcClient!.steer(message);
 						await refreshPendingInputState();
 					} catch (error) {
-						pendingSteeringMessages = Math.max(0, pendingSteeringMessages - 1);
+						pendingSteeringMessageTexts = removeLastPendingMessageText(pendingSteeringMessageTexts, message);
 						const text = error instanceof Error ? error.message : String(error);
 						updateInputState({ inputErrorMessage: text });
 						throw error;
@@ -648,13 +668,13 @@ async function runSingleAgent(
 				},
 				followUp: async (message: string) => {
 					assertAcceptingLiveInput();
-					pendingFollowUpMessages++;
+					pendingFollowUpMessageTexts = [...pendingFollowUpMessageTexts, message];
 					updateInputState({ inputErrorMessage: undefined });
 					try {
 						await rpcClient!.followUp(message);
 						await refreshPendingInputState();
 					} catch (error) {
-						pendingFollowUpMessages = Math.max(0, pendingFollowUpMessages - 1);
+						pendingFollowUpMessageTexts = removeLastPendingMessageText(pendingFollowUpMessageTexts, message);
 						const text = error instanceof Error ? error.message : String(error);
 						updateInputState({ inputErrorMessage: text });
 						throw error;
@@ -711,8 +731,8 @@ async function runSingleAgent(
 						if (!state) break agentLifecycle;
 
 						if (state.pendingMessageCount === 0) {
-							pendingSteeringMessages = 0;
-							pendingFollowUpMessages = 0;
+							pendingSteeringMessageTexts = [];
+							pendingFollowUpMessageTexts = [];
 						}
 						updateInputState({ pendingInputMessages: state.pendingMessageCount, inputErrorMessage: undefined });
 
@@ -760,8 +780,8 @@ async function runSingleAgent(
 				cleanupAbortTimer();
 				runAbortController.signal.removeEventListener("abort", killClient);
 				detachLiveInputController();
-				pendingSteeringMessages = 0;
-				pendingFollowUpMessages = 0;
+				pendingSteeringMessageTexts = [];
+				pendingFollowUpMessageTexts = [];
 				updateInputState({ pendingInputMessages: 0, inputErrorMessage: undefined });
 				const stderr = rpcClient.getStderr();
 				if (stderr && !currentResult.stderr.includes(stderr)) currentResult.stderr += stderr;

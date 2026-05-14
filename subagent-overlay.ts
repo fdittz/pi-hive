@@ -226,11 +226,14 @@ export class SubagentOverlay implements Component {
 
 		const header = this.renderHeader(run, runs.length, safeWidth);
 		const statusLines = this.renderStatusLine(run, safeWidth);
+		let pendingLines = this.renderPendingMessages(run, safeWidth);
 		const footer = this.renderFooter(safeWidth);
 		const rawInputLines = this.renderInputEditor(run, safeWidth);
-		const maxInputLines = Math.max(0, height - header.length - statusLines.length - footer.length - 1);
+		const maxInputLines = Math.max(0, height - header.length - pendingLines.length - statusLines.length - footer.length - 1);
 		const inputLines = rawInputLines.slice(0, maxInputLines);
-		const bodyHeight = Math.max(1, height - header.length - statusLines.length - inputLines.length - footer.length);
+		const maxPendingLines = Math.max(0, height - header.length - statusLines.length - inputLines.length - footer.length - 1);
+		pendingLines = pendingLines.slice(0, maxPendingLines);
+		const bodyHeight = Math.max(1, height - header.length - pendingLines.length - statusLines.length - inputLines.length - footer.length);
 		const viewport = this.transcriptView.renderRunViewport(
 			run,
 			safeWidth,
@@ -253,7 +256,7 @@ export class SubagentOverlay implements Component {
 		this.lastBodyLines = viewport.lines.slice(0, bodyHeight);
 		const visibleBody = this.renderSelection(viewport.lines.slice());
 		while (visibleBody.length < bodyHeight) visibleBody.push("");
-		return this.padToHeight([...header, ...visibleBody, ...statusLines, ...inputLines, ...footer], safeWidth, height);
+		return this.padToHeight([...header, ...visibleBody, ...pendingLines, ...statusLines, ...inputLines, ...footer], safeWidth, height);
 	}
 
 	handleInput(data: string): void {
@@ -805,6 +808,23 @@ export class SubagentOverlay implements Component {
 			default:
 				return this.theme.fg("error", "Failed");
 		}
+	}
+
+	private renderPendingMessages(run: SubagentRunRecord, width: number): string[] {
+		const steeringMessages = run.pendingSteeringMessageTexts ?? [];
+		const followUpMessages = run.pendingFollowUpMessageTexts ?? [];
+		if (steeringMessages.length === 0 && followUpMessages.length === 0) return [];
+
+		const lines = [""];
+		const renderMessage = (label: string, message: string) => {
+			const compactMessage = message.replace(/\s+/g, " ").trim();
+			return truncateToWidth(this.theme.fg("dim", `${label}: ${compactMessage}`), width);
+		};
+		for (const message of steeringMessages) lines.push(renderMessage("Steering", message));
+		for (const message of followUpMessages) lines.push(renderMessage("Follow-up", message));
+		const dequeueKey = this.keyText("app.message.dequeue", "Alt+Up");
+		lines.push(truncateToWidth(this.theme.fg("dim", `↳ ${dequeueKey} to edit queued messages`), width));
+		return lines;
 	}
 
 	private renderStatusLine(run: SubagentRunRecord, width: number): string[] {
