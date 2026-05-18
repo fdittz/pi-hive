@@ -8,6 +8,70 @@ export interface AgentMatch {
 	suggestedTask: string;
 }
 
+interface ScoredAgentMatch extends AgentMatch {
+	actionTriggerMatches: number;
+	originalIndex: number;
+}
+
+const ACTION_TRIGGER_WORDS = new Set([
+	"find",
+	"locate",
+	"search",
+	"inspect",
+	"explore",
+	"map",
+	"trace",
+	"understand",
+	"discover",
+	"plan",
+	"design",
+	"approach",
+	"diagnose",
+	"investigate",
+	"debug",
+	"review",
+	"audit",
+	"implement",
+	"change",
+	"build",
+	"fix",
+	"refactor",
+	"edit",
+	"modify",
+	"execute",
+	"apply",
+	"encontrar",
+	"localizar",
+	"buscar",
+	"pesquisar",
+	"procurar",
+	"inspecionar",
+	"explorar",
+	"mapear",
+	"rastrear",
+	"tracar",
+	"entender",
+	"descobrir",
+	"planejar",
+	"investigar",
+	"depurar",
+	"revisar",
+	"auditar",
+	"implementar",
+	"mudar",
+	"alterar",
+	"construir",
+	"consertar",
+	"corrigir",
+	"refatorar",
+	"editar",
+	"modificar",
+	"executar",
+	"aplicar",
+	"fazer",
+	"realizar",
+]);
+
 function uniqueStrings(values: string[]): string[] {
 	return Array.from(new Set(values));
 }
@@ -35,7 +99,7 @@ export function scoreAgents(
 	const normalizedRequest = normalizeForMatch(requestText);
 	const requestTokens = new Set(tokenizeNormalized(requestText));
 
-	return agents.map((agent) => {
+	const scoredMatches: ScoredAgentMatch[] = agents.map((agent, originalIndex) => {
 		let score = 0;
 		const reasons: string[] = [];
 
@@ -44,7 +108,9 @@ export function scoreAgents(
 			...(agent.triggers ?? []),
 			...(options?.useEnglishTriggers ? agent.triggers_en ?? [] : []),
 		]);
-		const triggerMatches = triggerSource.filter((trigger) => triggerMatchesRequest(normalizedRequest, requestTokens, trigger)).length;
+		const matchedTriggers = triggerSource.filter((trigger) => triggerMatchesRequest(normalizedRequest, requestTokens, trigger));
+		const triggerMatches = matchedTriggers.length;
+		const actionTriggerMatches = matchedTriggers.filter(isActionTrigger).length;
 		if (triggerMatches > 0) {
 			score += triggerMatches * 3;
 			reasons.push(`${triggerMatches} trigger keyword(s) matched`);
@@ -82,12 +148,41 @@ export function scoreAgents(
 			score,
 			reasoning: reasons.join("; "),
 			suggestedTask: options?.suggestedTask ?? requestText,
+			actionTriggerMatches,
+			originalIndex,
 		};
 	});
+
+	return scoredMatches.sort(compareScoredAgentMatches).map(toAgentMatch);
+}
+
+function toAgentMatch(match: ScoredAgentMatch): AgentMatch {
+	return {
+		name: match.name,
+		score: match.score,
+		reasoning: match.reasoning,
+		suggestedTask: match.suggestedTask,
+	};
+}
+
+function compareScoredAgentMatches(a: ScoredAgentMatch, b: ScoredAgentMatch): number {
+	const scoreDifference = b.score - a.score;
+	if (scoreDifference !== 0) return scoreDifference;
+
+	const actionTriggerDifference = b.actionTriggerMatches - a.actionTriggerMatches;
+	if (actionTriggerDifference !== 0) return actionTriggerDifference;
+
+	const nameDifference = a.name.localeCompare(b.name);
+	if (nameDifference !== 0) return nameDifference;
+
+	return a.originalIndex - b.originalIndex;
+}
+
+function isActionTrigger(trigger: string): boolean {
+	return tokenizeNormalized(trigger).some((token) => ACTION_TRIGGER_WORDS.has(token));
 }
 
 function bestMatch(matches: AgentMatch[]): AgentMatch | null {
-	matches.sort((a, b) => b.score - a.score);
 	const best = matches[0];
 	return best ? { ...best, score: normalizeScore(best.score) } : null;
 }

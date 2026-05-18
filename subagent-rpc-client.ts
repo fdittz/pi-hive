@@ -30,6 +30,16 @@ function commandName(command: RpcCommandLike): string {
 	return command.type;
 }
 
+function toError(error: unknown): Error {
+	return error instanceof Error ? error : new Error(String(error));
+}
+
+function copyErrorCode(target: Error, source: Error): Error {
+	const code = (source as NodeJS.ErrnoException).code;
+	if (code) (target as NodeJS.ErrnoException).code = code;
+	return target;
+}
+
 function toStringArray(value: unknown): string[] {
 	if (!Array.isArray(value)) return [];
 	return value.filter((item): item is string => typeof item === "string");
@@ -77,6 +87,8 @@ export class SubagentRpcClient {
 	private exitWaiters = new Set<() => void>();
 	private exitCode: number | undefined;
 	private closed = false;
+	private stdinClosed = false;
+	private stdinError?: Error;
 	private stopping = false;
 	private agentEndCount = 0;
 
@@ -92,12 +104,16 @@ export class SubagentRpcClient {
 			env: this.options.env,
 		});
 		this.proc = proc;
+		this.stdinClosed = false;
+		this.stdinError = undefined;
 
+		proc.stdin.on("error", (error) => this.handleStdinError(toError(error)));
+		proc.stdin.on("close", () => this.handleStdinClose());
 		proc.stdout.on("data", (data: Buffer) => this.handleStdout(this.stdoutDecoder.write(data)));
 		proc.stderr.on("data", (data: Buffer) => {
 			this.stderr += this.stderrDecoder.write(data);
 		});
-		proc.on("error", (error) => this.handleClose(1, error instanceof Error ? error : new Error(String(error))));
+		proc.on("error", (error) => this.handleClose(1, toError(error)));
 		proc.on("close", (code, signal) => this.handleClose(code ?? (signal === "SIGKILL" ? 137 : signal === "SIGTERM" ? 143 : 0)));
 
 		await new Promise<void>((resolve, reject) => {
@@ -291,28 +307,90 @@ export class SubagentRpcClient {
 	}
 
 	private async send(command: RpcCommandLike, timeoutMs = this.options.commandTimeoutMs ?? 30000): Promise<RpcResponse> {
-		if (!this.proc?.stdin || this.closed) throw new Error("Subagent RPC client is not running");
+		const unavailableError = this.getStdinUnavailableError();
+		if (unavailableError) throw unavailableError;
+
 		const id = `subagent_rpc_${++this.nextRequestId}`;
 		const fullCommand = { ...command, id };
+		const commandLabel = commandName(command);
 		return new Promise<RpcResponse>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pendingRequests.delete(id);
-				reject(new Error(`Timeout waiting for RPC response to ${commandName(command)}. ${this.stderr}`.trim()));
+				reject(new Error(`Timeout waiting for RPC response to ${commandLabel}. ${this.stderr}`.trim()));
 			}, timeoutMs);
 			(timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
-			this.pendingRequests.set(id, { command: commandName(command), resolve, reject, timer });
-			this.proc!.stdin.write(serializeJsonLine(fullCommand), (error) => {
-				if (!error) return;
-				this.pendingRequests.delete(id);
-				clearTimeout(timer);
-				reject(error);
+			this.pendingRequests.set(id, { command: commandLabel, resolve, reject, timer });
+			this.safeWrite(serializeJsonLine(fullCommand), (error) => {
+				this.rejectPendingRequest(id, copyErrorCode(new Error(`Failed to write RPC command ${commandLabel}: ${error.message}`), error));
 			});
 		});
 	}
 
 	private writeRaw(value: unknown): void {
-		if (!this.proc?.stdin || this.closed) return;
-		this.proc.stdin.write(serializeJsonLine(value));
+		this.safeWrite(serializeJsonLine(value), (error) => this.rejectAllPendingRequests(error));
+	}
+
+	private getStdinUnavailableError(): Error | undefined {
+		if (!this.proc?.stdin || this.closed) return new Error("Subagent RPC client is not running");
+		if (this.stdinError) return this.stdinError;
+		if (this.stdinClosed) return new Error("Subagent RPC stdin is closed");
+
+		const stdin = this.proc.stdin;
+		if (stdin.destroyed) return this.markStdinUnavailable(new Error("stdin stream is destroyed"));
+		if (stdin.writableEnded) return this.markStdinUnavailable(new Error("stdin stream has ended"));
+		if (!stdin.writable) return this.markStdinUnavailable(new Error("stdin stream is not writable"));
+		return undefined;
+	}
+
+	private safeWrite(line: string, onError?: (error: Error) => void): boolean {
+		const unavailableError = this.getStdinUnavailableError();
+		if (unavailableError) {
+			onError?.(unavailableError);
+			return false;
+		}
+
+		try {
+			this.proc!.stdin.write(line, (error) => {
+				if (!error) return;
+				onError?.(this.markStdinUnavailable(toError(error)));
+			});
+			return true;
+		} catch (error) {
+			onError?.(this.markStdinUnavailable(toError(error)));
+			return false;
+		}
+	}
+
+	private markStdinUnavailable(error: Error): Error {
+		this.stdinClosed = true;
+		this.stdinError = copyErrorCode(new Error(`Subagent RPC stdin is unavailable: ${error.message}`), error);
+		return this.stdinError;
+	}
+
+	private handleStdinClose(): void {
+		this.stdinClosed = true;
+		if (!this.stdinError) this.stdinError = new Error("Subagent RPC stdin is closed");
+	}
+
+	private handleStdinError(error: Error): void {
+		const stdinError = this.markStdinUnavailable(error);
+		this.rejectAllPendingRequests(stdinError);
+	}
+
+	private rejectPendingRequest(id: string, error: Error): void {
+		const pending = this.pendingRequests.get(id);
+		if (!pending) return;
+		this.pendingRequests.delete(id);
+		clearTimeout(pending.timer);
+		pending.reject(error);
+	}
+
+	private rejectAllPendingRequests(error: Error): void {
+		for (const [id, pending] of this.pendingRequests.entries()) {
+			this.pendingRequests.delete(id);
+			clearTimeout(pending.timer);
+			pending.reject(error);
+		}
 	}
 
 	private handleClose(code: number, error?: Error): void {

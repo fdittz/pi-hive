@@ -43,6 +43,7 @@ import {
 	shouldUseLanguageAgnosticDelegation,
 	type AutoDelegateConfig,
 } from "./auto-delegate.js";
+import { buildSubagentInvocationMessage } from "./auto-delegate-run.js";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { ChildSessionStorage } from "./child-session-storage.js";
 import {
@@ -347,6 +348,7 @@ type RunMeta = {
 	handoffDepth?: number;
 	handoff?: HandoffInfo;
 	additionalSystemPrompt?: string;
+	timeoutMs?: number | null;
 };
 
 async function runSingleAgent(
@@ -807,7 +809,7 @@ async function runSingleAgent(
 			}
 		})();
 
-		const timeoutMs = await getTimeoutForAgent(agentName);
+		const timeoutMs = runMeta.timeoutMs !== undefined ? runMeta.timeoutMs : await getTimeoutForAgent(agentName);
 		const exitCode = timeoutMs
 			? await Promise.race([
 					childExit,
@@ -910,6 +912,8 @@ const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode). Prefix with --background to run asynchronously." })),
 	background: Type.Optional(Type.Boolean({ description: "Run single-mode agent asynchronously and return a background job id immediately." })),
+	run: Type.Optional(Type.String({ description: "Run prefix, short id, full id, or agent@id label to continue (continuation mode)" })),
+	instruction: Type.Optional(Type.String({ description: "Optional continuation instruction (continuation mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
@@ -1152,7 +1156,10 @@ function truncateJobResultForCompletionMessage(result: string): string {
 
 function formatBackgroundJobCompletionMessage(job: BackgroundJob, options?: { truncateResult?: boolean }): string {
 	const isCancelled = job.status === "cancelled";
-	const result = job.result || (isCancelled ? "(no partial output captured)" : "(no result captured)");
+	const isFailed = job.status === "failed";
+	const result = isFailed
+		? job.error || "(no error captured)"
+		: job.result || (isCancelled ? "(no partial output captured)" : "(no result captured)");
 	const resultText = options?.truncateResult === false ? result : truncateJobResultForCompletionMessage(result);
 	return [
 		isCancelled ? `# Background job cancelled: ${job.id}` : `# Background job ${job.status}`,
@@ -1163,7 +1170,7 @@ function formatBackgroundJobCompletionMessage(job: BackgroundJob, options?: { tr
 		`- Elapsed: ${getElapsedTime(job)}`,
 		`- Task: ${job.task}`,
 		"",
-		isCancelled ? "## Partial Results" : "## Result",
+		isCancelled ? "## Partial Results" : isFailed ? "## Error" : "## Result",
 		"",
 		resultText,
 		"",
@@ -1185,7 +1192,7 @@ function sendBackgroundJobsMessage(
 }
 
 function sendBackgroundJobCompletionMessage(pi: ExtensionAPI, job: BackgroundJob): void {
-	if (job.status !== "completed" && job.status !== "cancelled") return;
+	if (job.status !== "completed" && job.status !== "cancelled" && job.status !== "failed") return;
 	registerBackgroundJobInRegistry(job);
 	sendBackgroundJobsMessage(pi, formatBackgroundJobCompletionMessage(job), { job, status: job.status });
 }
@@ -1330,6 +1337,9 @@ function startBackgroundSubagentRun(options: {
 	parentModel?: { provider: string; id: string };
 	parentThinking?: string;
 	controller?: AbortController;
+	timeoutMs?: number | null;
+	additionalSystemPrompt?: string;
+	onSettled?: () => void;
 	makeDetails: (mode: "single" | "chain") => (results: SingleResult[]) => SubagentDetails;
 }): void {
 	const controller = options.controller ?? new AbortController();
@@ -1383,6 +1393,8 @@ function startBackgroundSubagentRun(options: {
 					parentModel: options.parentModel,
 					parentThinking: options.parentThinking,
 					runId: options.jobId,
+					timeoutMs: options.timeoutMs,
+					additionalSystemPrompt: options.additionalSystemPrompt,
 				},
 			);
 			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
@@ -1402,7 +1414,10 @@ function startBackgroundSubagentRun(options: {
 				await stopHeartbeat();
 				await failJob(options.jobId, errorMsg);
 				const failedJob = await getBackgroundJob(options.jobId);
-				if (failedJob) registerBackgroundJobInRegistry(failedJob, options.cwd ?? options.ctx.cwd);
+				if (failedJob) {
+					registerBackgroundJobInRegistry(failedJob, options.cwd ?? options.ctx.cwd);
+					sendBackgroundJobCompletionMessage(options.pi, failedJob);
+				}
 				return;
 			}
 			setProgress(80);
@@ -1421,6 +1436,8 @@ function startBackgroundSubagentRun(options: {
 					parentModel: options.parentModel,
 					parentThinking: options.parentThinking,
 					handoffDepth: 0,
+					timeoutMs: options.timeoutMs,
+					additionalSystemPrompt: options.additionalSystemPrompt,
 				},
 			);
 			await stopHeartbeat();
@@ -1454,11 +1471,15 @@ function startBackgroundSubagentRun(options: {
 				await stopHeartbeat();
 				await failJob(options.jobId, error instanceof Error ? error.message : String(error));
 				const failedJob = await getBackgroundJob(options.jobId);
-				if (failedJob) registerBackgroundJobInRegistry(failedJob, options.cwd ?? options.ctx.cwd);
+				if (failedJob) {
+					registerBackgroundJobInRegistry(failedJob, options.cwd ?? options.ctx.cwd);
+					sendBackgroundJobCompletionMessage(options.pi, failedJob);
+				}
 			}
 		} finally {
 			await stopHeartbeat();
 			unregisterBackgroundJobAbortController(options.jobId);
+			options.onSettled?.();
 		}
 	})();
 }
@@ -1868,77 +1889,24 @@ async function executeAutoDelegation(
 	userMessage: string,
 ): Promise<void> {
 	const header = `[AUTO-DELEGATED to ${match.name} (${confidence}% confidence)]`;
-	const backgroundGuidance = `
-Consider whether this task would benefit from running in background:
-- Exploratory investigations (scout)
-- Complex planning (planner)
-- Code reviews (reviewer)
-- Large refactors (worker)
-
-If appropriate, the parent process might suggest --background. Background execution lets users continue working while the task runs asynchronously.
-`;
 
 	try {
-		const agentScope: AgentScope = "user";
-		const discovery = discoverAgents(ctx.cwd, agentScope);
-		const agents = discovery.agents;
-		const sessionFile = getSessionFile(ctx);
-		const parentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
-		const parentThinking = pi.getThinkingLevel();
-		const parentToolCallId = `auto-delegate:${Date.now()}`;
-		const makeDetails = (mode: "single" | "chain") =>
-			(results: SingleResult[]): SubagentDetails => ({
-				mode,
-				agentScope,
-				projectAgentsDir: discovery.projectAgentsDir,
-				results: mode === "chain" ? withSequentialChainSteps(results) : results,
-			});
-
-		ctx.ui.notify(header, "info");
-		const result = await runSingleAgent(
-			ctx.cwd,
-			agents,
-			match.name,
-			match.suggestedTask,
-			undefined,
-			undefined,
-			ctx.signal,
-			undefined,
-			makeDetails("single"),
-			{ parentToolCallId, mode: "single", index: 0, sessionFile, parentModel, parentThinking, additionalSystemPrompt: backgroundGuidance },
+		pi.sendMessage(
+			{
+				customType: "auto-delegate-result",
+				content: buildSubagentInvocationMessage({
+					agent: match.name,
+					task: match.suggestedTask,
+					userMessage,
+					confidence,
+					source: "auto-delegate",
+				}),
+				display: true,
+				details: { header, agent: match.name, confidence, originalRequest: userMessage, isError: false },
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
 		);
-		const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-		const handoffResults = isError
-			? []
-			: await executeHandoffsForResult(
-					ctx,
-					agents,
-					result,
-					ctx.signal,
-					undefined,
-					makeDetails("chain"),
-					{
-						parentToolCallId,
-						mode: "chain",
-						index: 0,
-						sessionFile,
-						parentModel,
-						parentThinking,
-						handoffDepth: 0,
-						additionalSystemPrompt: backgroundGuidance,
-					},
-				);
-		const allResults = [result, ...handoffResults];
-		const output = isError
-			? result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)"
-			: getFinalOutput(result.messages) || "(no output)";
-		const details = makeDetails(handoffResults.length > 0 ? "chain" : "single")(allResults);
-		pi.sendMessage({
-			customType: "auto-delegate-result",
-			content: `${header}\n\nOriginal request: ${userMessage}\n\n${output}`,
-			display: true,
-			details: { header, agent: match.name, confidence, originalRequest: userMessage, isError, subagent: details },
-		});
+		ctx.ui.notify(`${header} invoking subagent tool.`, "info");
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		ctx.ui.notify(`Auto-delegation failed: ${message}`, "error");
@@ -2052,6 +2020,7 @@ async function executeHandoffsForResult(
 				handoffDepth: (runMeta.handoffDepth ?? 0) + 1,
 				handoff: handoffInfo,
 				additionalSystemPrompt: runMeta.additionalSystemPrompt,
+				timeoutMs: runMeta.timeoutMs,
 			},
 		);
 		childResults.push(result);
@@ -2234,21 +2203,19 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /subagent-continue <run-prefix> [instruction]", "warning");
 				return;
 			}
-			try {
-				const result = await continueSubagentRun(
-					ctx,
-					parsed.run,
-					parsed.instruction,
-					ctx.signal,
-					undefined,
-					`command:${parsed.run}`,
-					pi.getThinkingLevel(),
-				);
-				pi.appendEntry("subagent-run-update", { result });
-				ctx.ui.notify(`Continued ${formatRunLabel(result.agent, result.runId)}.`, "info");
-			} catch (error) {
-				ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
-			}
+			pi.sendMessage(
+				{
+					customType: "subagent-invocation",
+					content: buildSubagentInvocationMessage({
+						run: parsed.run,
+						instruction: parsed.instruction,
+						source: "command",
+					}),
+					display: true,
+					details: { run: parsed.run, instruction: parsed.instruction, continuation: true },
+				},
+				{ triggerTurn: true, deliverAs: "steer" },
+			);
 		},
 	});
 
@@ -2260,14 +2227,30 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /subagent [--background] agent task", "warning");
 				return;
 			}
+
 			const backgroundMatch = trimmed.match(/^--background\s+(\S+)\s+([\s\S]+)$/);
-			// Delegate to the LLM by sending a special message that will invoke the tool
-			pi.sendMessage({
-				content: backgroundMatch
-					? `Please invoke the subagent tool with agent ${JSON.stringify(backgroundMatch[1])}, task ${JSON.stringify(backgroundMatch[2].trim())}, and background true.`
-					: `Please run this subagent task: ${trimmed}`,
-				display: true,
-			});
+			const foregroundMatch = backgroundMatch ? undefined : trimmed.match(/^(\S+)\s+([\s\S]+)$/);
+			const agent = backgroundMatch?.[1] ?? foregroundMatch?.[1];
+			const task = (backgroundMatch?.[2] ?? foregroundMatch?.[2] ?? "").trim();
+			if (!agent || !task) {
+				ctx.ui.notify("Usage: /subagent [--background] agent task", "warning");
+				return;
+			}
+
+			pi.sendMessage(
+				{
+					customType: "subagent-invocation",
+					content: buildSubagentInvocationMessage({
+						agent,
+						task,
+						background: Boolean(backgroundMatch),
+						source: "command",
+					}),
+					display: true,
+					details: { agent, task, background: Boolean(backgroundMatch) },
+				},
+				{ triggerTurn: true, deliverAs: "steer" },
+			);
 		},
 	});
 
@@ -2347,13 +2330,13 @@ export default function (pi: ExtensionAPI) {
 			const confidence = Math.round(match.score * 100);
 			if (confidence < config.confidenceThreshold) return { action: "continue" };
 
-			try {
-				await executeAutoDelegation(pi, ctx, match, confidence, userMessage);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`Auto-delegation failed: ${message}`, "error");
-				debugLog(`Auto-delegation error: ${message}`);
-			}
+			queueMicrotask(() => {
+				void executeAutoDelegation(pi, ctx, match, confidence, userMessage).catch((error) => {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Auto-delegation failed: ${message}`, "error");
+					debugLog(`Auto-delegation error: ${message}`);
+				});
+			});
 			return { action: "handled" };
 		});
 
@@ -2434,7 +2417,7 @@ export default function (pi: ExtensionAPI) {
 			label: "Subagent",
 			description: [
 				"Delegate tasks to specialized subagents with isolated context.",
-				"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+				"Modes: single (agent + task), continuation (run + optional instruction), parallel (tasks array), chain (sequential with {previous} placeholder).",
 				"Child subagents may request handoffs by calling the handoff tool; legacy JSON handoff output remains supported as a fallback.",
 				'Default agent scope is "user" (from ~/.pi/agent/agents).',
 				'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
@@ -2444,7 +2427,8 @@ export default function (pi: ExtensionAPI) {
 			parameters: SubagentParams,
 
 			async execute(toolCallId, params, signal, onUpdate, ctx) {
-				const agentScope: AgentScope = params.agentScope ?? "user";
+				const hasContinuation = Boolean(params.run);
+				const agentScope: AgentScope = params.agentScope ?? (hasContinuation ? "both" : "user");
 				const discovery = discoverAgents(ctx.cwd, agentScope);
 				const agents = discovery.agents;
 				const confirmProjectAgents = params.confirmProjectAgents ?? true;
@@ -2455,7 +2439,7 @@ export default function (pi: ExtensionAPI) {
 				const hasChain = (params.chain?.length ?? 0) > 0;
 				const hasTasks = (params.tasks?.length ?? 0) > 0;
 				const hasSingle = Boolean(params.agent && params.task);
-				const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
+				const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle) + Number(hasContinuation);
 
 				const makeDetails =
 					(mode: "single" | "parallel" | "chain") =>
@@ -2502,6 +2486,53 @@ export default function (pi: ExtensionAPI) {
 								details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
 							};
 					}
+				}
+
+				if (params.run) {
+					const result = await continueSubagentRun(
+						ctx,
+						params.run,
+						params.instruction,
+						signal,
+						onUpdate,
+						toolCallId,
+						parentThinking,
+					);
+					const continuedRun = result.runId ? registry.getRun(result.runId) : registry.findRunsByPrefix(params.run)[0];
+					const continuationMode = continuedRun?.mode ?? "single";
+					const continuationDetails = (results: SingleResult[]) => makeDetails(continuationMode)(results);
+					const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+					if (isError) {
+						const errorMsg = result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+						return {
+							content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+							details: continuationDetails([result]),
+							isError: true,
+						};
+					}
+
+					const handoffResults = await executeHandoffsForResult(
+						ctx,
+						agents,
+						result,
+						signal,
+						onUpdate,
+						makeDetails("chain"),
+						{
+							parentToolCallId: toolCallId,
+							mode: "chain",
+							index: 0,
+							sessionFile,
+							parentModel,
+							parentThinking,
+							handoffDepth: 0,
+						},
+					);
+					const allResults = [result, ...handoffResults];
+					return {
+						content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+						details: handoffResults.length > 0 ? makeDetails("chain")(allResults) : continuationDetails(allResults),
+					};
 				}
 
 				if (params.chain && params.chain.length > 0) {
@@ -2815,7 +2846,22 @@ export default function (pi: ExtensionAPI) {
 			},
 
 			renderCall(args, theme, _context) {
-				const scope: AgentScope = args.agentScope ?? "user";
+				const scope: AgentScope = args.agentScope ?? (args.run ? "both" : "user");
+				if (args.run) {
+					const preview = args.instruction
+						? args.instruction.length > 60
+							? `${args.instruction.slice(0, 60)}...`
+							: args.instruction
+						: "Continue from where you stopped";
+					return new Text(
+						theme.fg("toolTitle", theme.bold("subagent ")) +
+							theme.fg("accent", `continue ${args.run}`) +
+							theme.fg("muted", ` [${scope}]`) +
+							`\n  ${theme.fg("dim", preview)}`,
+						0,
+						0,
+					);
+				}
 				if (args.chain && args.chain.length > 0) {
 					let text =
 						theme.fg("toolTitle", theme.bold("subagent ")) +
