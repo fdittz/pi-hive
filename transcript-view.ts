@@ -1,9 +1,9 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
-import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderPlainTranscript } from "./compatibility.js";
 import { TranscriptAdapter } from "./transcript-adapter.js";
 import type { StoredTranscriptEvent, SubagentRunRecord, TranscriptEventMutation } from "./transcript-types.js";
+import { WrappedLineVirtualizer } from "./wrapped-line-virtualizer.js";
 
 export interface TranscriptViewOptions {
 	tui: TUI;
@@ -52,6 +52,9 @@ export class TranscriptView {
 	private state?: IncrementalState;
 	private cachedRenderKey: string | undefined;
 	private cachedViewport: TranscriptViewportResult | undefined;
+	private resultOutputVirtualizer?: WrappedLineVirtualizer;
+	private lastResultOutput?: string;
+	private plainTranscriptVirtualizers = new Map<string, { revision: number; virtualizer: WrappedLineVirtualizer }>();
 
 	renderRun(run: SubagentRunRecord, width: number, options: TranscriptViewOptions): string[] {
 		return this.renderRunViewport(
@@ -126,6 +129,41 @@ export class TranscriptView {
 		this.state = undefined;
 		this.cachedRenderKey = undefined;
 		this.cachedViewport = undefined;
+		this.resultOutputVirtualizer = undefined;
+		this.lastResultOutput = undefined;
+		this.plainTranscriptVirtualizers.clear();
+	}
+
+	private getRenderResultOutputVirtualizer(output: string): WrappedLineVirtualizer {
+		if (!this.resultOutputVirtualizer) {
+			this.resultOutputVirtualizer = new WrappedLineVirtualizer();
+		}
+
+		if (this.lastResultOutput !== output) {
+			const lines = output.split(/\r?\n/);
+			this.resultOutputVirtualizer.setSourceLines(lines);
+			this.lastResultOutput = output;
+		}
+
+		return this.resultOutputVirtualizer;
+	}
+
+	private getRenderPlainVirtualizer(run: SubagentRunRecord, theme: Theme): WrappedLineVirtualizer {
+		const runId = run.id;
+		let cached = this.plainTranscriptVirtualizers.get(runId);
+
+		if (cached && cached.revision !== run.revision) {
+			cached = undefined;
+		}
+
+		if (!cached) {
+			const plainLines = renderPlainTranscript(run, theme);
+			const virtualizer = new WrappedLineVirtualizer(plainLines);
+			cached = { revision: run.revision, virtualizer };
+			this.plainTranscriptVirtualizers.set(runId, cached);
+		}
+
+		return cached.virtualizer;
 	}
 
 	private selectEvents(run: SubagentRunRecord): SelectedEvents {
@@ -373,13 +411,13 @@ export class TranscriptView {
 		this.cachedViewport = undefined;
 		const safeHeight = Math.max(0, Math.floor(viewport.height));
 		const output = run.resultOutput?.trimEnd() || "(no result captured)";
-		const lines = this.wrapPlainLines(output.split(/\r?\n/), width);
-		const totalLines = lines.length;
-		const scrollOffset = this.resolveScrollOffset({ ...viewport, stickToBottom: false }, totalLines, safeHeight);
+		const virtualizer = this.getRenderResultOutputVirtualizer(output);
+		const result = virtualizer.renderViewport(width, viewport.scrollOffset, safeHeight);
+
 		return {
-			lines: safeHeight > 0 ? lines.slice(scrollOffset, scrollOffset + safeHeight) : [],
-			totalLines,
-			scrollOffset,
+			lines: result.lines,
+			totalLines: result.totalLines,
+			scrollOffset: result.scrollOffset,
 		};
 	}
 
@@ -390,23 +428,15 @@ export class TranscriptView {
 		options: TranscriptViewOptions,
 	): TranscriptViewportResult {
 		const safeHeight = Math.max(0, Math.floor(viewport.height));
-		const lines = this.wrapPlainLines(renderPlainTranscript(run, options.theme), width);
-		const totalLines = lines.length;
-		const scrollOffset = this.resolveScrollOffset(viewport, totalLines, safeHeight);
-		return {
-			lines: safeHeight > 0 ? lines.slice(scrollOffset, scrollOffset + safeHeight) : [],
-			totalLines,
-			scrollOffset,
-		};
-	}
+		const virtualizer = this.getRenderPlainVirtualizer(run, options.theme);
+		virtualizer.calcHeights(width);
+		const scrollOffset = this.resolveScrollOffset(viewport, virtualizer.getTotalLines(), safeHeight);
+		const result = virtualizer.renderViewport(width, scrollOffset, safeHeight);
 
-	private wrapPlainLines(lines: string[], width: number): string[] {
-		const wrapped: string[] = [];
-		for (const line of lines) {
-			const parts = wrapTextWithAnsi(line, width);
-			if (parts.length === 0) wrapped.push("");
-			else wrapped.push(...parts);
-		}
-		return wrapped;
+		return {
+			lines: result.lines,
+			totalLines: result.totalLines,
+			scrollOffset: result.scrollOffset,
+		};
 	}
 }
