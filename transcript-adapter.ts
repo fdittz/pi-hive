@@ -6,6 +6,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, type Component, type TUI, Text } from "@earendil-works/pi-tui";
 import { tryNative } from "./compatibility.js";
+import { LineHeightIndex } from "./line-height-index.js";
 import type { StoredTranscriptEvent } from "./transcript-types.js";
 
 export interface TranscriptAdapterOptions {
@@ -26,15 +27,17 @@ export interface TranscriptViewportRender {
 
 interface ComponentRenderCache {
 	component: Component;
-	width?: number;
-	lines: string[];
 	dirty: boolean;
+	width?: number;
+	height?: number;
+	cachedSlice?: { startLine: number; lines: string[]; width: number; version: number };
 }
 
 export class TranscriptAdapter {
 	private container = new Container();
 	private componentCaches: ComponentRenderCache[] = [];
 	private componentCacheByComponent = new Map<Component, ComponentRenderCache>();
+	private componentHeightIndex = new LineHeightIndex();
 	private streamingComponent?: AssistantMessageComponent;
 	private streamingMessage?: Message;
 	private pendingTools = new Map<string, ToolExecutionComponent>();
@@ -45,6 +48,7 @@ export class TranscriptAdapter {
 
 	constructor(private options: TranscriptAdapterOptions) {
 		this.expanded = options.expanded;
+		this.componentHeightIndex.reset(0);
 	}
 
 	consume(event: StoredTranscriptEvent): void {
@@ -111,31 +115,58 @@ export class TranscriptAdapter {
 		const safeWidth = Math.max(1, Math.floor(width));
 		const safeOffset = Math.max(0, Math.floor(offset));
 		const safeHeight = Math.max(0, Math.floor(height));
-		const end = safeOffset + safeHeight;
-		const lines: string[] = [];
-		let cursor = 0;
+		const totalLines = this.getLineCount(safeWidth);
 
-		for (const cache of this.componentCaches) {
+		if (safeHeight <= 0) return { lines: [], totalLines, version: this.renderVersion };
+
+		const endLine = safeOffset + safeHeight;
+		const startLookup = this.componentHeightIndex.findIndexAtOffset(safeOffset);
+		if (!startLookup) return { lines: [], totalLines, version: this.renderVersion };
+
+		const lines: string[] = [];
+		let currentLine = startLookup.prefixBefore;
+
+		for (let i = startLookup.index; i < this.componentCaches.length && currentLine < endLine; i++) {
+			const cache = this.componentCaches[i];
 			const componentLines = this.renderComponent(cache, safeWidth);
-			const nextCursor = cursor + componentLines.length;
-			if (safeHeight > 0 && nextCursor > safeOffset && cursor < end) {
-				const startInComponent = Math.max(0, safeOffset - cursor);
-				const endInComponent = Math.min(componentLines.length, end - cursor);
+			const nextLine = currentLine + componentLines.length;
+
+			if (nextLine > safeOffset && currentLine < endLine) {
+				const startInComponent = Math.max(0, safeOffset - currentLine);
+				const endInComponent = Math.min(componentLines.length, endLine - currentLine);
 				lines.push(...componentLines.slice(startInComponent, endInComponent));
 			}
-			cursor = nextCursor;
+
+			currentLine = nextLine;
 		}
 
-		return { lines, totalLines: cursor, version: this.renderVersion };
+		return { lines, totalLines, version: this.renderVersion };
 	}
 
 	getLineCount(width: number): number {
 		const safeWidth = Math.max(1, Math.floor(width));
-		let total = 0;
-		for (const cache of this.componentCaches) {
-			total += this.renderComponent(cache, safeWidth).length;
+		const newHeights: number[] = [];
+		let needsUpdate = false;
+
+		for (let i = 0; i < this.componentCaches.length; i++) {
+			const cache = this.componentCaches[i];
+			const oldHeight = cache.height;
+
+			if (cache.dirty || cache.width !== safeWidth || oldHeight === undefined) {
+				const lines = this.renderComponent(cache, safeWidth);
+				cache.height = lines.length;
+				needsUpdate = true;
+			}
+
+			newHeights.push(cache.height ?? 0);
 		}
-		return total;
+
+		if (needsUpdate || newHeights.length !== this.componentHeightIndex.getBlockCount()) {
+			this.componentHeightIndex.reset(this.componentCaches.length);
+			this.componentHeightIndex.setHeights(newHeights);
+		}
+
+		return this.componentHeightIndex.getTotalHeight();
 	}
 
 	getRenderVersion(): number {
@@ -300,8 +331,10 @@ export class TranscriptAdapter {
 
 	private addComponent(component: Component): void {
 		this.container.addChild(component);
-		const cache: ComponentRenderCache = { component, lines: [], dirty: true };
-		this.componentCaches.push(cache);
+		const index = this.componentCaches.length;
+		this.componentHeightIndex.append(0);
+		const cache: ComponentRenderCache = { component, dirty: true };
+		this.componentCaches[index] = cache;
 		this.componentCacheByComponent.set(component, cache);
 		this.bumpRenderVersion();
 	}
@@ -310,16 +343,33 @@ export class TranscriptAdapter {
 		this.container.clear();
 		this.componentCaches = [];
 		this.componentCacheByComponent.clear();
-	}
-
-	private markComponentDirty(component: Component): void {
-		const cache = this.componentCacheByComponent.get(component);
-		if (cache) cache.dirty = true;
+		this.componentHeightIndex.reset(0);
 		this.bumpRenderVersion();
 	}
 
+	private markComponentDirty(index: number): void;
+	private markComponentDirty(component: Component): void;
+	private markComponentDirty(componentOrIndex: Component | number): void {
+		const cache =
+			typeof componentOrIndex === "number"
+				? this.componentCaches[Math.floor(componentOrIndex)]
+				: this.componentCacheByComponent.get(componentOrIndex);
+		if (cache) {
+			cache.dirty = true;
+			cache.cachedSlice = undefined;
+			cache.height = undefined;
+			this.bumpRenderVersion();
+		}
+	}
+
 	private markAllComponentsDirty(): void {
-		for (const cache of this.componentCaches) cache.dirty = true;
+		for (const cache of this.componentCaches) {
+			cache.dirty = true;
+			cache.width = undefined;
+			cache.height = undefined;
+			cache.cachedSlice = undefined;
+		}
+		this.componentHeightIndex.reset(this.componentCaches.length);
 		this.bumpRenderVersion();
 	}
 
@@ -328,11 +378,20 @@ export class TranscriptAdapter {
 	}
 
 	private renderComponent(cache: ComponentRenderCache, width: number): string[] {
-		if (!cache.dirty && cache.width === width) return cache.lines;
-		cache.lines = cache.component.render(width);
+		if (!cache.dirty && cache.width === width && cache.cachedSlice?.width === width) return cache.cachedSlice.lines;
+
+		const lines = cache.component.render(width);
 		cache.width = width;
+		cache.height = lines.length;
 		cache.dirty = false;
-		return cache.lines;
+
+		if (cache.height <= 50) {
+			cache.cachedSlice = { startLine: 0, lines, width, version: this.renderVersion };
+		} else {
+			cache.cachedSlice = undefined;
+		}
+
+		return lines;
 	}
 
 	private getUserText(message: Message): string {
