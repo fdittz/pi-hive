@@ -45,6 +45,10 @@ function parseFrontmatter(content: string): { frontmatter: Record<string, unknow
 }
 
 mock.module("@earendil-works/pi-coding-agent", () => ({
+	VERSION: "0.75.0",
+	AssistantMessageComponent: class {},
+	ToolExecutionComponent: class {},
+	UserMessageComponent: class {},
 	getAgentDir: () => "/tmp/pi-hive-test-empty-agents",
 	parseFrontmatter,
 }));

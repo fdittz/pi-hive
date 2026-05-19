@@ -458,7 +458,7 @@ Inside the viewer:
 
 The viewer replays the same JSON event stream emitted by child `pi --mode json` processes and renders built-in tool calls with public pi components such as `ToolExecutionComponent` and `AssistantMessageComponent`.
 
-Large transcripts are rendered through a viewport instead of redrawing the entire history every frame. `TranscriptView` incrementally consumes new events, `TranscriptAdapter` caches rendered lines per native component, and the overlay coalesces live updates to avoid excessive TUI renders while a subagent is streaming.
+Large transcripts are rendered through height-indexed viewport virtualization instead of redrawing the entire history every frame. `TranscriptView` incrementally consumes new events, `TranscriptAdapter` tracks component heights and viewport slices, and the overlay coalesces live updates to avoid excessive TUI renders while a subagent is streaming.
 
 While the viewer is open, pi-hive enables terminal mouse reporting so the mouse wheel scrolls the transcript instead of the terminal scrollback. Mouse reporting is disabled again when the viewer closes.
 
@@ -495,6 +495,51 @@ The main session stores only a small `transcriptRef` plus compact fallback event
 - `read ~/path:1-10` for read
 - `grep /pattern/ in ~/path` for grep
 - etc.
+
+## Performance: Transcript Virtualization
+
+### How It Works
+
+The subagent live view now uses **height-indexed viewport virtualization** to keep the viewport display around ~300 lines at a time.
+
+**Before:**
+- Full transcript rendered as lines in memory
+- All components traversed on every viewport render
+- Large transcripts caused high memory usage for **rendered output**
+
+**After:**
+- **Rendered output budget:** ~300 lines displayed on screen at one time
+- **Internal caches:** small components/lines may be retained per width (implementation detail)
+- **Overall memory:** grows with transcript/output size, but viewport/display is constant-bounded
+
+### Budget
+
+- **Rendered lines budget:** ~300 lines displayed on screen (not total transcript length)
+- **Event stream:** Full transcript events remain in memory during active run (persisted to sidecar after completion)
+- **Overscan:** +100 lines before/after visible viewport to reduce flicker on quick scroll
+- **Internal caches:** small components/lines may be retained per width to reduce re-rendering; no fixed global cache cap is promised
+
+### Behavior
+
+- Within the same viewport width and state, scrolling is smooth and responsive because only visible content is rendered
+- **Viewport display** is bounded (~300 lines) regardless of transcript length
+- Internal render cache may grow with transcript; this trades memory for CPU (less re-render)
+- Within the same viewport width and state, scroll is smooth and fast
+- Changing width or scrolling after long inactivity may require re-measurement and show slight delay
+- Stick-to-bottom auto-follows live streams correctly
+
+### What's NOT Changed
+
+- Event stream and persistence: full transcript still persisted to sidecar JSONL after run completes
+- Replay and filtering: transcript contents/filtering behavior unchanged
+- UI/UX: visual output identical; only rendering strategy optimized
+- Fallback behavior: plain/text rendering available if native rendering fails
+
+### Affected Paths
+
+1. **Native adapter (transcript-adapter.ts)**: Highest ROI—most transcripts use this
+2. **resultOutput**: Background jobs with large stdout
+3. **Fallback plain**: Recovery path if native rendering fails
 
 ## Agent Definitions
 

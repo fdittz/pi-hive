@@ -471,7 +471,7 @@ Important properties:
 - The parent extension collects assistant messages, tool results, token usage, and final output.
 - Abort signals propagate to child processes.
 
-## Live transcript architecture
+## Live Transcript Architecture (Updated)
 
 The live viewer is intentionally not implemented by nesting pi's `InteractiveMode`. `InteractiveMode` owns terminal IO, editor state, footer/header state, and the main session runtime, so nesting it would make two UI runtimes compete for the same terminal.
 
@@ -500,6 +500,32 @@ UserMessageComponent
 ```
 
 The implementation avoids imports from private `dist/...` package paths.
+
+### Height-Indexed Virtualization
+
+Components are indexed by their rendered height. When rendering a viewport:
+
+1. `getLineCount(width)` measures dirty components, updates the height index, returns total
+2. `renderViewport(width, offset, height)` uses index to locate the first visible component
+3. Only intersecting components are fully rendered; their output is sliced to viewport bounds
+4. Small components (≤50 lines) render cache per width to avoid re-render on same-width scroll
+5. Large components are re-rendered on demand; `WrappedLineVirtualizer` caches wrapped lines per source line + width
+
+### Rendered Output Memory
+
+- `ComponentRenderCache` no longer stores full `.lines` array for rendered output
+- Instead: `.height`, `.cachedSlice` (optional, for small components), `.dirty` flag
+- Viewport render returns ~300 displayed lines max + overscan per call
+- Internal caches may retain small component slices or wrapped source lines per width
+- Full transcript events remain in memory during an active run and are persisted to the sidecar JSONL after completion
+
+### Scroll Performance
+
+- **Steady-state scroll** in viewport: only visible components/lines are rendered
+- **First render or width change:** all components measured; O(n) cost (unavoidable for exact line count)
+- **Lazy caching:** small components cached; large components rendered on-demand
+- **Result:** smooth scrolling for long transcripts; first viewport calculation has O(n) cost amortized
+- Very long transcripts (10k+ events, 1000+ rendered lines) scroll smoothly **within same width/state**
 
 ## Files
 

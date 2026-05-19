@@ -4,8 +4,9 @@ import { colorAgentText } from "./agent-colors.js";
 import type { StoredTranscriptEvent, SubagentRunRecord } from "./transcript-types.js";
 
 export function getCompatibilityWarning(): string | undefined {
-	if (!VERSION.startsWith("0.74.")) {
-		return `Subagent live view was built against pi 0.74.x; current pi is ${VERSION}. Falling back if native rendering fails.`;
+	const majorMinor = VERSION.split(".").slice(0, 2).join(".");
+	if (!majorMinor.match(/^0\.(74|75)$/)) {
+		return `Subagent live view was built against pi 0.74.x/0.75.x; current pi is ${VERSION}. Falling back if native rendering fails.`;
 	}
 	return undefined;
 }
