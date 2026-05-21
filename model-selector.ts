@@ -1,4 +1,6 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 import type { AgentConfig, AgentScope } from "./agents.js";
 import { discoverAgents } from "./agents.js";
 import {
@@ -12,34 +14,41 @@ import {
 	setAgentModelOverride,
 } from "./model-overrides.js";
 
-function pad(value: string, width: number): string {
-	return value.length >= width ? value : value + " ".repeat(width - value.length);
-}
+async function showSelectList(
+	ctx: ExtensionCommandContext,
+	title: string,
+	items: SelectItem[],
+): Promise<string | null> {
+	return ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+		const container = new Container();
 
-function agentOption(agent: AgentConfig, ctx: ExtensionCommandContext, parentThinking?: string): string {
-	const config = loadSubagentModelConfig();
-	const current = getAgentModelDisplay(agent, ctx.model, config, parentThinking);
-	return `${pad(agent.name, 16)} ${pad(agent.source, 8)} current: ${current}`;
-}
+		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+		container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
 
-function parseAgentName(option: string): string {
-	return option.trim().split(/\s+/)[0] ?? option.trim();
-}
+		const maxVisible = Math.min(items.length, 15);
+		const selectList = new SelectList(items, maxVisible, {
+			selectedPrefix: (t: string) => theme.fg("accent", t),
+			selectedText: (t: string) => theme.fg("accent", t),
+			description: (t: string) => theme.fg("muted", t),
+			scrollInfo: (t: string) => theme.fg("dim", t),
+			noMatch: (t: string) => theme.fg("warning", t),
+		});
+		selectList.onSelect = (item: SelectItem) => done(item.value);
+		selectList.onCancel = () => done(null);
+		container.addChild(selectList);
 
-function modelOption(value: string, label: string): string {
-	return `${value} — ${label}`;
-}
+		container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter select • esc cancel"), 1, 0));
+		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 
-function parseModelOption(option: string): string {
-	return option.split(" — ")[0]?.trim() || option.trim();
-}
-
-function thinkingOption(value: string, label: string): string {
-	return `${value} — ${label}`;
-}
-
-function parseThinkingOption(option: string): string {
-	return option.split(" — ")[0]?.trim() || option.trim();
+		return {
+			render: (w: number) => container.render(w),
+			invalidate: () => container.invalidate(),
+			handleInput: (data: string) => {
+				selectList.handleInput(data);
+				tui.requestRender();
+			},
+		};
+	});
 }
 
 export async function openSubagentModelSelector(
@@ -57,35 +66,51 @@ export async function openSubagentModelSelector(
 			return;
 		}
 
-		const agentOptions = agents.map((agent) => agentOption(agent, ctx, parentThinking));
-		const selectedAgentOption = await ctx.ui.select(
-			`Select subagent model (${getSubagentModelConfigPath()})`,
-			agentOptions,
-		);
-		if (!selectedAgentOption) return;
+		// Step 1: Pick an agent
+		const config = loadSubagentModelConfig();
+		const agentItems: SelectItem[] = agents.map((agent) => {
+			const current = getAgentModelDisplay(agent, ctx.model, config, parentThinking);
+			return {
+				value: agent.name,
+				label: agent.name,
+				description: `${agent.source} • current: ${current}`,
+			};
+		});
 
-		const agentName = parseAgentName(selectedAgentOption);
-		const agent = agents.find((a) => a.name === agentName);
+		const selectedAgentName = await showSelectList(
+			ctx,
+			`Select subagent model (${getSubagentModelConfigPath()})`,
+			agentItems,
+		);
+		if (!selectedAgentName) return;
+
+		const agent = agents.find((a) => a.name === selectedAgentName);
 		if (!agent) continue;
 
+		// Step 2: Pick a model
 		const parent = ctx.model ? formatModelRef(ctx.model) : "default model";
 		const parentThinkingLabel = parentThinking ? `thinking ${parentThinking}` : "default thinking";
 		const availableModels = ctx.modelRegistry
 			.getAvailable()
 			.map((model) => formatModelRef(model))
 			.sort((a, b) => a.localeCompare(b));
-		const modelOptions = [
-			modelOption(INHERIT_MODEL, `inherit current parent model (${parent}, ${parentThinkingLabel})`),
-			...availableModels.map((modelRef) => modelOption(modelRef, "use this model for the selected subagent")),
+
+		const modelItems: SelectItem[] = [
+			{
+				value: INHERIT_MODEL,
+				label: INHERIT_MODEL,
+				description: `${parent}, ${parentThinkingLabel}`,
+			},
+			...availableModels.map((modelRef) => ({
+				value: modelRef,
+				label: modelRef,
+			})),
 		];
 
-		const selectedModelOption = await ctx.ui.select(`Model for ${agent.name}`, modelOptions);
-		if (!selectedModelOption) continue;
+		const selectedModel = await showSelectList(ctx, `Model for ${agent.name}`, modelItems);
+		if (!selectedModel) continue;
 
-		const selectedModel = parseModelOption(selectedModelOption);
-
-		// Ask only for an explicit subagent override. If the user leaves thinking unset,
-		// resolution inherits the parent pi thinking level; agent frontmatter is ignored.
+		// Step 3: Optionally configure thinking level
 		const configThinking = await ctx.ui.confirm(
 			`Configure thinking level for ${agent.name}?`,
 			`Leave unchecked to inherit the parent pi thinking level (${parentThinkingLabel}). Agent frontmatter thinking is not used as a subagent fallback.`,
@@ -93,21 +118,29 @@ export async function openSubagentModelSelector(
 
 		let finalSetting = selectedModel;
 		if (configThinking) {
-			const thinkingOptions = [
-				thinkingOption(INHERIT_THINKING, `inherit parent pi thinking (${parentThinkingLabel})`),
-				...THINKING_LEVELS.map((level) => thinkingOption(level, `use ${level} thinking effort for this subagent`)),
+			const thinkingItems: SelectItem[] = [
+				{
+					value: INHERIT_THINKING,
+					label: INHERIT_THINKING,
+					description: parentThinkingLabel,
+				},
+				...THINKING_LEVELS.map((level) => ({
+					value: level,
+					label: level,
+				})),
 			];
 
-			const selectedThinkingOption = await ctx.ui.select(
+			const selectedThinking = await showSelectList(
+				ctx,
 				`Thinking level for ${agent.name} (Resolution order: override → parent pi → default)`,
-				thinkingOptions,
+				thinkingItems,
 			);
-			if (selectedThinkingOption) {
-				const selectedThinking = parseThinkingOption(selectedThinkingOption);
+			if (selectedThinking) {
 				if (selectedThinking !== INHERIT_THINKING) {
-					finalSetting = selectedModel === INHERIT_MODEL
-						? `${INHERIT_MODEL}:${selectedThinking}`
-						: `${selectedModel}:${selectedThinking}`;
+					finalSetting =
+						selectedModel === INHERIT_MODEL
+							? `${INHERIT_MODEL}:${selectedThinking}`
+							: `${selectedModel}:${selectedThinking}`;
 				}
 			}
 		}
