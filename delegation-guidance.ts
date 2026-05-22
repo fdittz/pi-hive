@@ -107,7 +107,7 @@ export function generateSubagentGuidance(agents: AgentConfig[]): SubagentGuidanc
 	const promptSnippet = [
 		"Delegate tasks to specialized subagents with isolated context.",
 		`Available agents: ${agentList}${remainingText}`,
-		'Modes: single, parallel tasks, or chain with {previous}. Add --background flag to run asynchronously: /subagent --background agent task',
+		'Modes: single, parallel tasks, or chain (previous-step context is auto-injected into later steps by default). Add --background flag to run asynchronously: /subagent --background agent task',
 	].join(" ");
 
 	const promptGuidelines: string[] = [
@@ -119,7 +119,7 @@ export function generateSubagentGuidance(agents: AgentConfig[]): SubagentGuidanc
 		"When user mentions 'background', 'async', 'in parallel', 'without blocking', or 'while I work', add --background flag: /subagent --background agent task",
 		"Use subagent when an available specialized agent can do focused discovery, planning, implementation, review, or domain-specific work in an isolated context.",
 		'Use subagent agentScope "both" (or "project") when the user explicitly asks to use trusted project-local agents from .pi/agents; default agentScope "user" excludes project-local agents.',
-		"Use subagent parallel tasks only for independent work; use chain when one agent's output should feed the next step.",
+		"Use subagent parallel tasks only for independent work; use chain when one agent's output should feed the next step; {previous} is auto-injected into later chain steps by default.",
 		"Background tasks run asynchronously without blocking; user can check progress with /subagent-jobs status and retrieve results with /subagent-jobs results <id>.",
 	];
 
@@ -184,7 +184,7 @@ export function generateSubagentGuidance(agents: AgentConfig[]): SubagentGuidanc
 		"Monitor with `/subagent-jobs status` and retrieve results with `/subagent-jobs results <id>`",
 		"",
 		'Use `agentScope: "both"` (or `"project"`) only when the user explicitly wants trusted project-local agents from `.pi/agents`; the default `"user"` scope only includes bundled/user agents.',
-		"Use chain mode when output should flow between agents, and parallel mode only for independent tasks.",
+		"Use chain mode when output should flow between agents, and parallel mode only for independent tasks. Later chain steps receive previous output automatically unless the user disables chain.autoInjectPrevious.",
 		...maybeKnownChainGuidance(availableAgents),
 	]
 		.filter(Boolean)

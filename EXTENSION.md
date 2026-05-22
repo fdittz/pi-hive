@@ -61,6 +61,7 @@ A local project/repository copy is:
 
 - Delegate tasks to bundled package agents and user agents from `~/.pi/agent/agents/*.md`.
 - Run one agent, multiple agents in parallel, or a sequential chain.
+- Automatically pass previous chain-step output to later steps by injecting `{previous}` when absent.
 - Prevent nested subagent process chains by withholding parent orchestration tools from child processes marked with `PI_SUBAGENT=1`.
 - Let child subagents request follow-up work through a real `handoff` tool.
 - Stream child process JSON events from each subagent.
@@ -163,6 +164,30 @@ handoffAllowList: reviewer, planner
 ```
 
 Supported aliases are `handoffAllowList`, `handoffAllowlist`, `handoff-allow-list`, and `allowList`.
+
+### Chain previous-output injection
+
+Sequential `subagent` chains pass context with a `{previous}` placeholder. By default, before execution pi-hive normalizes every chain step after the first: if the step task does not already contain a previous placeholder, it appends:
+
+```text
+Contexto do passo anterior (auto-inserido):
+{previous}
+```
+
+Existing placeholders are respected case-insensitively and with optional whitespace, so `{previous}`, `{ previous }`, and `{Previous}` are all treated as explicit placeholders. Disable the behavior in `~/.pi/agent/subagent.json` when a chain's steps must remain independent:
+
+```json
+{
+  "chain": {
+    "autoInjectPrevious": {
+      "enabled": false,
+      "mode": "append-block"
+    }
+  }
+}
+```
+
+The default is `enabled: true`; `mode` currently supports `append-block`.
 
 ### `/subagents-lang`
 
@@ -333,7 +358,7 @@ Child subagent processes register `handoff` instead of those parent orchestratio
 }
 ```
 
-`{previous}` is replaced with the previous step's final assistant output.
+`{previous}` is replaced with the previous step's final assistant output. If a later step omits the placeholder, pi-hive appends the default previous-context block automatically unless `chain.autoInjectPrevious.enabled` is set to `false` in `~/.pi/agent/subagent.json`.
 
 ## Prompt templates
 

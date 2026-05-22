@@ -7,7 +7,7 @@
  * Supports three modes:
  *   - Single: { agent: "name", task: "..." }
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
- *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
+ *   - Chain: { chain: [{ agent: "name", task: "..." }, ...] } (auto-injects {previous} into later steps by default)
  *
  * Uses RPC mode to stream child events and accept live steering/follow-up input.
  */
@@ -46,6 +46,7 @@ import {
 import { buildSubagentInvocationMessage } from "./auto-delegate-run.js";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { ChildSessionStorage } from "./child-session-storage.js";
+import { normalizeChainPrevious, replacePreviousPlaceholder } from "./chain-previous.js";
 import {
 	findBestAgent,
 	loadCachedAgentsWithEnglishTriggers,
@@ -899,7 +900,7 @@ const TaskItem = Type.Object({
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
+	task: Type.String({ description: "Task with optional {previous} placeholder for prior output; later chain steps get one auto-injected by default" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
@@ -915,7 +916,7 @@ const SubagentParams = Type.Object({
 	run: Type.Optional(Type.String({ description: "Run prefix, short id, full id, or agent@id label to continue (continuation mode)" })),
 	instruction: Type.Optional(Type.String({ description: "Optional continuation instruction (continuation mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
+	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution; prior output is auto-injected into later steps by default" })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
@@ -2417,7 +2418,7 @@ export default function (pi: ExtensionAPI) {
 			label: "Subagent",
 			description: [
 				"Delegate tasks to specialized subagents with isolated context.",
-				"Modes: single (agent + task), continuation (run + optional instruction), parallel (tasks array), chain (sequential with {previous} placeholder).",
+				"Modes: single (agent + task), continuation (run + optional instruction), parallel (tasks array), chain (sequential; {previous} is auto-injected into later steps by default).",
 				"Child subagents may request handoffs by calling the handoff tool; legacy JSON handoff output remains supported as a fallback.",
 				'Default agent scope is "user" (from ~/.pi/agent/agents).',
 				'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
@@ -2536,12 +2537,13 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (params.chain && params.chain.length > 0) {
+					const chain = normalizeChainPrevious(params.chain, loadSubagentConfig().chain.autoInjectPrevious);
 					const results: SingleResult[] = [];
 					let previousOutput = "";
 
-					for (let i = 0; i < params.chain.length; i++) {
-						const step = params.chain[i];
-						const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					for (let i = 0; i < chain.length; i++) {
+						const step = chain[i];
+						const taskWithContext = replacePreviousPlaceholder(step.task, previousOutput);
 
 						// Create update callback that includes all previous results
 						const chainUpdate: OnUpdateCallback | undefined = onUpdate

@@ -4,7 +4,7 @@ import {
 	ToolExecutionComponent,
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
-import { Container, type Component, type TUI, Text } from "@earendil-works/pi-tui";
+import { Container, type Component, Spacer, type TUI, Text } from "@earendil-works/pi-tui";
 import { tryNative } from "./compatibility.js";
 import { LineHeightIndex } from "./line-height-index.js";
 import type { StoredTranscriptEvent } from "./transcript-types.js";
@@ -180,6 +180,7 @@ export class TranscriptAdapter {
 	private handleMessageStart(message: Message | undefined): void {
 		if (!message) return;
 		if (message.role === "user") {
+			if (this.componentCaches.length > 0) this.addComponent(new Spacer(1));
 			const text = this.getUserText(message);
 			const component = tryNative(() => new UserMessageComponent(text));
 			if (component) this.addComponent(component);

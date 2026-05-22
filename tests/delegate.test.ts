@@ -50,6 +50,7 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 	ToolExecutionComponent: class {},
 	UserMessageComponent: class {},
 	getAgentDir: () => "/tmp/pi-hive-test-empty-agents",
+	withFileMutationQueue: async (_filePath: string, mutate: () => Promise<void>) => mutate(),
 	parseFrontmatter,
 }));
 

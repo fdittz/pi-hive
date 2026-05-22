@@ -60,8 +60,15 @@ mock.module("@earendil-works/pi-tui", () => {
 		}
 	}
 
+	class Spacer {
+		render(): string[] {
+			return [];
+		}
+	}
+
 	return {
 		Container,
+		Spacer,
 		Text,
 		wrapTextWithAnsi: (text: string, width: number): string[] => {
 			const safeWidth = Math.max(1, Math.floor(width));
@@ -81,6 +88,7 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 	ToolExecutionComponent: class {},
 	UserMessageComponent: class {},
 	getAgentDir: () => "/tmp/pi-hive-test-empty-agents",
+	withFileMutationQueue: async (_filePath: string, mutate: () => Promise<void>) => mutate(),
 	parseFrontmatter,
 }));
 

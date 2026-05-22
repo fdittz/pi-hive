@@ -10,9 +10,9 @@ Pi-hive agents are specialized Markdown files with YAML frontmatter that run in 
 
 - **Single**: `{ agent, task }` — one agent, one task
 - **Parallel**: `{ tasks: [...] }` — multiple agents run concurrently (max 8, 4 concurrent)
-- **Chain**: `{ chain: [...] }` — sequential tasks with `{previous}` placeholder for prior output
+- **Chain**: `{ chain: [...] }` — sequential tasks; prior output is passed through `{previous}` and auto-injected into later steps by default
 
-Each agent runs in its own context window, so passing context between agents is explicit and intentional.
+Each agent runs in its own context window, so context between chain steps is passed through `{previous}`. pi-hive auto-injects that placeholder into steps after the first unless `chain.autoInjectPrevious.enabled` is set to `false`.
 
 ---
 
@@ -133,8 +133,8 @@ Dynamic prompt guidance is generated from discovered agents using `description`,
 {
   "chain": [
     { "agent": "scout", "task": "Find authentication code" },
-    { "agent": "planner", "task": "Plan OAuth migration based on {previous}" },
-    { "agent": "worker", "task": "Implement plan from {previous}" }
+    { "agent": "planner", "task": "Plan OAuth migration" },
+    { "agent": "worker", "task": "Implement plan" }
   ]
 }
 ```
@@ -144,7 +144,7 @@ Dynamic prompt guidance is generated from discovered agents using `description`,
 {
   "chain": [
     { "agent": "scout", "task": "Find session store" },
-    { "agent": "planner", "task": "Plan Redis migration from {previous}" }
+    { "agent": "planner", "task": "Plan Redis migration" }
   ]
 }
 ```
@@ -154,8 +154,8 @@ Dynamic prompt guidance is generated from discovered agents using `description`,
 {
   "chain": [
     { "agent": "worker", "task": "Add input validation to API" },
-    { "agent": "reviewer", "task": "Security audit of {previous}" },
-    { "agent": "worker", "task": "Fix issues from {previous}" }
+    { "agent": "reviewer", "task": "Security audit" },
+    { "agent": "worker", "task": "Fix issues" }
   ]
 }
 ```
@@ -194,11 +194,17 @@ Now this agent can only delegate to those two.
     "maxHandoffsPerRun": 3,
     "requireApprovalForProjectAgents": false,
     "blockSelfHandoff": false
+  },
+  "chain": {
+    "autoInjectPrevious": {
+      "enabled": true,
+      "mode": "append-block"
+    }
   }
 }
 ```
 
-Configure with `/subagent-handoff` command.
+Set `chain.autoInjectPrevious.enabled` to `false` to stop automatic `{previous}` insertion for chain steps. Configure handoff settings with `/subagent-handoff` command.
 
 ---
 

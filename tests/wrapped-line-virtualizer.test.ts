@@ -24,8 +24,15 @@ mock.module("@earendil-works/pi-tui", () => {
 		}
 	}
 
+	class Spacer {
+		render(): string[] {
+			return [];
+		}
+	}
+
 	return {
 		Container,
+		Spacer,
 		Text,
 		wrapTextWithAnsi: (text: string, width: number): string[] => {
 			const safeWidth = Math.max(1, Math.floor(width));

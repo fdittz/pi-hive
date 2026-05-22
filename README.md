@@ -16,6 +16,7 @@ For complete local extension documentation, see [`EXTENSION.md`](./EXTENSION.md)
 - **Overlay performance**: Viewport rendering, incremental transcript replay, and per-component render caching keep large transcripts responsive
 - **Model and thinking selection**: Use `/subagent-model` to configure each subagent's model plus optional thinking level
 - **Handoff tool**: Child subagents get a real `handoff` tool to request follow-up work; handoffs run automatically by default
+- **Natural chains**: Sequential chains automatically pass the previous step output to later steps unless disabled in config
 - **Dynamic agent guidance**: Discovered agents are summarized into `promptSnippet`/`promptGuidelines` so pi can suggest the right specialist
 - **Agent metadata**: Frontmatter supports `when`, `examples`, `triggers`, and `triggers_en` for better discovery and guidance
 - **Translated trigger cache**: Use `/subagents-lang <lang>` to translate English agent triggers once, cache them, and improve delegation matching for non-English requests
@@ -162,6 +163,12 @@ Example:
     "headers": {
       "x-initiator": "agent"
     }
+  },
+  "chain": {
+    "autoInjectPrevious": {
+      "enabled": true,
+      "mode": "append-block"
+    }
   }
 }
 ```
@@ -180,6 +187,8 @@ Example:
 | `requestHeaders.enabled` | Enable provider/model request headers inside child subagent pi processes |
 | `requestHeaders.providers` | Provider allowlist for headers; `"*"` means all providers |
 | `requestHeaders.headers` | Header templates to inject into matching providers |
+| `chain.autoInjectPrevious.enabled` | Automatically append a `{previous}` context block to chain steps after the first when they do not already contain one; default `true` |
+| `chain.autoInjectPrevious.mode` | Injection format; currently `append-block` |
 
 The old `~/.pi/agent/subagent-models.json` file is read as a migration fallback for model overrides, but new writes go to `subagent.json`.
 
@@ -256,6 +265,8 @@ Run 2 scouts in parallel: one to find models, one to find providers
 ```
 Use a chain: first have scout find the read tool, then have planner suggest improvements
 ```
+
+For chain steps after the first, pi-hive appends a context block containing `{previous}` automatically unless the task already contains a placeholder such as `{previous}`, `{ previous }`, or `{Previous}`. Set `chain.autoInjectPrevious.enabled: false` in `~/.pi/agent/subagent.json` to keep chain tasks exactly as provided.
 
 ### Workflow prompts
 ```
@@ -404,7 +415,7 @@ The extension also registers an LLM-callable tool named `subagent_continue`, so 
 |------|-----------|-------------|
 | Single | `{ agent, task }` | One agent, one task |
 | Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
-| Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
+| Chain | `{ chain: [...] }` | Sequential; later steps receive prior output through `{previous}` (auto-injected by default) |
 
 ## Dynamic agent guidance
 

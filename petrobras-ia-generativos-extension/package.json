@@ -1,0 +1,22 @@
+{
+  "name": "petrobras-ia-generativos-provider",
+  "version": "1.0.0",
+  "description": "Custom provider for Petrobras IA Generativos (AWS Bedrock proxy)",
+  "main": "index.ts",
+  "type": "module",
+  "author": "",
+  "license": "ISC",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.1048.0",
+    "@earendil-works/pi-ai": "^0.75.3",
+    "@smithy/node-http-handler": "^4.7.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

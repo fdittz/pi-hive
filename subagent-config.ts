@@ -22,6 +22,12 @@ export interface SubagentConfig {
 		providers: string[];
 		headers: Record<string, string>;
 	};
+	chain: {
+		autoInjectPrevious: {
+			enabled: boolean;
+			mode: "append-block";
+		};
+	};
 }
 
 const DEFAULT_CONFIG: SubagentConfig = {
@@ -40,6 +46,12 @@ const DEFAULT_CONFIG: SubagentConfig = {
 		providers: ["*"],
 		headers: {
 			"x-initiator": "agent",
+		},
+	},
+	chain: {
+		autoInjectPrevious: {
+			enabled: true,
+			mode: "append-block",
 		},
 	},
 };
@@ -70,6 +82,8 @@ function normalizeConfig(parsed: unknown): SubagentConfig {
 	const models = isRecord(root.models) ? root.models : {};
 	const handoff = isRecord(root.handoff) ? root.handoff : {};
 	const requestHeaders = isRecord(root.requestHeaders) ? root.requestHeaders : {};
+	const chain = isRecord(root.chain) ? root.chain : {};
+	const autoInjectPrevious = isRecord(chain.autoInjectPrevious) ? chain.autoInjectPrevious : {};
 	const mode = handoff.mode === "manual" || handoff.mode === "off" || handoff.mode === "auto" ? handoff.mode : DEFAULT_CONFIG.handoff.mode;
 	const providers = Array.isArray(requestHeaders.providers)
 		? requestHeaders.providers.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
@@ -105,6 +119,15 @@ function normalizeConfig(parsed: unknown): SubagentConfig {
 					? normalizeStringMap(requestHeaders.headers)
 					: { ...DEFAULT_CONFIG.requestHeaders.headers },
 		},
+		chain: {
+			autoInjectPrevious: {
+				enabled:
+					typeof autoInjectPrevious.enabled === "boolean"
+						? autoInjectPrevious.enabled
+						: DEFAULT_CONFIG.chain.autoInjectPrevious.enabled,
+				mode: "append-block",
+			},
+		},
 	};
 }
 
@@ -130,6 +153,7 @@ export function loadSubagentConfig(): SubagentConfig {
 			models: { overrides: loadLegacyModelOverrides() },
 			handoff: { ...DEFAULT_CONFIG.handoff },
 			requestHeaders: { ...DEFAULT_CONFIG.requestHeaders, headers: { ...DEFAULT_CONFIG.requestHeaders.headers } },
+			chain: { autoInjectPrevious: { ...DEFAULT_CONFIG.chain.autoInjectPrevious } },
 		};
 	}
 }
@@ -149,5 +173,6 @@ export function getDefaultSubagentConfig(): SubagentConfig {
 		models: { overrides: {} },
 		handoff: { ...DEFAULT_CONFIG.handoff },
 		requestHeaders: { ...DEFAULT_CONFIG.requestHeaders, headers: { ...DEFAULT_CONFIG.requestHeaders.headers } },
+		chain: { autoInjectPrevious: { ...DEFAULT_CONFIG.chain.autoInjectPrevious } },
 	};
 }

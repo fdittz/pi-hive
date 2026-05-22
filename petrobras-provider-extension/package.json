@@ -1,0 +1,24 @@
+{
+  "name": "petrobras-ia-provider",
+  "version": "1.0.0",
+  "description": "Custom provider for Petrobras IA",
+  "main": "index.ts",
+  "type": "module",
+  "author": "",
+  "license": "ISC",
+  "scripts": {
+    "test": "node --test test/*.test.cjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.75.3",
+    "openai": "^6.26.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

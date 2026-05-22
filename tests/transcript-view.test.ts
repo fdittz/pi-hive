@@ -27,6 +27,11 @@ mock.module("@earendil-works/pi-tui", () => ({
 			return [this.text];
 		}
 	},
+	Spacer: class {
+		render(): string[] {
+			return [];
+		}
+	},
 	wrapTextWithAnsi: (text: string, width: number): string[] => {
 		const safeWidth = Math.max(1, Math.floor(width));
 		if (text.length === 0) return [];
@@ -44,6 +49,7 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 	ToolExecutionComponent: class {},
 	UserMessageComponent: class {},
 	getAgentDir: () => "/tmp/pi-hive-test-empty-agents",
+	withFileMutationQueue: async (_filePath: string, mutate: () => Promise<void>) => mutate(),
 	parseFrontmatter,
 }));
 
