@@ -278,7 +278,7 @@ export class SubagentOverlay implements Component {
 		const editor = run && isLiveStatus(run.status) ? this.getEditorForRun(run) : undefined;
 		const hasInputController = Boolean(run && this.registry.getInputController(run.id));
 		const editorHasText = Boolean(editor && editor.getText().length > 0);
-		const confirmCancelWithCtrlC = matchesKey(data, "ctrl+c") && (!this.selectedText || this.cancelConfirmationRunId === run?.id);
+		const confirmCancelWithCtrlC = matchesKey(data, "ctrl+c");
 		const confirmCancelWithX = !hasInputController && (matchesKey(data, "x") || data === "X");
 		if ((confirmCancelWithX || confirmCancelWithCtrlC) && run && canCancelStatus(run.status)) {
 			this.cancelSelectedRun();
@@ -291,10 +291,12 @@ export class SubagentOverlay implements Component {
 			return;
 		}
 
-		if (matchesKey(data, "ctrl+c")) {
+		if (this.matchesCopyShortcut(data)) {
 			if (this.selectedText) this.copySelection();
 			return;
 		}
+
+		if (this.matchesBlockedPasteShortcut(data)) return;
 
 		if (matchesKey(data, "ctrl+shift+o") || matchesKey(data, "alt+o") || matchesKey(data, Key.escape) || (!hasInputController && data === "q")) {
 			this.done();
@@ -429,6 +431,14 @@ export class SubagentOverlay implements Component {
 
 	private matchesDequeue(data: string): boolean {
 		return this.keybindings.matches(data, "app.message.dequeue") || matchesKey(data, Key.alt("up"));
+	}
+
+	private matchesCopyShortcut(data: string): boolean {
+		return matchesKey(data, Key.ctrlShift("c"));
+	}
+
+	private matchesBlockedPasteShortcut(data: string): boolean {
+		return matchesKey(data, "ctrl+v");
 	}
 
 	private matchesOptionalAppKey(data: string, keybinding: string): boolean {
@@ -820,8 +830,8 @@ export class SubagentOverlay implements Component {
 		const followUpKey = this.keyText("app.message.followUp", "Alt+Enter");
 		const newLineKey = this.keyText("tui.input.newLine", "Shift+Enter");
 		const helpText = isLiveStatus(run.status)
-			? `${submitKey} steer · ${followUpKey} follow-up · ${newLineKey} newline · PgUp/PgDn scroll · Ctrl+C cancel · Ctrl+O expand · Alt+O/Esc back`
-			: "←/→ agent · ↑/↓ scroll · drag select · Ctrl+C copy · Alt+O/Esc/q back";
+			? `${submitKey} steer · ${followUpKey} follow-up · ${newLineKey} newline · Ctrl+Shift+V paste · PgUp/PgDn scroll · Ctrl+C cancel · Ctrl+O expand · Alt+O/Esc back`
+			: "←/→ agent · ↑/↓ scroll · drag select · Ctrl+Shift+C copy · Alt+O/Esc/q back";
 		const help = this.theme.fg("dim", helpText);
 		return [top, truncateToWidth(title, width), truncateToWidth(ctx, width), truncateToWidth(help, width), top];
 	}
