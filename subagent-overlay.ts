@@ -2,7 +2,7 @@ import { CustomEditor, FooterComponent, getSelectListTheme, type KeybindingsMana
 import { Key, matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { colorAgentText } from "./agent-colors.js";
 import type { LiveSubagentRegistry } from "./live-registry.js";
-import { createFooterDataAdapter, createFooterSessionAdapter, type SubagentOverlayHostContext } from "./subagent-overlay-context.js";
+import { createFooterDataAdapter, createFooterSessionAdapter, createSubagentFooterDataAdapter, createSubagentFooterSessionAdapter, type SubagentOverlayHostContext } from "./subagent-overlay-context.js";
 import { TranscriptView } from "./transcript-view.js";
 import { formatRunLabel, getRunShortId, type SubagentRunRecord } from "./transcript-types.js";
 
@@ -133,6 +133,69 @@ function stripAnsi(text: string): string {
 	return text.replace(ANSI_PATTERN, "");
 }
 
+/**
+ * Split an ANSI-decorated line into three segments — before, middle, after —
+ * defined by visible column ranges [0, startCol), [startCol, endCol), [endCol, ∞).
+ * Each segment preserves the original ANSI escape sequences that apply to it,
+ * and "middle" and "after" inherit the active SGR state at their start column
+ * so colors don't bleed or disappear across boundaries.
+ */
+function splitAnsiByColumns(
+	line: string,
+	startCol: number,
+	endCol: number,
+): { before: string; middle: string; after: string } {
+	// Active SGR state tracker — stores the last SGR codes seen so we can
+	// re-emit them at a segment boundary to restore styling.
+	let activeSgr = "";
+
+	let before = "";
+	let middle = "";
+	let after = "";
+	let col = 0;
+	let i = 0;
+
+	const len = line.length;
+
+	while (i < len) {
+		// Check for ANSI escape sequence
+		const ansiMatch = line.slice(i).match(/^\x1b(?:[@-Z\\-_]|\[[0-?]*[ -\/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/);
+		if (ansiMatch) {
+			const code = ansiMatch[0];
+			// Track SGR sequences for state inheritance
+			if (/^\x1b\[[0-9;]*m$/.test(code)) activeSgr = code;
+			// Emit into whichever segment we're currently writing
+			if (col < startCol) before += code;
+			else if (col < endCol) middle += code;
+			else after += code;
+			i += code.length;
+			continue;
+		}
+
+		// Regular character — determine its cell width
+		const ch = line[i];
+		const w = visibleWidth(ch);
+
+		if (col < startCol) {
+			before += ch;
+			col += w;
+			// Crossed into middle: re-emit active SGR so middle inherits styling
+			if (col >= startCol && col < endCol) middle += activeSgr;
+		} else if (col < endCol) {
+			middle += ch;
+			col += w;
+			// Crossed into after: re-emit active SGR so after inherits styling
+			if (col >= endCol) after += activeSgr;
+		} else {
+			after += ch;
+			col += w;
+		}
+		i++;
+	}
+
+	return { before, middle, after };
+}
+
 function compareSelectionPoints(a: SelectionPoint, b: SelectionPoint): number {
 	if (a.row !== b.row) return a.row - b.row;
 	return a.col - b.col;
@@ -190,6 +253,8 @@ export class SubagentOverlay implements Component {
 	private inputHistoryByRunId = new Map<string, string[]>();
 	private unsubscribe?: () => void;
 	private renderTimer?: ReturnType<typeof setTimeout>;
+	private autoScrollTimer?: ReturnType<typeof setInterval>;
+	private autoScrollDelta = 0;
 	private disposed = false;
 
 	constructor(
@@ -202,7 +267,10 @@ export class SubagentOverlay implements Component {
 		private initialRunId?: string,
 		private onCancelledRun?: (runId: string) => void,
 	) {
-		this.footer = new FooterComponent(createFooterSessionAdapter(this.host), createFooterDataAdapter(this.host));
+		this.footer = new FooterComponent(
+			createSubagentFooterSessionAdapter(this.host, () => this.getSelectedRun()),
+			createSubagentFooterDataAdapter(this.host, () => this.getSelectedRun()),
+		);
 		this.enableMouseReporting();
 		this.setTextCursor();
 		this.unsubscribe = registry.subscribe(() => {
@@ -278,9 +346,9 @@ export class SubagentOverlay implements Component {
 		const editor = run && isLiveStatus(run.status) ? this.getEditorForRun(run) : undefined;
 		const hasInputController = Boolean(run && this.registry.getInputController(run.id));
 		const editorHasText = Boolean(editor && editor.getText().length > 0);
-		const confirmCancelWithCtrlC = matchesKey(data, "ctrl+c");
+		const confirmCancelWithCtrlY = matchesKey(data, Key.ctrl("y"));
 		const confirmCancelWithX = !hasInputController && (matchesKey(data, "x") || data === "X");
-		if ((confirmCancelWithX || confirmCancelWithCtrlC) && run && canCancelStatus(run.status)) {
+		if ((confirmCancelWithX || confirmCancelWithCtrlY) && run && canCancelStatus(run.status)) {
 			this.cancelSelectedRun();
 			return;
 		}
@@ -291,14 +359,21 @@ export class SubagentOverlay implements Component {
 			return;
 		}
 
-		if (this.matchesCopyShortcut(data)) {
+		if (matchesKey(data, "ctrl+c")) {
 			if (this.selectedText) this.copySelection();
 			return;
 		}
 
-		if (this.matchesBlockedPasteShortcut(data)) return;
-
-		if (matchesKey(data, "ctrl+shift+o") || matchesKey(data, "alt+o") || matchesKey(data, Key.escape) || (!hasInputController && data === "q")) {
+		if (matchesKey(data, Key.escape)) {
+			if (this.selectedText) {
+				this.clearSelection();
+				this.tui.requestRender();
+			} else {
+				this.done();
+			}
+			return;
+		}
+		if (matchesKey(data, "ctrl+shift+o") || matchesKey(data, Key.alt("o")) || (!hasInputController && data === "q")) {
 			this.done();
 			return;
 		}
@@ -375,6 +450,7 @@ export class SubagentOverlay implements Component {
 			clearTimeout(this.renderTimer);
 			this.renderTimer = undefined;
 		}
+		this.stopAutoScroll();
 		if (this.copyNoticeTimer) {
 			clearTimeout(this.copyNoticeTimer);
 			this.copyNoticeTimer = undefined;
@@ -431,14 +507,6 @@ export class SubagentOverlay implements Component {
 
 	private matchesDequeue(data: string): boolean {
 		return this.keybindings.matches(data, "app.message.dequeue") || matchesKey(data, Key.alt("up"));
-	}
-
-	private matchesCopyShortcut(data: string): boolean {
-		return matchesKey(data, Key.ctrlShift("c"));
-	}
-
-	private matchesBlockedPasteShortcut(data: string): boolean {
-		return matchesKey(data, "ctrl+v");
 	}
 
 	private matchesOptionalAppKey(data: string, keybinding: string): boolean {
@@ -642,6 +710,32 @@ export class SubagentOverlay implements Component {
 		(this.cancelCloseTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
 	}
 
+	private startAutoScroll(delta: number): void {
+		if (this.autoScrollDelta === delta && this.autoScrollTimer) return;
+		this.stopAutoScroll();
+		this.autoScrollDelta = delta;
+		this.autoScrollTimer = setInterval(() => {
+			if (this.disposed) { this.stopAutoScroll(); return; }
+			this.scrollBy(delta);
+			if (this.isSelecting && this.selectionStart) {
+				// Extend selection to the edge as we scroll
+				const edgeRow = this.lastRenderScrollOffset + (delta < 0 ? 0 : this.lastBodyHeight - 1);
+				const edgeCol = delta < 0 ? 0 : this.lastWidth - 1;
+				this.selectionEnd = { row: edgeRow, col: edgeCol };
+				this.selectionMoved = true;
+				this.updateSelectedRange();
+			}
+		}, 80);
+	}
+
+	private stopAutoScroll(): void {
+		if (this.autoScrollTimer) {
+			clearInterval(this.autoScrollTimer);
+			this.autoScrollTimer = undefined;
+		}
+		this.autoScrollDelta = 0;
+	}
+
 	private handleMouseEvent(event: ParsedMouseEvent): void {
 		if (event.kind === "wheel") {
 			if (event.wheelDelta !== undefined) this.scrollBy(event.wheelDelta);
@@ -663,6 +757,28 @@ export class SubagentOverlay implements Component {
 
 		if (event.kind === "drag") {
 			if (!this.isSelecting || !this.selectionStart) return;
+			const bodyRow = event.row - 1 - this.lastBodyTopRow;
+			if (bodyRow < 0) {
+				// Above body — auto-scroll up, extend selection to top
+				const speed = Math.max(1, Math.ceil(Math.abs(bodyRow) / 2));
+				this.startAutoScroll(-speed);
+				this.selectionEnd = { row: this.lastRenderScrollOffset, col: 0 };
+				this.selectionMoved = true;
+				this.updateSelectedRange();
+				this.tui.requestRender();
+				return;
+			} else if (bodyRow >= this.lastBodyHeight) {
+				// Below body — auto-scroll down, extend selection to bottom
+				const speed = Math.max(1, Math.ceil((bodyRow - this.lastBodyHeight + 1) / 2));
+				this.startAutoScroll(speed);
+				this.selectionEnd = { row: this.lastRenderScrollOffset + this.lastBodyHeight - 1, col: this.lastWidth - 1 };
+				this.selectionMoved = true;
+				this.updateSelectedRange();
+				this.tui.requestRender();
+				return;
+			}
+			// Inside body — stop auto-scroll and update normally
+			this.stopAutoScroll();
 			const point = this.mousePointToSelectionPoint(event, true);
 			if (!point) return;
 			this.selectionEnd = point;
@@ -673,14 +789,19 @@ export class SubagentOverlay implements Component {
 		}
 
 		if (event.kind === "up") {
+			this.stopAutoScroll();
 			if (!this.isSelecting || !this.selectionStart) return;
 			const point = this.mousePointToSelectionPoint(event, true);
 			if (point) {
 				this.selectionEnd = point;
 				this.selectionMoved = this.selectionMoved || !selectionPointsEqual(this.selectionStart, point);
 			}
-			if (this.selectionMoved) this.updateSelectedRange();
-			else this.clearSelection();
+			if (this.selectionMoved) {
+				this.updateSelectedRange();
+				if (this.selectedText) this.copySelection();
+			} else {
+				this.clearSelection();
+			}
 			this.isSelecting = false;
 			this.tui.requestRender();
 		}
@@ -743,11 +864,10 @@ export class SubagentOverlay implements Component {
 	}
 
 	private highlightLineSelection(line: string, startCol: number, endCol: number): string {
-		const plain = stripAnsi(line);
-		const prefix = slicePlainByCells(plain, 0, startCol);
-		const selected = slicePlainByCells(plain, startCol, endCol);
-		const suffix = slicePlainByCells(plain, endCol, visibleWidth(plain));
-		return prefix + this.theme.bg("selectedBg", selected) + suffix;
+		const { before, middle, after } = splitAnsiByColumns(line, startCol, endCol);
+		// Use reverse video (\x1b[7m) — same as native terminal selection:
+		// inverts fg/bg regardless of existing colors, always visible.
+		return before + "\x1b[7m" + middle + "\x1b[27m" + after;
 	}
 
 	private extractSelectedText(range: SelectionRange = this.selectedText!): string | undefined {
@@ -777,7 +897,7 @@ export class SubagentOverlay implements Component {
 		this.showCopyNotice(`Copied ${[...text].length} characters`, "success");
 	}
 
-	private showCopyNotice(message: string, color: "success" | "warning" | "error"): void {
+	showCopyNotice(message: string, color: "success" | "warning" | "error"): void {
 		this.copyNotice = { message, color };
 		if (this.copyNoticeTimer) clearTimeout(this.copyNoticeTimer);
 		this.copyNoticeTimer = setTimeout(() => {
@@ -830,8 +950,8 @@ export class SubagentOverlay implements Component {
 		const followUpKey = this.keyText("app.message.followUp", "Alt+Enter");
 		const newLineKey = this.keyText("tui.input.newLine", "Shift+Enter");
 		const helpText = isLiveStatus(run.status)
-			? `${submitKey} steer · ${followUpKey} follow-up · ${newLineKey} newline · Ctrl+Shift+V paste · PgUp/PgDn scroll · Ctrl+C cancel · Ctrl+O expand · Alt+O/Esc back`
-			: "←/→ agent · ↑/↓ scroll · drag select · Ctrl+Shift+C copy · Alt+O/Esc/q back";
+			? `${submitKey} steer · ${followUpKey} follow-up · ${newLineKey} newline · PgUp/PgDn scroll · Ctrl+Y cancel · Ctrl+O expand · Alt+O/Esc back`
+			: "←/→ agent · ↑/↓ scroll · drag select · Ctrl+C copy (not Ctrl+Shift+C) · Alt+O/Esc/q back";
 		const help = this.theme.fg("dim", helpText);
 		return [top, truncateToWidth(title, width), truncateToWidth(ctx, width), truncateToWidth(help, width), top];
 	}
@@ -889,7 +1009,7 @@ export class SubagentOverlay implements Component {
 		if (this.cancelConfirmationRunId === run.id) {
 			status = this.theme.fg(
 				"warning",
-				"⚠️ Confirm cancel? Press Ctrl+C again to cancel (or any other key to dismiss)",
+				"⚠️ Confirm cancel? Press Ctrl+Y again to cancel (or any other key to dismiss)",
 			);
 		} else if (run.status === "cancelling") {
 			status = `${this.theme.fg("warning", `Cancelling... elapsed ${formatDuration(elapsedMs(run))}`)}${notice}`;

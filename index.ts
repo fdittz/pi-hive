@@ -19,7 +19,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Key, Markdown, matchesKey, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { colorAgentText } from "./agent-colors.js";
 import {
@@ -984,12 +984,22 @@ async function openSubagentsOverlay(ctx: ExtensionContext, pi: ExtensionAPI, run
 	const warning = getCompatibilityWarning();
 	if (warning) ctx.ui.notify(warning, "warning");
 	const overlayHost: SubagentOverlayHostContext = { ctx, pi };
+	let overlayRef: SubagentOverlay | undefined;
+	const unsubscribeCtrlShiftC = ctx.ui.onTerminalInput((data) => {
+		// Ctrl+Shift+C is consumed by Kitty before reaching the app.
+		// This handler catches it in terminals that do forward it and shows a hint.
+		if (overlayRef && matchesKey(data, Key.ctrlShift("c"))) {
+			overlayRef.showCopyNotice("Use Ctrl+C to copy inside the subagent overlay", "warning");
+			return { consume: true };
+		}
+	});
 	try {
 		await ctx.ui.custom<void>(
 			(tui, theme, keybindings, done) => {
 				const close = () => done(undefined);
 				activeOverlayClose = close;
-				return new SubagentOverlay(tui, theme, keybindings, close, registry, overlayHost, initialRunId, enqueueCancelledRunFeedback);
+				overlayRef = new SubagentOverlay(tui, theme, keybindings, close, registry, overlayHost, initialRunId, enqueueCancelledRunFeedback);
+				return overlayRef;
 			},
 			{
 				overlay: true,
@@ -1002,6 +1012,8 @@ async function openSubagentsOverlay(ctx: ExtensionContext, pi: ExtensionAPI, run
 			},
 		);
 	} finally {
+		unsubscribeCtrlShiftC();
+		overlayRef = undefined;
 		activeOverlayClose = undefined;
 		for (const run of registry.getCancelledRuns(initiallyRunningRunIds)) {
 			enqueueCancelledRunFeedback(run.id);
@@ -2531,7 +2543,15 @@ export default function (pi: ExtensionAPI) {
 					);
 					const allResults = [result, ...handoffResults];
 					return {
-						content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+						content: [
+							{
+								type: "text",
+								text:
+									handoffResults.length > 0
+										? formatBackgroundRunResult(allResults)
+										: getFinalOutput(result.messages) || "(no output)",
+							},
+						],
 						details: handoffResults.length > 0 ? makeDetails("chain")(allResults) : continuationDetails(allResults),
 					};
 				}
@@ -2835,7 +2855,15 @@ export default function (pi: ExtensionAPI) {
 					);
 					const allResults = [result, ...handoffResults];
 					return {
-						content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+						content: [
+							{
+								type: "text",
+								text:
+									handoffResults.length > 0
+										? formatBackgroundRunResult(allResults)
+										: getFinalOutput(result.messages) || "(no output)",
+							},
+						],
 						details: makeDetails(handoffResults.length > 0 ? "chain" : "single")(allResults),
 					};
 				}
