@@ -9,10 +9,20 @@ import {
 	getSubagentModelConfigPath,
 	INHERIT_MODEL,
 	INHERIT_THINKING,
-	THINKING_LEVELS,
 	loadSubagentModelConfig,
+	resolveThinkingLevels,
 	setAgentModelOverride,
 } from "./model-overrides.js";
+
+const THINKING_LEVEL_DESCRIPTIONS: Record<string, string> = {
+	off: "No reasoning",
+	minimal: "Very brief reasoning (~1k tokens)",
+	low: "Light reasoning (~2k tokens)",
+	medium: "Moderate reasoning (~8k tokens)",
+	high: "Deep reasoning (~16k tokens)",
+	xhigh: "Extra-high reasoning (~32k tokens)",
+	max: "Maximum reasoning",
+};
 
 async function showSelectList(
 	ctx: ExtensionCommandContext,
@@ -118,15 +128,28 @@ export async function openSubagentModelSelector(
 
 		let finalSetting = selectedModel;
 		if (configThinking) {
+			// Offer only the levels the selected model actually supports, like pi's
+			// native /settings thinking menu does for the main model.
+			const available = ctx.modelRegistry.getAvailable();
+			const levels = resolveThinkingLevels(selectedModel, available, ctx.model);
+			if (levels.length === 1 && levels[0] === "off") {
+				await setAgentModelOverride(agent.name, finalSetting);
+				ctx.ui.notify(
+					`${agent.name} now uses ${finalSetting}. (This model does not support thinking; the level stays inherited.)`,
+					"info",
+				);
+				continue;
+			}
 			const thinkingItems: SelectItem[] = [
 				{
 					value: INHERIT_THINKING,
 					label: INHERIT_THINKING,
 					description: parentThinkingLabel,
 				},
-				...THINKING_LEVELS.map((level) => ({
+				...levels.map((level) => ({
 					value: level,
 					label: level,
+					description: THINKING_LEVEL_DESCRIPTIONS[level],
 				})),
 			];
 

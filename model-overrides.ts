@@ -1,10 +1,11 @@
 import type { Model } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "./agents.js";
 import { getSubagentConfigPath, loadSubagentConfig, saveSubagentConfig } from "./subagent-config.js";
 
 export const INHERIT_MODEL = "inherit";
 export const INHERIT_THINKING = "inherit";
-export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ExplicitSubagentThinkingLevel = (typeof THINKING_LEVELS)[number];
 export type SubagentThinkingLevel = ExplicitSubagentThinkingLevel | typeof INHERIT_THINKING;
 
@@ -46,9 +47,29 @@ export async function saveSubagentModelConfig(config: SubagentModelConfig): Prom
 
 function splitModelThinking(value: string): { model: string; thinking?: ExplicitSubagentThinkingLevel } {
 	const trimmed = value.trim();
-	const match = trimmed.match(/^(.*):(off|minimal|low|medium|high|xhigh)$/);
+	const match = trimmed.match(/^(.*):(off|minimal|low|medium|high|xhigh|max)$/);
 	if (!match) return { model: trimmed };
 	return { model: match[1], thinking: match[2] as ExplicitSubagentThinkingLevel };
+}
+
+/**
+ * Thinking levels to offer for a model selection, mirroring pi's native /settings
+ * menu: levels are derived from the concrete model's capabilities (reasoning flag
+ * + thinkingLevelMap), not the global list. Falls back to the full list when the
+ * model cannot be resolved (custom/external refs).
+ */
+export function resolveThinkingLevels(
+	selectedModel: string,
+	availableModels: Model<any>[],
+	parentModel: Model<any> | undefined,
+): string[] {
+	const model =
+		selectedModel === INHERIT_MODEL
+			? parentModel
+			: availableModels.find((m) => formatModelRef(m) === selectedModel);
+	if (!model) return [...THINKING_LEVELS];
+	const levels = getSupportedThinkingLevels(model as Model<any>);
+	return levels.length > 0 ? [...levels] : [...THINKING_LEVELS];
 }
 
 function normalizeThinking(value: string | undefined): SubagentThinkingLevel {
