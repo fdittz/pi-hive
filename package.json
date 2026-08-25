@@ -36,7 +36,8 @@
   ],
   "scripts": {
     "check:load": "pi --no-extensions -e ./index.ts --list-models",
-    "check:no-private-imports": "! grep -R 'pi-coding-agent/dist' . --include='*.ts'"
+    "check:no-private-imports": "! grep -R 'pi-coding-agent/dist' . --include='*.ts' --exclude-dir=node_modules",
+    "setup:test-deps": "bash scripts/link-test-deps.sh"
   },
   "repository": {
     "type": "git",

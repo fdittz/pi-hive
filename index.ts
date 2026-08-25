@@ -2350,7 +2350,11 @@ export default function (pi: ExtensionAPI) {
 					debugLog(`Auto-delegation error: ${message}`);
 				});
 			});
-			return { action: "handled" };
+			// Keep the original user message flowing into the session as a normal
+			// user message (same as when auto-delegate is OFF). The steer sent above
+			// is an added nudge; the agent must see the full original request in
+			// context so the subagent task is not a lossy re-transcription.
+			return { action: "continue" };
 		});
 
 		pi.registerTool({

@@ -8,13 +8,11 @@ import {
 	normalizeChainPrevious,
 	replacePreviousPlaceholder,
 } from "../chain-previous.js";
+import { piCodingAgentStub } from "./helpers/pi-test-stubs.js";
 
 let agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-hive-subagent-config-"));
 
-mock.module("@earendil-works/pi-coding-agent", () => ({
-	getAgentDir: () => agentDir,
-	withFileMutationQueue: async (_filePath: string, mutate: () => Promise<void>) => mutate(),
-}));
+mock.module("@earendil-works/pi-coding-agent", () => piCodingAgentStub({ getAgentDir: () => agentDir }));
 
 const { getDefaultSubagentConfig, loadSubagentConfig } = await import("../subagent-config.js");
 

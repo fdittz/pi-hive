@@ -1,57 +1,11 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
+import { piCodingAgentStub, piTuiStub } from "./helpers/pi-test-stubs.js";
 
-function parseFrontmatter(content: string): { frontmatter: Record<string, unknown>; body: string } {
-	const match = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/);
-	if (!match) return { frontmatter: {}, body: content };
-	return { frontmatter: {}, body: match[2] };
-}
 
-mock.module("@earendil-works/pi-tui", () => ({
-	Container: class {
-		children: unknown[] = [];
+mock.module("@earendil-works/pi-tui", () => piTuiStub());
 
-		addChild(child: unknown): void {
-			this.children.push(child);
-		}
-
-		clear(): void {
-			this.children = [];
-		}
-
-		invalidate(): void {}
-	},
-	Text: class {
-		constructor(private text: string) {}
-
-		render(): string[] {
-			return [this.text];
-		}
-	},
-	Spacer: class {
-		render(): string[] {
-			return [];
-		}
-	},
-	wrapTextWithAnsi: (text: string, width: number): string[] => {
-		const safeWidth = Math.max(1, Math.floor(width));
-		if (text.length === 0) return [];
-		const lines: string[] = [];
-		for (let i = 0; i < text.length; i += safeWidth) {
-			lines.push(text.slice(i, i + safeWidth));
-		}
-		return lines;
-	},
-}));
-
-mock.module("@earendil-works/pi-coding-agent", () => ({
-	VERSION: "0.75.0",
-	AssistantMessageComponent: class {},
-	ToolExecutionComponent: class {},
-	UserMessageComponent: class {},
-	getAgentDir: () => "/tmp/pi-hive-test-empty-agents",
-	withFileMutationQueue: async (_filePath: string, mutate: () => Promise<void>) => mutate(),
-	parseFrontmatter,
-}));
+mock.module("@earendil-works/pi-coding-agent", () =>
+	piCodingAgentStub({ getAgentDir: () => "/tmp/pi-hive-test-empty-agents" }));
 
 const { TranscriptView } = await import("../transcript-view.js");
 const { WrappedLineVirtualizer } = await import("../wrapped-line-virtualizer.js");

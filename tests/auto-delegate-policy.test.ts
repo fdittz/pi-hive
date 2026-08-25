@@ -2,12 +2,11 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { piCodingAgentStub } from "./helpers/pi-test-stubs.js";
 
-// Bun module mocks are process-wide; keep this minimal stub isolated from guidance-only tests.
-mock.module("@earendil-works/pi-coding-agent", () => ({
-	getAgentDir: () => process.env.PI_CODING_AGENT_DIR ?? os.tmpdir(),
-	withFileMutationQueue: async (_filePath: string, mutate: () => Promise<void>) => mutate(),
-}));
+// Bun module mocks are process-wide and the first registration wins for the
+// whole process, so always register the shared complete stub.
+mock.module("@earendil-works/pi-coding-agent", () => piCodingAgentStub());
 
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 const { getAutoDelegateConfig, isAutoDelegateEnabled } = await import("../auto-delegate.js");

@@ -1,50 +1,9 @@
 import { describe, it, expect, beforeEach, mock } from "bun:test";
 import type { WrappedLineVirtualizer } from "../wrapped-line-virtualizer.js";
 
-mock.module("@earendil-works/pi-tui", () => {
-	class Container {
-		children: unknown[] = [];
+import { piTuiStub } from "./helpers/pi-test-stubs.js";
 
-		addChild(child: unknown): void {
-			this.children.push(child);
-		}
-
-		clear(): void {
-			this.children = [];
-		}
-
-		invalidate(): void {}
-	}
-
-	class Text {
-		constructor(private text: string) {}
-
-		render(_width: number): string[] {
-			return [this.text];
-		}
-	}
-
-	class Spacer {
-		render(): string[] {
-			return [];
-		}
-	}
-
-	return {
-		Container,
-		Spacer,
-		Text,
-		wrapTextWithAnsi: (text: string, width: number): string[] => {
-			const safeWidth = Math.max(1, Math.floor(width));
-			if (text.length === 0) return [];
-			const lines: string[] = [];
-			for (let i = 0; i < text.length; i += safeWidth) {
-				lines.push(text.slice(i, i + safeWidth));
-			}
-			return lines;
-		},
-	};
-});
+mock.module("@earendil-works/pi-tui", () => piTuiStub());
 
 const { WrappedLineVirtualizer } = await import("../wrapped-line-virtualizer.js");
 
