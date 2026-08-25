@@ -27,6 +27,7 @@ export function createFooterSessionAdapter(host: SubagentOverlayHostContext): Ag
 		},
 		sessionManager: host.ctx.sessionManager,
 		modelRegistry: host.ctx.modelRegistry,
+		modelRuntime: createModelRuntimeShim(host),
 		getContextUsage: () => host.ctx.getContextUsage(),
 	} as unknown as AgentSession;
 }
@@ -144,6 +145,7 @@ export function createSubagentFooterSessionAdapter(
 			},
 		},
 		modelRegistry: host.ctx.modelRegistry,
+		modelRuntime: createModelRuntimeShim(host),
 		getContextUsage(): SubagentFooterSnapshot["contextUsage"] {
 			const run = getRun();
 			return run ? getCachedSubagentFooterSnapshot(run).contextUsage : { ...emptySubagentContextUsage };
@@ -247,6 +249,29 @@ function getCachedSubagentFooterSnapshot(run: SubagentRunRecord): SubagentFooter
 	const snapshot = collectSubagentFooterSnapshot(run);
 	subagentFooterSnapshotCache.set(run.id, { revision: run.revision, snapshot });
 	return snapshot;
+}
+
+/**
+ * pi >= 0.80.10 changed `FooterComponent.render` to read
+ * `session.modelRuntime.isUsingOAuth(state.model.provider)`, and pi >= 0.84.1 changed it to
+ * `session.modelRuntime.isUsingSubscription(state.model.provider)`. The extension API only exposes the
+ * synchronous `ctx.modelRegistry` facade (not the internal `ModelRuntime`), so we provide a minimal
+ * stand-in that keeps the shared footer rendering inside the overlay. It delegates to the host registry
+ * so the "(sub)" indicator still reflects real OAuth credentials, and degrades to `false` if the
+ * registry is unavailable so rendering never throws.
+ */
+function createModelRuntimeShim(host: SubagentOverlayHostContext) {
+	const isOAuthForProvider = (providerId: string): boolean => {
+		try {
+			return host.ctx.modelRegistry?.isUsingOAuth?.({ provider: providerId } as any) === true;
+		} catch {
+			return false;
+		}
+	};
+	return {
+		isUsingOAuth: isOAuthForProvider,
+		isUsingSubscription: isOAuthForProvider,
+	};
 }
 
 function parseSubagentProvider(model: string | undefined): string {

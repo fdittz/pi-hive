@@ -172,3 +172,57 @@ describe("createSubagentFooterSessionAdapter", () => {
 		expect(adapter.sessionManager.getEntries()).toEqual([]);
 	});
 });
+
+describe("createSubagentFooterSessionAdapter modelRuntime shim", () => {
+	test("exposes modelRuntime.isUsingSubscription so the current pi footer renders without crashing", () => {
+		const host = {
+			ctx: {
+				modelRegistry: { isUsingOAuth: () => false },
+			},
+		} as any;
+		const adapter = createSubagentFooterSessionAdapter(host, () =>
+			createRun({ model: "anthropic/claude-sonnet-4" }),
+		);
+
+		// Mirrors FooterComponent.render (pi >= 0.84.1):
+		//   this.session.modelRuntime.isUsingSubscription(state.model.provider)
+		expect(adapter.modelRuntime).toBeTypeOf("object");
+		expect(adapter.modelRuntime.isUsingSubscription).toBeTypeOf("function");
+		expect(adapter.modelRuntime.isUsingOAuth).toBeTypeOf("function");
+		expect(adapter.modelRuntime.isUsingSubscription(adapter.state.model?.provider)).toBe(false);
+	});
+
+	test("modelRuntime delegates subscription status to the host model registry", () => {
+		const calls: string[] = [];
+		const host = {
+			ctx: {
+				modelRegistry: {
+					isUsingOAuth: (model: { provider: string }) => {
+						calls.push(model.provider);
+						return model.provider === "anthropic";
+					},
+				},
+			},
+		} as any;
+		const adapter = createSubagentFooterSessionAdapter(host, () =>
+			createRun({ model: "anthropic/claude-sonnet-4" }),
+		);
+
+		expect(adapter.modelRuntime.isUsingSubscription("anthropic")).toBe(true);
+		expect(adapter.modelRuntime.isUsingOAuth("openai")).toBe(false);
+		expect(calls).toEqual(["anthropic", "openai"]);
+	});
+
+	test("modelRuntime falls back to false when the host registry is missing or throws", () => {
+		const missing = createSubagentFooterSessionAdapter({ ctx: {} } as any, () => createRun());
+		expect(missing.modelRuntime.isUsingSubscription("anthropic")).toBe(false);
+
+		const throwing = createSubagentFooterSessionAdapter(
+			{ ctx: { modelRegistry: { isUsingOAuth: () => {
+					throw new Error("boom");
+				} } } } as any,
+			() => createRun(),
+		);
+		expect(throwing.modelRuntime.isUsingSubscription("anthropic")).toBe(false);
+	});
+});
